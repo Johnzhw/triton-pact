@@ -282,6 +282,12 @@ struct PageTransformPass
       return WalkResult::advance();
     });
 
+    // Stage B (div→shift/rem→and canonicalization): deferred.
+    // LLVM already performs this optimization at the LLVM IR level
+    // (confirmed in motivation analysis). Implementing at TTIR level
+    // would require MLIR::create API migration that provides no
+    // additional performance benefit.
+
     // Summary (only log when matches found)
     if (numBlockTableLoads > 0) {
       llvm::errs() << "[PACT PageTransform] Recognized " << numBlockTableLoads

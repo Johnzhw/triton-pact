@@ -49,6 +49,12 @@ def convert_type_repr(x):
     return x
 
 
+def _attach_pact_func_attrs(module, attrs):
+    """Attach pact.* attributes to module and tt.func ops."""
+    from ._pact_annotate import attach_pact_func_attrs
+    attach_pact_func_attrs(module, attrs)
+
+
 class ASTSource:
 
     def __init__(self, fn, signature, constexprs=None, attrs=None) -> None:
@@ -68,6 +74,92 @@ class ASTSource:
             if not isinstance(k, str):
                 raise TypeError("Signature keys must be string")
 
+        # PACT: detect paged attention kernels and inject pact.* attributes
+        self._annotate_pact_attrs(fn)
+
+    def _annotate_pact_attrs(self, fn):
+        """Detect paged attention kernels and inject pact.* attributes.
+
+        Heuristics:
+          1. Kernel contains a parameter named 'block_tables_ptr' or 'block_table'
+          2. Kernel contains a constexpr named 'BLOCK_SIZE' or 'PAGE_SIZE'
+          3. Optionally: 'num_queries_per_kv' for MQA/GQA detection
+
+        Attributes are set on self.attrs and propagated to tt.func via ast_to_ttir.
+        """
+        try:
+            from triton import knobs
+            if not knobs.pact.enable:
+                return
+        except Exception:
+            return
+
+        # Check parameter names for block_table
+        sig_keys_lower = [k.lower() for k in self.signature.keys()]
+        has_block_table = any(
+            name in k for k in sig_keys_lower
+            for name in ("block_table", "block_tables")
+        )
+
+        if not has_block_table:
+            return
+
+        # Get constexpr keys from fn.arg_names and self.constants
+        constexpr_names = set()
+        constexpr_values = {}
+        for k, v in self.constants.items():
+            # k is a tuple of arg indices, v is the constant value
+            for idx in k:
+                if idx < len(fn.arg_names):
+                    name = fn.arg_names[idx]
+                    constexpr_names.add(name)
+                    constexpr_values[name] = v
+
+        # Check for PAGE_SIZE constexpr
+        page_size_keys = ("BLOCK_SIZE", "PAGE_SIZE", "block_size", "page_size")
+        has_page_size = any(k in constexpr_names for k in page_size_keys)
+        if not has_page_size:
+            return
+
+        # Extract page size value
+        page_size = None
+        for k in page_size_keys:
+            if k in constexpr_values:
+                page_size = constexpr_values[k]
+                break
+
+        if page_size is None or page_size <= 0:
+            return
+
+        # Set paged mode attributes
+        self.attrs["pact.paged"] = True
+        self.attrs["pact.page_size"] = int(page_size)
+
+        # Find block_table arg name
+        for k in self.signature.keys():
+            if "block_table" in k.lower():
+                self.attrs["pact.block_table_arg"] = k
+                break
+
+        # MQA/GQA detection via num_queries_per_kv
+        gqa_keys = ("num_queries_per_kv", "kv_group_num")
+        for gk in gqa_keys:
+            if gk in constexpr_values:
+                gqa_val = int(constexpr_values[gk])
+                if gqa_val == 1:
+                    self.attrs["pact.mha"] = True
+                elif gqa_val > 1:
+                    self.attrs["pact.gqa"] = True
+                    self.attrs["pact.gqa_group_size"] = gqa_val
+                break
+
+        # Log detection in verbose mode
+        if knobs.pact.verbose:
+            import sys
+            print(f"[PACT] Detected paged attention kernel: {fn.__name__}", file=sys.stderr)
+            print(f"[PACT]   page_size={page_size}", file=sys.stderr)
+            print(f"[PACT]   attrs={self.attrs}", file=sys.stderr)
+
     def hash(self):
         sorted_sig = [v for k, v in sorted(self.signature.items())]
         get_key = lambda x: x.cache_key if hasattr(x, 'cache_key') else str(x)
@@ -77,8 +169,13 @@ class ASTSource:
 
     def make_ir(self, target: GPUTarget, options, codegen_fns, module_map, context):
         from .code_generator import ast_to_ttir
-        return ast_to_ttir(self.fn, self, context=context, options=options, codegen_fns=codegen_fns,
-                           module_map=module_map)
+        module = ast_to_ttir(self.fn, self, context=context, options=options,
+                             codegen_fns=codegen_fns, module_map=module_map)
+
+        # PACT: attach pact.* function attributes to the tt.func op
+        _attach_pact_func_attrs(module, self.attrs)
+
+        return module
 
     def parse_options(self):
         return dict()

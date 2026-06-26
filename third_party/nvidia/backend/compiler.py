@@ -249,6 +249,11 @@ class CUDABackend(BaseBackend):
         passes.common.add_canonicalizer(pm)
         passes.ttir.add_combine(pm)
         passes.ttir.add_reorder_broadcast(pm)
+        # PACT: Page-aware compilation passes (TTIR level)
+        if knobs.pact.enable and knobs.pact.enable_page_transform:
+            passes.ttir.add_page_transform(pm)
+        if knobs.pact.enable and knobs.pact.enable_pattern_specialize:
+            passes.ttir.add_pattern_specialize(pm)
         passes.common.add_cse(pm)
         passes.common.add_symbol_dce(pm)
         passes.ttir.add_loop_unroll(pm)
@@ -309,6 +314,10 @@ class CUDABackend(BaseBackend):
         passes.ttir.add_loop_aware_cse(pm)
         if capability // 10 == 8:
             passes.ttgpuir.add_prefetch(pm)
+        # PACT: Paged prefetch insertion pass (TTGIR level)
+        if knobs.pact.enable and knobs.pact.enable_prefetch_insert \
+           and capability // 10 >= 8:
+            passes.ttgpuir.add_prefetch_insert(pm)
         passes.ttgpuir.add_optimize_dot_operands(pm, capability >= 80)
         passes.ttgpuir.add_coalesce_async_copy(pm)
         nvidia.passes.ttnvgpuir.add_optimize_tmem_layouts(pm)

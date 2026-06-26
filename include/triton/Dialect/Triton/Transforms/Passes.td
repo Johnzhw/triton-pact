@@ -79,4 +79,28 @@ def TritonLoopAwareCSE : Pass<"triton-loop-aware-cse", "mlir::ModuleOp"> {
   }];
 }
 
+def TritonPageTransform : Pass<"triton-page-transform", "mlir::ModuleOp"> {
+  let summary = "Recognize and canonicalize paged KV cache access patterns";
+  let description = [{
+    Detects block-table-driven paged attention patterns where loads access KV
+    caches through block_tables (tt.load from block_tables_ptr indexed by
+    seq_offset // BLOCK_SIZE). Annotates matching loads with pact.* attributes
+    and performs safe canonicalization (div→shift, mod→and for power-of-2
+    PAGE_SIZE, conservative block_table load hoisting).
+  }];
+  let dependentDialects = ["mlir::triton::TritonDialect", "mlir::arith::ArithDialect"];
+}
+
+def TritonPatternSpecialize : Pass<"triton-pattern-specialize", "mlir::ModuleOp"> {
+  let summary = "Specialize MQA/GQA head mapping for paged attention";
+  let description = [{
+    Reads pact.mqa / pact.gqa metadata from function attributes and performs
+    conservative KV head mapping canonicalization. For MQA, canonicalizes
+    kv_head_idx to 0. For GQA, ensures kv_head_idx = q_head_idx / group_size.
+    Records sharing metadata for downstream PrefetchInsert. No-op fallback
+    if metadata is missing or GQA group size is invalid.
+  }];
+  let dependentDialects = ["mlir::triton::TritonDialect", "mlir::arith::ArithDialect"];
+}
+
 #endif

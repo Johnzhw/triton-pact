@@ -568,6 +568,20 @@ class proton_knobs(base_knobs):
     enable_hw_trace: env_bool = env_bool("TRITON_ENABLE_HW_TRACE", False)
 
 
+class pact_knobs(base_knobs):
+    """PACT (Page-Aware Compilation for Triton) knobs.
+
+    Environment variables controlling the PACT compilation optimization
+    framework for paged attention kernels.
+    """
+    enable: env_bool = env_bool("PACT_ENABLE", False)
+    enable_page_transform: env_bool = env_bool("PACT_ENABLE_PAGE_TRANSFORM", True)
+    enable_pattern_specialize: env_bool = env_bool("PACT_ENABLE_PATTERN_SPECIALIZE", True)
+    enable_prefetch_insert: env_bool = env_bool("PACT_ENABLE_PREFETCH_INSERT", True)
+    dump_ir: env_bool = env_bool("PACT_DUMP_IR", False)
+    verbose: env_bool = env_bool("PACT_VERBOSE", False)
+
+
 build = build_knobs()
 redis = redis_knobs()
 cache = cache_knobs()
@@ -578,6 +592,7 @@ language = language_knobs()
 nvidia = nvidia_knobs()
 amd = amd_knobs()
 proton = proton_knobs()
+pact = pact_knobs()
 
 
 def refresh_knobs():

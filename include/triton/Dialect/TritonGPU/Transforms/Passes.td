@@ -340,4 +340,19 @@ def TritonGPUCoalesceAsyncCopy: Pass<"tritongpu-coalesce-async-copy", "mlir::Mod
                            "mlir::triton::TritonDialect"];
 }
 
+def TritonGPUPrefetchInsert : Pass<"tritongpu-prefetch-insert", "mlir::ModuleOp"> {
+  let summary = "Insert async copy + double-buffering for paged KV cache loads";
+  let description = [{
+    Converts annotated paged KV cache loads (tt.load with pact.paged_load
+    attribute) into asynchronous ttg.async_copy_global_to_local operations
+    with software double-buffering (prefetch distance = 1). Uses existing
+    ttg.async_commit_group / ttg.async_wait infrastructure. No-op fallback
+    if no paged loads are annotated or if hardware constraints are not met.
+  }];
+  let dependentDialects = ["mlir::triton::gpu::TritonGPUDialect",
+                           "mlir::triton::nvidia_gpu::TritonNvidiaGPUDialect",
+                           "mlir::scf::SCFDialect",
+                           "mlir::arith::ArithDialect"];
+}
+
 #endif

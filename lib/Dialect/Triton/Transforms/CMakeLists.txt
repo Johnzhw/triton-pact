@@ -8,6 +8,8 @@ add_triton_library(TritonTransforms
   LoopInvariantCodeMotion.cpp
   LoopPeeling.cpp
   LoopUnroll.cpp
+  PageTransform.cpp
+  PatternSpecialize.cpp
   ReorderBroadcast.cpp
   RewriteTensorDescriptorToPointer.cpp
   ArithTypeConversion.cpp

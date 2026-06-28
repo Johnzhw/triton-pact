@@ -1,19 +1,20 @@
 //===- PrefetchInsert.cpp - PACT Prefetch Insert Pass ---------------------===//
 //
-// PACT PrefetchInsert pass: Converts paged KV loads in decode loops to
-// async cp.async operations (SM80+). Supports single-buffer (v1).
+// PACT PrefetchInsert pass: Converts eligible paged KV loads in decode
+// loops to async cp.async (SM80+).  Loads that cannot use cp.async
+// (insufficient layout contiguity or per-element masks) stay synchronous.
 //
-// Transformation (single-buffer):
-//   For each pact.paged_load inside scf.for:
-//     Before: tt.load → ttg.local_alloc(init) → ttg.local_load(memdesc)
-//     After:  ttg.local_alloc(empty) → async_copy_global_to_local
-//             → async_commit_group → async_wait → ttg.local_load(buf, token)
+// cp.async requirements:
+//   1. Layout: sizePerThread in the contiguous (order[0]) dimension ×
+//      element size must be exactly 4, 8, or 16 bytes.
+//   2. Mask: must be absent or a splat all-ones constant.  Per-element
+//      masks (arising from boundary checks in attention kernels) force
+//      a sync fallback because cp.async uses one mask bit per vector group.
 //
-// Current status:
-//   - Async copy insertion: WORKING (verified in TTGIR dump)
-//   - Blocked by cp.async alignment: sizePerThread=[1,1] = 2 bytes < 4 bytes
-//     minimum. Needs either layout adjustment (4+ bytes/thread) or
-//     contiguity analysis to batch elements.
+// Transformation (single-buffer, when eligible):
+//   Before: tt.load(ptr, mask, other) → local_alloc(init) → local_load
+//   After:  local_alloc(empty) → async_copy_global_to_local(ptr, mask, other)
+//           → commit → wait → local_load(buf, token)
 //
 //===----------------------------------------------------------------------===//
 
@@ -40,28 +41,12 @@ namespace gpu {
 
 namespace {
 
-/// Return true if the value is a constant zero tensor.
-static bool isZeroConst(Value val) {
-  if (!val)
-    return false;
-  if (auto constOp = val.getDefiningOp<arith::ConstantOp>()) {
-    if (auto denseAttr = dyn_cast<DenseFPElementsAttr>(constOp.getValue())) {
-      return denseAttr.isSplat() && denseAttr.getSplatValue<APFloat>().isZero();
-    }
-    if (auto intAttr = dyn_cast<DenseIntElementsAttr>(constOp.getValue())) {
-      return intAttr.isSplat() && intAttr.getSplatValue<APInt>().isZero();
-    }
-  }
-  return false;
-}
-
 /// Walk the use-def chain from the load result to find the LocalAllocOp.
 static LocalAllocOp findLocalAllocThroughLayoutConversions(
     triton::LoadOp loadOp) {
   SmallVector<Value> worklist;
   worklist.push_back(loadOp.getResult());
 
-  // BFS through convert_layout ops (limit depth to avoid infinite loops)
   for (int depth = 0; depth < 8 && !worklist.empty(); ++depth) {
     SmallVector<Value> next;
     for (Value val : worklist) {
@@ -77,25 +62,65 @@ static LocalAllocOp findLocalAllocThroughLayoutConversions(
   return nullptr;
 }
 
+/// Check whether cp.async can be used for this load.
+///
+/// (1) Layout: sizePerThread[order[0]] × sizeof(elem) ∈ {4, 8, 16}.
+/// (2) Mask: absent or splat-1 constant (no per-element masking).
+static bool canUseCpAsync(triton::LoadOp loadOp) {
+  auto resultType = dyn_cast<RankedTensorType>(loadOp.getResult().getType());
+  if (!resultType)
+    return false;
+
+  auto blockedEnc = dyn_cast<BlockedEncodingAttr>(resultType.getEncoding());
+  if (!blockedEnc)
+    return false;
+
+  unsigned elemBytes = resultType.getElementTypeBitWidth() / 8;
+  auto sz = blockedEnc.getSizePerThread();
+  auto order = blockedEnc.getOrder();
+  if (sz.size() < 2 || order.size() < 2)
+    return false;
+
+  unsigned contiguousDim = order[0];
+  unsigned bytesPerVec = sz[contiguousDim] * elemBytes;
+  if (bytesPerVec != 4 && bytesPerVec != 8 && bytesPerVec != 16)
+    return false;
+
+  Value mask = loadOp.getMask();
+  if (mask) {
+    if (auto constOp = mask.getDefiningOp<arith::ConstantOp>()) {
+      if (auto denseAttr =
+              dyn_cast<DenseIntElementsAttr>(constOp.getValue())) {
+        if (!denseAttr.isSplat() ||
+            !denseAttr.getSplatValue<APInt>().isOne())
+          return false;
+      } else {
+        return false;
+      }
+    } else {
+      return false;
+    }
+  }
+
+  return true;
+}
+
 struct PrefetchInsertPass
     : public impl::TritonGPUPrefetchInsertBase<PrefetchInsertPass> {
 
-  /// Convert a synchronous paged load → local_alloc pattern into async.
   LogicalResult convertSingleBuffer(triton::LoadOp loadOp,
                                     LocalAllocOp allocOp,
                                     OpBuilder &builder) {
     Location loc = loadOp.getLoc();
 
-    // Collect load parameters
     Value src = loadOp.getPtr();
     Value mask = loadOp.getMask();
     Value other = loadOp.getOther();
-    triton::CacheModifier cache = loadOp.getCache();
-    triton::EvictionPolicy evict = loadOp.getEvict();
+    auto cache = loadOp.getCache();
+    auto evict = loadOp.getEvict();
     bool isVolatile = loadOp.getIsVolatile();
-    uint32_t contiguity = 1; // conservative default
+    uint32_t contiguity = 1;
 
-    // Get the memdesc type and make it mutable for empty alloc.
     auto oldMemDescType = cast<MemDescType>(allocOp.getResult().getType());
     auto mutableMemDescType = MemDescType::get(
         oldMemDescType.getShape(), oldMemDescType.getElementType(),
@@ -104,63 +129,41 @@ struct PrefetchInsertPass
 
     ImplicitLocOpBuilder b(loc, builder);
 
-    // 1. Create empty local_alloc before the load
     b.setInsertionPoint(loadOp);
     Value newBuf = LocalAllocOp::create(b, mutableMemDescType).getResult();
 
-    // 2. Async copy: global → local (LowerLoops.cpp pattern)
     Operation *copy = AsyncCopyGlobalToLocalOp::create(
-        b, /*src=*/src, /*result=*/newBuf,
-        /*mask=*/mask, /*other=*/other,
-        /*cache=*/cache, /*evict=*/evict,
-        /*isVolatile=*/isVolatile, /*contiguity=*/contiguity);
+        b, src, newBuf, mask, other,
+        cache, evict, isVolatile, contiguity);
 
-    // 3. Commit
     Operation *commit =
         AsyncCommitGroupOp::create(b, copy->getResult(0));
 
-    // 4. Wait
     Operation *wait =
-        AsyncWaitOp::create(b, commit->getResult(0), /*num=*/0);
+        AsyncWaitOp::create(b, commit->getResult(0), 0);
 
-    // Collect all uses of the old memdesc
     Value oldMemDesc = allocOp.getResult();
     SmallVector<OpOperand *> memDescUses;
     for (auto &use : oldMemDesc.getUses())
       memDescUses.push_back(&use);
 
-    // 5. Replace old local_load uses with new ones using the async token
     for (OpOperand *use : memDescUses) {
       Operation *user = use->getOwner();
-
       if (auto oldLocalLoad = dyn_cast<LocalLoadOp>(user)) {
         b.setInsertionPoint(oldLocalLoad);
         Type resultType = oldLocalLoad.getResult().getType();
-
-        if (!loadOp.getOther() || isZeroConst(loadOp.getOther())) {
-          auto newLocalLoad = LocalLoadOp::create(
-              b, resultType, newBuf, wait->getResult(0));
-          oldLocalLoad.getResult().replaceAllUsesWith(
-              newLocalLoad.getResult());
-        } else {
-          auto sharedLoad = LocalLoadOp::create(
-              b, resultType, newBuf, wait->getResult(0));
-          auto select = arith::SelectOp::create(
-              b, resultType,
-              loadOp.getMask(), sharedLoad.getResult(), other);
-          oldLocalLoad.getResult().replaceAllUsesWith(
-              select->getResult(0));
-        }
+        auto newLocalLoad = LocalLoadOp::create(
+            b, resultType, newBuf, wait->getResult(0));
+        oldLocalLoad.getResult().replaceAllUsesWith(
+            newLocalLoad.getResult());
         oldLocalLoad->erase();
       } else {
         user->setOperand(use->getOperandNumber(), newBuf);
       }
     }
 
-    // Erase the old local_alloc and load
     allocOp.erase();
     loadOp.erase();
-
     return success();
   }
 
@@ -171,6 +174,7 @@ struct PrefetchInsertPass
       triton::LoadOp loadOp;
       LocalAllocOp allocOp;
       scf::ForOp forOp;
+      bool asyncEligible = false;
     };
     SmallVector<PagedLoadInfo> pagedLoads;
 
@@ -193,33 +197,44 @@ struct PrefetchInsertPass
 
         LocalAllocOp allocOp =
             findLocalAllocThroughLayoutConversions(loadOp);
-        if (allocOp)
-          pagedLoads.push_back({loadOp, allocOp, forOp});
+        if (!allocOp)
+          return WalkResult::advance();
 
+        PagedLoadInfo info;
+        info.loadOp = loadOp;
+        info.allocOp = allocOp;
+        info.forOp = forOp;
+        info.asyncEligible = canUseCpAsync(loadOp);
+        pagedLoads.push_back(info);
         return WalkResult::advance();
       });
-
       return WalkResult::advance();
     });
 
+    int asyncOk = 0, syncOk = 0;
+    for (auto &i : pagedLoads) {
+      if (i.asyncEligible) asyncOk++; else syncOk++;
+    }
     llvm::errs() << "[PACT PrefetchInsert] Found " << pagedLoads.size()
-                 << " paged load(s) in paged loop(s)\n";
+                 << " paged load(s): " << asyncOk << " async-eligible, "
+                 << syncOk << " sync-fallback\n";
 
     int converted = 0;
     OpBuilder builder(mod.getContext());
-
     for (auto &info : pagedLoads) {
-      if (succeeded(
-              convertSingleBuffer(info.loadOp, info.allocOp, builder)))
+      if (!info.asyncEligible) {
+        llvm::errs() << "[PACT PrefetchInsert] Sync fallback — "
+                     << "cp.async requires layout contiguity ∈ {4,8,16} bytes "
+                     << "AND an all-ones (or absent) mask\n";
+        continue;
+      }
+      if (succeeded(convertSingleBuffer(info.loadOp, info.allocOp, builder)))
         converted++;
     }
 
     if (converted > 0) {
       llvm::errs() << "[PACT PrefetchInsert] Converted " << converted
                    << " paged load(s) to async copy (single-buffer)\n";
-      llvm::errs() << "[PACT PrefetchInsert] NOTE: cp.async alignment "
-                   << "constraint may block LLVM lowering if "
-                   << "bytes/thread < 4.\n";
     }
   }
 };

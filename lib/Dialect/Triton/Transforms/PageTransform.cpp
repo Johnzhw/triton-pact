@@ -17,6 +17,9 @@
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/Triton/Transforms/Passes.h"
 
+#include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/DenseSet.h"
+#include "llvm/ADT/MapVector.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/Support/raw_ostream.h"
 
@@ -96,6 +99,29 @@ static std::optional<int64_t> extractConstantInt(Attribute attr) {
 }
 
 //===----------------------------------------------------------------------===//
+// Helper: get the constant divisor of a divsi or remsi op, if any.
+// Returns the constant value and the source operand (lhs of div/rem).
+//===----------------------------------------------------------------------===//
+static std::optional<int64_t> getConstantDivisor(Operation *op, Value &srcOut) {
+  auto name = op->getName().getStringRef();
+  if (name != "arith.divsi" && name != "arith.floordivsi" &&
+      name != "arith.remsi")
+    return std::nullopt;
+
+  // Check if divisor (operand 1) is a constant
+  auto constOp = op->getOperand(1).getDefiningOp<arith::ConstantOp>();
+  if (!constOp)
+    return std::nullopt;
+
+  auto val = extractConstantInt(constOp.getValue());
+  if (!val)
+    return std::nullopt;
+
+  srcOut = op->getOperand(0);
+  return val;
+}
+
+//===----------------------------------------------------------------------===//
 // Helper: check if a value involves arith.divsi or arith.remsi by a constant
 //===----------------------------------------------------------------------===//
 static bool hasDivOrRemByConst(Value val, int64_t divisor, bool checkDiv,
@@ -136,46 +162,260 @@ static bool hasDivOrRemByConst(Value val, int64_t divisor, bool checkDiv,
 }
 
 //===----------------------------------------------------------------------===//
-// Stage A: Semantic Recognition
+// Helper: trace SSA uses forward to check if a value eventually feeds into
+// a tt.load operation.  maxDepth limits the search.
+//===----------------------------------------------------------------------===//
+static bool reachesTtLoad(Value val, int maxDepth = 16) {
+  if (maxDepth <= 0)
+    return false;
+
+  for (auto *user : val.getUsers()) {
+    if (user->getName().getStringRef() == "tt.load")
+      return true;
+
+    // Recurse through intermediate ops (addptr, extsi, cast, broadcast,
+    // expand_dims, splat, muli, addi, etc.)
+    for (auto result : user->getResults()) {
+      if (result == val)
+        continue;
+      if (reachesTtLoad(result, maxDepth - 1))
+        return true;
+    }
+  }
+  return false;
+}
+
+//===----------------------------------------------------------------------===//
+// Helper: try to find the canonical source of a value by walking through
+// type conversions, splats, broadcasts, expand_dims, and addi chains.
+// Returns the "root" value (e.g., the loop induction var or its derivative).
+//===----------------------------------------------------------------------===//
+static Value canonicalSource(Value val, int maxDepth = 8) {
+  if (maxDepth <= 0)
+    return val;
+
+  auto *defOp = val.getDefiningOp();
+  if (!defOp)
+    return val;
+
+  auto name = defOp->getName().getStringRef();
+
+  // Skip type conversions
+  if (name == "arith.extsi" || name == "arith.extui" ||
+      name == "arith.trunci" || name == "arith.index_cast" ||
+      name == "arith.sitofp") {
+    return canonicalSource(defOp->getOperand(0), maxDepth - 1);
+  }
+
+  // Skip splat, broadcast, expand_dims (they just reshape; the source value
+  // is what matters for semantic matching)
+  if (name == "tt.splat" || name == "tt.broadcast" ||
+      name == "tt.expand_dims") {
+    return canonicalSource(defOp->getOperand(0), maxDepth - 1);
+  }
+
+  // Walk through addi: if one operand is a constant and the other traces
+  // to an interesting value, follow the non-constant side.
+  if (name == "arith.addi") {
+    Value lhs = defOp->getOperand(0);
+    Value rhs = defOp->getOperand(1);
+    bool lhsConst = lhs.getDefiningOp<arith::ConstantOp>() != nullptr;
+    bool rhsConst = rhs.getDefiningOp<arith::ConstantOp>() != nullptr;
+    if (lhsConst && !rhsConst)
+      return canonicalSource(rhs, maxDepth - 1);
+    if (!lhsConst && rhsConst)
+      return canonicalSource(lhs, maxDepth - 1);
+  }
+
+  // Walk through muli: similar to addi, follow non-constant side
+  if (name == "arith.muli") {
+    Value lhs = defOp->getOperand(0);
+    Value rhs = defOp->getOperand(1);
+    bool lhsConst = lhs.getDefiningOp<arith::ConstantOp>() != nullptr;
+    bool rhsConst = rhs.getDefiningOp<arith::ConstantOp>() != nullptr;
+    if (lhsConst && !rhsConst)
+      return canonicalSource(rhs, maxDepth - 1);
+    if (!lhsConst && rhsConst)
+      return canonicalSource(lhs, maxDepth - 1);
+  }
+
+  return val;
+}
+
+//===----------------------------------------------------------------------===//
+// PageTransform Pass
 //===----------------------------------------------------------------------===//
 struct PageTransformPass
     : public impl::TritonPageTransformBase<PageTransformPass> {
 
+  // Auto-detect page_size from (divsi, remsi) pairs operating on the same
+  // source value.  Returns the detected page_size, or 0 if not found.
+  int64_t detectPageSize(scf::ForOp forOp, MLIRContext *ctx,
+                          SmallVectorImpl<Operation *> &divOps,
+                          SmallVectorImpl<Operation *> &remOps) {
+    // Collect all divsi and remsi ops with constant divisors in this loop.
+    struct BinOpInfo {
+      Operation *op;
+      int64_t divisor;
+      Value source;  // canonical source
+      bool isDiv;    // true = divsi, false = remsi
+    };
+    SmallVector<BinOpInfo> binOps;
+
+    forOp.walk([&](Operation *op) {
+      auto name = op->getName().getStringRef();
+      bool isDiv = (name == "arith.divsi" || name == "arith.floordivsi");
+      bool isRem = (name == "arith.remsi");
+      if (!isDiv && !isRem)
+        return WalkResult::advance();
+
+      Value src;
+      auto divVal = getConstantDivisor(op, src);
+      if (!divVal)
+        return WalkResult::advance();
+
+      Value canon = canonicalSource(src, /*maxDepth=*/8);
+      binOps.push_back({op, *divVal, canon, isDiv});
+      return WalkResult::advance();
+    });
+
+    if (binOps.empty())
+      return 0;
+
+    // Group by (canonical_source, divisor).  We need at least one divsi
+    // and one remsi sharing the same (source, divisor).
+    // Use a map keyed by (source_op_ptr, divisor).
+    using Key = std::pair<Operation *, int64_t>;
+    // MapVector for deterministic iteration
+    llvm::MapVector<Key, SmallVector<BinOpInfo>> groups;
+    for (auto &b : binOps) {
+      Operation *srcOp = b.source.getDefiningOp();
+      // Use nullptr as sentinel for block-argument sources
+      if (!srcOp) {
+        // For block arguments, use a hash of the value
+        srcOp = reinterpret_cast<Operation *>(
+            reinterpret_cast<uintptr_t>(b.source.getImpl()));
+      }
+      groups[{srcOp, b.divisor}].push_back(b);
+    }
+
+    // Score each candidate divisor: strongest = has both divsi→load AND
+    // remsi→load paths.
+    int64_t bestPageSize = 0;
+    int bestScore = -1;
+
+    for (auto &kv : groups) {
+      int64_t divisor = kv.first.second;
+      auto &members = kv.second;
+
+      bool hasDiv = false, hasRem = false;
+      bool divReachesLoad = false, remReachesLoad = false;
+      Operation *divOp = nullptr, *remOp = nullptr;
+
+      for (auto &m : members) {
+        if (m.isDiv) {
+          hasDiv = true;
+          divOp = m.op;
+          if (reachesTtLoad(m.op->getResult(0)))
+            divReachesLoad = true;
+        } else {
+          hasRem = true;
+          remOp = m.op;
+          if (reachesTtLoad(m.op->getResult(0)))
+            remReachesLoad = true;
+        }
+      }
+
+      if (!hasDiv || !hasRem)
+        continue;
+
+      int score = (divReachesLoad ? 2 : 0) + (remReachesLoad ? 1 : 0);
+      // Bonus for power-of-2 divisors (common page sizes)
+      if ((divisor & (divisor - 1)) == 0 && divisor >= 16 && divisor <= 256)
+        score += 1;
+
+      if (score > bestScore) {
+        bestScore = score;
+        bestPageSize = divisor;
+        if (divOp)
+          divOps.push_back(divOp);
+        if (remOp)
+          remOps.push_back(remOp);
+      }
+    }
+
+    // Require at least: div reaches load AND rem reaches load (score >= 3)
+    if (bestScore < 3) {
+      // Allow score 2 (div→load) if divisor is a clear power-of-2
+      // and we also have a remsi (even if it doesn't directly reach load)
+      if (bestScore < 2)
+        return 0;
+    }
+
+    return bestPageSize;
+  }
+
   void runOnOperation() override {
     ModuleOp mod = getOperation();
 
-    // Check module-level and function-level pact.paged attributes
-    int64_t pageSize = 0;
+    // Check module-level and function-level pact.paged attributes.
+    // These serve as hints.  If not present, we auto-detect.
+    int64_t attrPageSize = 0;
     bool hasPagedFunc = false;
 
-    // Check module op itself
     if (mod->hasAttr("pact.paged")) {
       hasPagedFunc = true;
       if (auto ps = mod->getAttrOfType<IntegerAttr>("pact.page_size"))
-        pageSize = ps.getInt();
+        attrPageSize = ps.getInt();
     }
 
-    // Check nested operations (function ops)
     mod.walk([&](Operation *op) {
       if (op->hasAttr("pact.paged")) {
         hasPagedFunc = true;
         if (auto ps = op->getAttrOfType<IntegerAttr>("pact.page_size"))
-          pageSize = ps.getInt();
+          if (attrPageSize == 0)
+            attrPageSize = ps.getInt();
       }
     });
-    if (!hasPagedFunc)
-      return; // No-op fallback
-
-    if (pageSize <= 0)
-      return; // Invalid page size
 
     // Counters
     int numBlockTableLoads = 0;
     int numKVLoadsAnnotated = 0;
+    int numAutoDetected = 0;
 
-    // Walk all scf.for loops in paged functions
+    // Walk all scf.for loops
     mod.walk([&](scf::ForOp forOp) {
-      // Check parent function for pact.paged (try both module and func attrs)
+      int64_t pageSize = attrPageSize;
+      bool autoDetected = false;
+
+      // If no attribute-provided page_size, try auto-detection
+      if (pageSize <= 0) {
+        SmallVector<Operation *> divOps, remOps;
+        pageSize = detectPageSize(forOp, &getContext(), divOps, remOps);
+        if (pageSize > 0) {
+          autoDetected = true;
+          numAutoDetected++;
+          // Set pact.paged and pact.page_size on the parent function
+          auto *pagedFuncOp = forOp->getParentOp();
+          pagedFuncOp->setAttr("pact.paged",
+                               UnitAttr::get(&getContext()));
+          pagedFuncOp->setAttr("pact.page_size",
+              IntegerAttr::get(IntegerType::get(&getContext(), 64),
+                               pageSize));
+          // Also set on the module for downstream passes
+          if (!mod->hasAttr("pact.paged")) {
+            mod->setAttr("pact.paged", UnitAttr::get(&getContext()));
+            mod->setAttr("pact.page_size",
+                IntegerAttr::get(IntegerType::get(&getContext(), 64),
+                                 pageSize));
+          }
+        }
+      }
+
+      if (pageSize <= 0)
+        return WalkResult::advance();
+
+      // Check parent function context
       auto *parentOp = forOp->getParentOp();
       bool isPaged = mod->hasAttr("pact.paged");
       while (parentOp && !isPaged) {
@@ -185,31 +425,21 @@ struct PageTransformPass
       if (!isPaged)
         return WalkResult::advance();
 
-      // Phase 1: Identify block table loads inside this loop
-      // A block table load is a tt.load whose pointer traces to
-      // block_tables_ptr (by name) and whose index involves arith.divsi
-      // by pageSize.
+      // Phase 1: Identify block table loads inside this loop.
+      // A block table load is a tt.load whose pointer offset chain involves
+      // arith.divsi by pageSize.
       SmallVector<Operation *> blockTableLoads;
-      int numLoadOps = 0, numTtLoadOps = 0, numWithDiv = 0, numWithOffsetChain = 0;
-      int numPhase2Loads = 0, numPhase2DependsBT = 0, numPhase2HasRem = 0;
       forOp.walk([&](Operation *op) {
-        numLoadOps++;
         if (op->getName().getStringRef() != "tt.load")
           return WalkResult::advance();
 
-        numTtLoadOps++;
         auto loadOp = op;
         Value ptr = loadOp->getOperand(0);
 
-        // Trace pointer chain to find base
+        // Trace pointer chain to find offsets
         SmallVector<Value, 8> offsetChain;
-        Value base = traceToBasePointer(ptr, offsetChain);
-        numWithOffsetChain += (offsetChain.size() > 0) ? 1 : 0;
+        traceToBasePointer(ptr, offsetChain);
 
-        // The paged access is identified by the presence of divsi by
-        // PAGE_SIZE in the offset chain, not by the base pointer name.
-        // The base pointer name heuristic is unreliable in optimized IR.
-        // Fallback: check if any offset involves divsi by pageSize
         bool hasDivByPageSize = false;
         for (auto off : offsetChain) {
           if (hasDivOrRemByConst(off, pageSize, /*checkDiv=*/true,
@@ -220,8 +450,6 @@ struct PageTransformPass
         }
 
         if (hasDivByPageSize) {
-          numWithDiv++;
-          // This is likely a block table lookup
           loadOp->setAttr("pact.block_table_lookup",
                           UnitAttr::get(&getContext()));
           blockTableLoads.push_back(loadOp);
@@ -241,23 +469,19 @@ struct PageTransformPass
                       UnitAttr::get(&getContext()));
 
       // Phase 2: Identify K/V loads.
-      // Heuristic: inside the same scf.for loop as the block table lookup,
-      // any tt.load (not already annotated as block_table_lookup) whose
-      // offset chain involves arith.remsi by pageSize is a paged KV load.
+      // Any tt.load (not already annotated) whose offset chain involves
+      // arith.remsi by pageSize is a paged KV load.
       forOp.walk([&](Operation *op) {
-        numPhase2Loads++;
         if (op->getName().getStringRef() != "tt.load")
           return WalkResult::advance();
-        // Skip block table loads themselves
         if (op->hasAttr("pact.block_table_lookup"))
           return WalkResult::advance();
 
         auto loadOp = op;
         Value ptr = loadOp->getOperand(0);
 
-        // Trace pointer chain to find offsets involving remsi by pageSize
         SmallVector<Value, 8> offsetChain;
-        Value base = traceToBasePointer(ptr, offsetChain);
+        traceToBasePointer(ptr, offsetChain);
         bool hasRemByPageSize = false;
         for (auto off : offsetChain) {
           if (hasDivOrRemByConst(off, pageSize, /*checkDiv=*/false,
@@ -270,8 +494,6 @@ struct PageTransformPass
         if (!hasRemByPageSize)
           return WalkResult::advance();
 
-        numPhase2HasRem++;
-
         // Annotate as paged KV load
         loadOp->setAttr("pact.paged_load", UnitAttr::get(&getContext()));
         numKVLoadsAnnotated++;
@@ -282,17 +504,15 @@ struct PageTransformPass
       return WalkResult::advance();
     });
 
-    // Stage B (div→shift/rem→and canonicalization): deferred.
-    // LLVM already performs this optimization at the LLVM IR level
-    // (confirmed in motivation analysis). Implementing at TTIR level
-    // would require MLIR::create API migration that provides no
-    // additional performance benefit.
-
-    // Summary (only log when matches found)
+    // Summary
+    if (numAutoDetected > 0) {
+      llvm::errs() << "[PACT PageTransform] Auto-detected " << numAutoDetected
+                   << " paged attention loop(s) via def-use chain analysis\n";
+    }
     if (numBlockTableLoads > 0) {
       llvm::errs() << "[PACT PageTransform] Recognized " << numBlockTableLoads
                    << " block_table lookup(s) and " << numKVLoadsAnnotated
-                   << " paged KV load(s) (pageSize=" << pageSize << ")\n";
+                   << " paged KV load(s)\n";
     }
   }
 };

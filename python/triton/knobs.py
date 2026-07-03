@@ -578,6 +578,7 @@ class pact_knobs(base_knobs):
     enable_page_transform: env_bool = env_bool("PACT_ENABLE_PAGE_TRANSFORM", True)
     enable_pattern_specialize: env_bool = env_bool("PACT_ENABLE_PATTERN_SPECIALIZE", True)
     enable_prefetch_insert: env_bool = env_bool("PACT_ENABLE_PREFETCH_INSERT", True)
+    enable_layout_remap: env_bool = env_bool("PACT_ENABLE_LAYOUT_REMAP", True)
     dump_ir: env_bool = env_bool("PACT_DUMP_IR", False)
     verbose: env_bool = env_bool("PACT_VERBOSE", False)
 

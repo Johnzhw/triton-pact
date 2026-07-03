@@ -96,6 +96,7 @@ void init_triton_passes_ttgpuir(py::module &&m) {
   ADD_PASS_WRAPPER_0("add_coalesce_async_copy",
                      createTritonGPUCoalesceAsyncCopy);
   ADD_PASS_WRAPPER_0("add_prefetch_insert", createTritonGPUPrefetchInsert);
+  ADD_PASS_WRAPPER_0("add_pact_layout_remap", createTritonGPUPactLayoutRemap);
   ADD_PASS_WRAPPER_0("add_global_sanitizer",
                      createTritonInstrumentGlobalSanitizer);
   ADD_PASS_WRAPPER_0("add_concurrency_sanitizer",

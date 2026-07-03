@@ -25,6 +25,7 @@ add_triton_library(TritonGPUTransforms
   Pipeliner/Schedule.cpp
   Prefetch.cpp
   PrefetchInsert.cpp
+  PactLayoutRemap.cpp
   RemoveLayoutConversions.cpp
   ReorderInstructions.cpp
   CoalesceAsyncCopy.cpp

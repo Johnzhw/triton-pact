@@ -337,6 +337,9 @@ class CUDABackend(BaseBackend):
             passes.common.add_canonicalizer(pm)
             passes.common.add_cse(pm)
 
+        # PACT: PactLayoutRemap runs before PrefetchInsert to fix layout/mask.
+        if knobs.pact.enable and knobs.pact.enable_layout_remap:
+            passes.ttgpuir.add_pact_layout_remap(pm)
         # PACT: Schedule PrefetchInsert last, after all other TTGIR passes.
         # This ensures local_alloc ops created by optimize_dot_operands,
         # prefetch, pipeline, or coalesce_async_copy are visible.

@@ -355,4 +355,18 @@ def TritonGPUPrefetchInsert : Pass<"tritongpu-prefetch-insert", "mlir::ModuleOp"
                            "mlir::arith::ArithDialect"];
 }
 
+def TritonGPUPactLayoutRemap : Pass<"tritongpu-pact-layout-remap", "mlir::ModuleOp"> {
+  let summary = "Remap paged KV load layouts for cp.async eligibility";
+  let description = [{
+    Remaps tensor layouts of paged K/V loads (tt.load with pact.paged_load)
+    to make them cp.async-eligible.  For K loads, makes the head_dim axis
+    the contiguous dimension.  For V loads, converts per-element masks to
+    unconditional load + post-load arith.select.  No-op fallback if no
+    paged loads are annotated or if remapping is not possible.
+  }];
+  let dependentDialects = ["mlir::triton::gpu::TritonGPUDialect",
+                           "mlir::triton::TritonDialect",
+                           "mlir::arith::ArithDialect"];
+}
+
 #endif

@@ -1054,29 +1054,25 @@ struct AsyncCopyGlobalToLocalOpConversion
       auto srcElem = b.extract_val(ptrTy, structElem, 0);
       auto maskElem = b.extract_val(i1_ty, structElem, 1);
 
-      // For nBytes=2: fall back to sync ld.global.b16 + st.shared.b16.
-      // cp.async needs 4-byte aligned source; odd f16 offsets are only
-      // 2-byte aligned → use sync load/store instead.
-      if (nBytes == 2) {
-        // ld.global.b16 via PTXBuilder
-        PTXBuilder loadBuilder;
-        auto &loadInstr = *loadBuilder.create<PTXInstr>("ld");
-        loadInstr.global().b(16);
-        auto *loadDst = loadBuilder.newOperand("=h");
-        auto *loadSrc = loadBuilder.newAddrOperand(srcElem, "l");
-        loadInstr(loadDst, loadSrc).maybePredicate(threadPred);
-        auto loadedVal = loadBuilder.launch(rewriter, loc,
-                                             IntegerType::get(ctx, 16));
-
-        // st.shared.b16 via PTXBuilder
-        PTXBuilder storeBuilder;
-        auto &storeInstr = *storeBuilder.create<PTXInstr>("st");
-        storeInstr.shared().b(16);
-        auto *storeAddr = storeBuilder.newAddrOperand(shmemAddr, "r");
-        auto *storeData = storeBuilder.newOperand(loadedVal, "h");
-        storeInstr(storeAddr, storeData).maybePredicate(threadPred);
-        storeBuilder.launch(rewriter, loc, void_ty(ctx));
+      // For nBytes=2: pair consecutive elements.  Even-indexed calls
+      // (startIdx % 2 == 0) emit cp.async with cpSize=4, srcSize=4
+      // from a 4-byte-aligned address, covering two f16 elements.
+      // Odd-indexed calls skip (already loaded by the paired even call).
+      if (nBytes == 2 && (startIdx % 2 == 0)) {
+        auto cpSizeVal = 4;
+        CacheModifier mod = CacheModifier::CA;
+        PTXBuilder ptxBuilder;
+        auto &copyAsyncOp = *ptxBuilder.create<PTXCpAsyncLoadInstr>(mod);
+        auto *dstOp = ptxBuilder.newAddrOperand(shmemAddr, "r");
+        auto *srcOp = ptxBuilder.newAddrOperand(srcElem, "l");
+        auto *copySz = ptxBuilder.newConstantOperand(cpSizeVal);
+        auto *srcSz = ptxBuilder.newConstantOperand(cpSizeVal);
+        copyAsyncOp(dstOp, srcOp, copySz, srcSz).maybePredicate(threadPred);
+        ptxBuilder.launch(rewriter, loc, void_ty(ctx));
         return {};
+      }
+      if (nBytes == 2 && (startIdx % 2 == 1)) {
+        return {}; // skip odd-indexed elements (loaded by even pair)
       }
 
       // Tune CG and CA for cp.async.

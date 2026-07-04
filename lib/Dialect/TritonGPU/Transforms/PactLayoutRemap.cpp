@@ -1,13 +1,7 @@
 //===- PactLayoutRemap.cpp - PACT Layout Remap Pass -----------------------===//
 //
-// Fixes paged K/V loads for cp.async compatibility:
-//   1. V load: replace per-element mask with splat-1
-//   2. K load: mark for contiguity override + nBytes=2 padding
-//
-// nBytes=2 strategy: emitCpAsync pads to cpSize=4, srcSize=2.
-// Elements at odd offsets are 2-byte aligned → handled in lowering
-// by pairing: if addr is 4-byte aligned, use cp.async; else emit
-// individual ld.global + st.shared.
+//   1. V load: replaces per-element mask with splat-1
+//   2. K load: marks with pact.layout_remapped for nBytes=2 pairing
 //===----------------------------------------------------------------------===//
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
@@ -18,7 +12,6 @@
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/Transforms/Passes.h"
-
 #include "llvm/Support/raw_ostream.h"
 
 using namespace mlir;
@@ -39,47 +32,49 @@ struct PactLayoutRemapPass
     ModuleOp mod = getOperation();
     int numKMarked = 0, numVMaskFixed = 0;
 
-    // First pass: fix V load masks (modify in-place)
     mod.walk([&](triton::LoadOp loadOp) {
       if (!loadOp->hasAttr("pact.paged_load"))
         return WalkResult::advance();
-      Value mask = loadOp.getMask();
-      if (!mask) return WalkResult::advance();
 
-      bool isAllOnes = false;
-      if (auto constOp = mask.getDefiningOp<arith::ConstantOp>())
-        if (auto da = dyn_cast<DenseIntElementsAttr>(constOp.getValue()))
-          if (da.isSplat() && da.getSplatValue<APInt>().isOne())
-            isAllOnes = true;
-      if (isAllOnes) return WalkResult::advance();
-
-      ImplicitLocOpBuilder b(loadOp.getLoc(), &getContext());
-      b.setInsertionPoint(loadOp);
-      auto maskTy = cast<RankedTensorType>(mask.getType());
-      auto oneAttr = DenseIntElementsAttr::get(maskTy, APInt(1, 1));
-      loadOp.getMaskMutable().assign(
-          b.create<arith::ConstantOp>(maskTy, oneAttr).getResult());
-      numVMaskFixed++;
-      return WalkResult::advance();
-    });
-
-    // Second pass: mark K loads needing contiguity override
-    mod.walk([&](triton::LoadOp loadOp) {
-      if (!loadOp->hasAttr("pact.paged_load"))
-        return WalkResult::advance();
       auto rTy = dyn_cast<RankedTensorType>(loadOp.getResult().getType());
-      if (!rTy || rTy.getShape().size() < 2) return WalkResult::advance();
+      if (!rTy || rTy.getShape().size() < 2)
+        return WalkResult::advance();
+
       auto enc = dyn_cast<BlockedEncodingAttr>(rTy.getEncoding());
       if (!enc) return WalkResult::advance();
 
+      auto ctx = &getContext();
+      auto b = ImplicitLocOpBuilder(loadOp.getLoc(), ctx);
+      b.setInsertionPoint(loadOp);
+
+      // V load mask fix
+      Value mask = loadOp.getMask();
+      if (mask) {
+        bool allOnes = false;
+        if (auto c = mask.getDefiningOp<arith::ConstantOp>())
+          if (auto da = dyn_cast<DenseIntElementsAttr>(c.getValue()))
+            if (da.isSplat() && da.getSplatValue<APInt>().isOne())
+              allOnes = true;
+        if (!allOnes) {
+          auto mTy = cast<RankedTensorType>(mask.getType());
+          auto one = DenseIntElementsAttr::get(mTy, APInt(1, 1));
+          loadOp.getMaskMutable().assign(
+              b.create<arith::ConstantOp>(mTy, one).getResult());
+          numVMaskFixed++;
+        }
+      }
+
+      // K load: mark for nBytes=2 pairing in lowering
       auto sz = enc.getSizePerThread();
       auto order = enc.getOrder();
-      if (order.empty()) return WalkResult::advance();
-      unsigned bytes = sz[order[0]] * (rTy.getElementTypeBitWidth() / 8);
-      if (bytes < 4) {
-        loadOp->setAttr("pact.layout_remapped", UnitAttr::get(&getContext()));
-        numKMarked++;
+      if (!order.empty()) {
+        unsigned bytes = sz[order[0]] * (rTy.getElementTypeBitWidth() / 8);
+        if (bytes < 4) {
+          loadOp->setAttr("pact.layout_remapped", UnitAttr::get(ctx));
+          numKMarked++;
+        }
       }
+
       return WalkResult::advance();
     });
 
@@ -89,7 +84,7 @@ struct PactLayoutRemapPass
   }
 };
 
-} // anonymous namespace
+} // namespace
 } // namespace gpu
 } // namespace triton
 } // namespace mlir

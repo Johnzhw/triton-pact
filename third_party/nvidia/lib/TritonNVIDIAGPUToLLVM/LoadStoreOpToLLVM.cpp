@@ -1043,44 +1043,54 @@ struct AsyncCopyGlobalToLocalOpConversion
                            ArrayRef<Value> vals, Value shmemAddr, int startIdx,
                            VectorType vecTy,
                            std::optional<Value> ctaId) -> SmallVector<Value> {
-      llvm::errs() << "[PACT LLVM Lowering] emitCpAsync: startIdx=" << startIdx
-                   << " nElem=" << vecTy.getNumElements()
-                   << " hasMask=" << hasMask << "\n";
       assert(!ctaId.has_value() && "cp.async does not support cross-cta loads");
       assert(isa<VectorType>(vecTy));
       auto *ctx = rewriter.getContext();
       auto elemTy = vecTy.getElementType();
       auto nBytes = vecTy.getNumElements() * elemTy.getIntOrFloatBitWidth() / 8;
       assert(nBytes == 16 || nBytes == 8 || nBytes == 4 || nBytes == 2);
-      // For nBytes=2: emit cp.async with cpSize=4, srcSize=2.
-      // The source address must be 4-byte aligned; the base pointer is
-      // 16-byte aligned (tt.divisibility=16) and elements are at 2-byte
-      // strides, so every other element is 4-byte aligned.
-      auto cpSize = nBytes < 4 ? 4 : nBytes;
-      auto srcSizeBytes = nBytes;
-      // Tune CG and CA.
-      CacheModifier srcCacheModifier =
-          cpSize == 16 ? CacheModifier::CG : CacheModifier::CA;
 
       auto structElem = vals[startIdx];
       auto srcElem = b.extract_val(ptrTy, structElem, 0);
       auto maskElem = b.extract_val(i1_ty, structElem, 1);
+
+      // For nBytes=2: fall back to sync ld.global.b16 + st.shared.b16.
+      // cp.async needs 4-byte aligned source; odd f16 offsets are only
+      // 2-byte aligned → use sync load/store instead.
+      if (nBytes == 2) {
+        // ld.global.b16 via PTXBuilder
+        PTXBuilder loadBuilder;
+        auto &loadInstr = *loadBuilder.create<PTXInstr>("ld");
+        loadInstr.global().b(16);
+        auto *loadDst = loadBuilder.newOperand("=h");
+        auto *loadSrc = loadBuilder.newAddrOperand(srcElem, "l");
+        loadInstr(loadDst, loadSrc).maybePredicate(threadPred);
+        auto loadedVal = loadBuilder.launch(rewriter, loc,
+                                             IntegerType::get(ctx, 16));
+
+        // st.shared.b16 via PTXBuilder
+        PTXBuilder storeBuilder;
+        auto &storeInstr = *storeBuilder.create<PTXInstr>("st");
+        storeInstr.shared().b(16);
+        auto *storeAddr = storeBuilder.newAddrOperand(shmemAddr, "r");
+        auto *storeData = storeBuilder.newOperand(loadedVal, "h");
+        storeInstr(storeAddr, storeData).maybePredicate(threadPred);
+        storeBuilder.launch(rewriter, loc, void_ty(ctx));
+        return {};
+      }
+
+      // Tune CG and CA for cp.async.
+      CacheModifier srcCacheModifier =
+          nBytes == 16 ? CacheModifier::CG : CacheModifier::CA;
 
       PTXBuilder ptxBuilder;
       auto &copyAsyncOp =
           *ptxBuilder.create<PTXCpAsyncLoadInstr>(srcCacheModifier);
       auto *dstOperand = ptxBuilder.newAddrOperand(shmemAddr, "r");
       auto *srcOperand = ptxBuilder.newAddrOperand(srcElem, "l");
-      auto *copySize = ptxBuilder.newConstantOperand(cpSize);
-      auto *srcSize = ptxBuilder.newConstantOperand(srcSizeBytes);
+      auto *copySize = ptxBuilder.newConstantOperand(nBytes);
+      auto *srcSize = copySize;
       if (hasMask) {
-        // We don't use predicate in this case, setting src-size to 0
-        // if there's any mask. cp.async will automatically fill the
-        // remaining slots with 0 if cp-size > src-size.
-        // XXX(Keren): Always assume other = 0 for now.
-        // When 'other != 0' is supported, we will need to fold the
-        // op.getMask() and redundantDataMask() into the same predicate, the
-        // way it is done for LoadOp.
         auto selectOp = b.select(maskElem, b.i32_val(nBytes), b.i32_val(0));
         srcSize = ptxBuilder.newOperand(selectOp, "r");
       }

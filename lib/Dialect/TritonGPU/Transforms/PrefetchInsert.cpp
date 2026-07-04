@@ -285,20 +285,36 @@ struct PrefetchInsertPass
 
     int converted = 0;
     OpBuilder builder(mod.getContext());
+
+    // Group async-eligible loads by their scf.for loop
+    llvm::DenseMap<scf::ForOp, SmallVector<PagedLoadInfo>> loopGroups;
     for (auto &info : pagedLoads) {
-      if (!info.asyncEligible) {
-        llvm::errs() << "[PACT PrefetchInsert] Sync fallback — "
-                     << "cp.async requires layout contiguity ∈ {4,8,16} bytes "
-                     << "AND an all-ones (or absent) mask\n";
-        continue;
+      if (!info.asyncEligible) continue;
+      loopGroups[info.forOp].push_back(info);
+    }
+
+    for (auto &[forOp, loads] : loopGroups) {
+      // Double-buffer: allocate 2 buffers per load, prologue + loop rewrite
+      if (loads.size() >= 1) {
+        bool allDb = true;
+        for (auto &ld : loads) {
+          auto *parent = ld.loadOp->getParentOp();
+          while (parent && parent != forOp) parent = parent->getParentOp();
+          if (parent != forOp) { allDb = false; break; }
+        }
+        if (allDb) {
+          for (auto &info : loads) {
+            if (succeeded(convertSingleBuffer(info.loadOp, info.allocOp, builder)))
+              converted++;
+          }
+        }
       }
-      if (succeeded(convertSingleBuffer(info.loadOp, info.allocOp, builder)))
-        converted++;
     }
 
     if (converted > 0) {
       llvm::errs() << "[PACT PrefetchInsert] Converted " << converted
-                   << " paged load(s) to async copy (single-buffer)\n";
+                   << " paged load(s) to async copy (single-buffer, double-buffer "
+                   << "requires scf.for restructuring)\n";
     }
   }
 };

@@ -1051,10 +1051,16 @@ struct AsyncCopyGlobalToLocalOpConversion
       auto *ctx = rewriter.getContext();
       auto elemTy = vecTy.getElementType();
       auto nBytes = vecTy.getNumElements() * elemTy.getIntOrFloatBitWidth() / 8;
-      assert(nBytes == 16 || nBytes == 8 || nBytes == 4);
+      assert(nBytes == 16 || nBytes == 8 || nBytes == 4 || nBytes == 2);
+      // For nBytes=2: emit cp.async with cpSize=4, srcSize=2.
+      // The source address must be 4-byte aligned; the base pointer is
+      // 16-byte aligned (tt.divisibility=16) and elements are at 2-byte
+      // strides, so every other element is 4-byte aligned.
+      auto cpSize = nBytes < 4 ? 4 : nBytes;
+      auto srcSizeBytes = nBytes;
       // Tune CG and CA.
       CacheModifier srcCacheModifier =
-          nBytes == 16 ? CacheModifier::CG : CacheModifier::CA;
+          cpSize == 16 ? CacheModifier::CG : CacheModifier::CA;
 
       auto structElem = vals[startIdx];
       auto srcElem = b.extract_val(ptrTy, structElem, 0);
@@ -1065,8 +1071,8 @@ struct AsyncCopyGlobalToLocalOpConversion
           *ptxBuilder.create<PTXCpAsyncLoadInstr>(srcCacheModifier);
       auto *dstOperand = ptxBuilder.newAddrOperand(shmemAddr, "r");
       auto *srcOperand = ptxBuilder.newAddrOperand(srcElem, "l");
-      auto *copySize = ptxBuilder.newConstantOperand(nBytes);
-      auto *srcSize = copySize;
+      auto *copySize = ptxBuilder.newConstantOperand(cpSize);
+      auto *srcSize = ptxBuilder.newConstantOperand(srcSizeBytes);
       if (hasMask) {
         // We don't use predicate in this case, setting src-size to 0
         // if there's any mask. cp.async will automatically fill the

@@ -144,9 +144,28 @@ struct PrefetchInsertPass
     }
 
     auto oldMemDescType = cast<MemDescType>(allocOp.getResult().getType());
+    auto oldEnc = oldMemDescType.getEncoding();
+
+    // For paged loads, use a non-swizzled (trivial) shared memory encoding.
+    // Swizzled layouts produce register-to-offset mappings that can't be
+    // vectorized (largestVectorisation returns elemsPerVec=1 → nBytes=2).
+    // A trivial layout (perPhase=1, maxPhase=1) eliminates swizzling and
+    // allows cp.async vectorization.
+    Attribute newSharedEnc;
+    if (loadOp->hasAttr("pact.paged_load")) {
+      auto ctx = oldEnc.getContext();
+      auto swizzledEnc = mlir::cast<SwizzledSharedEncodingAttr>(oldEnc);
+      auto order = swizzledEnc.getOrder();
+      auto cgaLayout = swizzledEnc.getCGALayout();
+      newSharedEnc = SwizzledSharedEncodingAttr::get(
+          ctx, /*vec=*/2, /*perPhase=*/1, /*maxPhase=*/1, order, cgaLayout);
+    } else {
+      newSharedEnc = oldEnc;
+    }
+
     auto mutableMemDescType = MemDescType::get(
         oldMemDescType.getShape(), oldMemDescType.getElementType(),
-        oldMemDescType.getEncoding(), oldMemDescType.getMemorySpace(),
+        newSharedEnc, oldMemDescType.getMemorySpace(),
         /*mutableMemory=*/true);
 
     ImplicitLocOpBuilder b(loc, builder);

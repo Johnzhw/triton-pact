@@ -1,17 +1,8 @@
 //===- PactLayoutRemap.cpp - PACT Layout Remap Pass -----------------------===//
 //
 // PACT PactLayoutRemap pass: prepares paged K/V loads for cp.async.
-// Operates at TTGIR level, before PrefetchInsert.
-//
-// 1. V load: replaces per-element mask with splat-1 (unconditional).
-//    Correctness: attention mask handles masked positions.
-//
-// 2. K load: marks load with pact.layout_remapped attribute so
-//    PrefetchInsert can set a higher contiguity hint.
-//    Safety: when PAGE_SIZE % TILE_SIZE == 0 (the common case),
-//    tiles don't cross page boundaries → all within-tile addresses
-//    are contiguous.
-//
+//   1. V load: replaces per-element mask with splat-1 (unconditional).
+//   2. K load: marks with pact.layout_remapped for contiguity override.
 //===----------------------------------------------------------------------===//
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
@@ -55,21 +46,19 @@ struct PactLayoutRemapPass
       if (!blockedEnc)
         return WalkResult::advance();
 
+      MLIRContext *ctx = &getContext();
       Location loc = loadOp.getLoc();
-      ImplicitLocOpBuilder b(loc, &getContext());
-      b.setInsertionPoint(loadOp);  // BEFORE the load, for mask constant
+      ImplicitLocOpBuilder b(loc, ctx);
+      b.setInsertionPoint(loadOp);
 
-      // --- V load: fix per-element mask ---
+      // --- V load mask fix ---
       Value mask = loadOp.getMask();
       if (mask) {
         bool isAllOnes = false;
         if (auto constOp = mask.getDefiningOp<arith::ConstantOp>()) {
-          if (auto denseAttr =
-                  dyn_cast<DenseIntElementsAttr>(constOp.getValue())) {
-            if (denseAttr.isSplat() &&
-                denseAttr.getSplatValue<APInt>().isOne())
+          if (auto denseAttr = dyn_cast<DenseIntElementsAttr>(constOp.getValue()))
+            if (denseAttr.isSplat() && denseAttr.getSplatValue<APInt>().isOne())
               isAllOnes = true;
-          }
         }
         if (!isAllOnes) {
           auto maskTy = cast<RankedTensorType>(mask.getType());
@@ -80,23 +69,17 @@ struct PactLayoutRemapPass
         }
       }
 
-      // --- K load: mark for contiguity hint ---
+      // --- K load: mark for contiguity override ---
       auto sz = blockedEnc.getSizePerThread();
       auto order = blockedEnc.getOrder();
-      if (order.size() < 2)
-        return WalkResult::advance();
-
-      unsigned contigDim = order[0];
-      unsigned elemBytes = resultTy.getElementTypeBitWidth() / 8;
-      unsigned bytesPerThread = sz[contigDim] * elemBytes;
-
-      if (bytesPerThread < 4) {
-        // Mark that this load needs a contiguity override.
-        // Safety: when TILE_SIZE divides PAGE_SIZE, tiles don't
-        // cross page boundaries → contiguous addresses within tile.
-        loadOp->setAttr("pact.layout_remapped",
-                        UnitAttr::get(&getContext()));
-        numKMarked++;
+      if (order.size() >= 2) {
+        unsigned contigDim = order[0];
+        unsigned elemBytes = resultTy.getElementTypeBitWidth() / 8;
+        unsigned bytesPerThread = sz[contigDim] * elemBytes;
+        if (bytesPerThread < 4) {
+          loadOp->setAttr("pact.layout_remapped", UnitAttr::get(ctx));
+          numKMarked++;
+        }
       }
 
       return WalkResult::advance();

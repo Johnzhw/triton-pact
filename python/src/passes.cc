@@ -51,6 +51,7 @@ void init_triton_passes_ttir(py::module &&m) {
   ADD_PASS_WRAPPER_0("add_triton_licm", createTritonLoopInvariantCodeMotion);
   ADD_PASS_WRAPPER_0("add_loop_aware_cse", createTritonLoopAwareCSE);
   ADD_PASS_WRAPPER_0("add_page_transform", createTritonPageTransform);
+  ADD_PASS_WRAPPER_0("add_pact_prefetch", createTritonPactPrefetch);
   ADD_PASS_WRAPPER_0("add_pattern_specialize", createTritonPatternSpecialize);
   ADD_PASS_OPTION_WRAPPER_4("add_convert_to_ttgpuir",
                             createConvertTritonToTritonGPU, const std::string &,

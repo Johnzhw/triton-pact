@@ -91,6 +91,16 @@ def TritonPageTransform : Pass<"triton-page-transform", "mlir::ModuleOp"> {
   let dependentDialects = ["mlir::triton::TritonDialect", "mlir::arith::ArithDialect"];
 }
 
+def TritonPactPrefetch : Pass<"triton-pact-prefetch", "mlir::ModuleOp"> {
+  let summary = "Software block-table prefetch restructuring for paged attention";
+  let description = [{
+    Restructures the main tile loop to prefetch the next iteration's
+    block_table lookup while computing the current iteration's attention.
+    Operates at TTIR level, before TTGIR conversion.
+  }];
+  let dependentDialects = ["mlir::triton::TritonDialect", "mlir::arith::ArithDialect"];
+}
+
 def TritonPatternSpecialize : Pass<"triton-pattern-specialize", "mlir::ModuleOp"> {
   let summary = "Specialize MQA/GQA head mapping for paged attention";
   let description = [{

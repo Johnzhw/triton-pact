@@ -254,6 +254,8 @@ class CUDABackend(BaseBackend):
             passes.ttir.add_page_transform(pm)
         if knobs.pact.enable and knobs.pact.enable_pattern_specialize:
             passes.ttir.add_pattern_specialize(pm)
+        if knobs.pact.enable and knobs.pact.enable_bt_prefetch:
+            passes.ttir.add_pact_prefetch(pm)
         passes.common.add_cse(pm)
         passes.common.add_symbol_dce(pm)
         passes.ttir.add_loop_unroll(pm)

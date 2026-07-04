@@ -151,11 +151,26 @@ struct PrefetchInsertPass
 
     ImplicitLocOpBuilder b(loc, builder);
 
+    // For splat-1 masks (all-ones), skip the mask operand — cp.async
+    // can be unconditional and the mask just adds overhead in lowering.
+    bool isAllOnes = false;
+    if (mask) {
+      if (auto constOp = mask.getDefiningOp<arith::ConstantOp>()) {
+        if (auto denseAttr =
+                dyn_cast<DenseIntElementsAttr>(constOp.getValue())) {
+          if (denseAttr.isSplat() &&
+              denseAttr.getSplatValue<APInt>().isOne())
+            isAllOnes = true;
+        }
+      }
+    }
+    Value asyncMask = isAllOnes ? Value() : mask;
+
     b.setInsertionPoint(loadOp);
     Value newBuf = LocalAllocOp::create(b, mutableMemDescType).getResult();
 
     Operation *copy = AsyncCopyGlobalToLocalOp::create(
-        b, src, newBuf, mask, other,
+        b, src, newBuf, asyncMask, other,
         cache, evict, isVolatile, contiguity);
 
     // Propagate pact attributes to the async copy op for lowering hints

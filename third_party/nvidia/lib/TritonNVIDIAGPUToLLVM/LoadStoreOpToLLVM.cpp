@@ -1009,17 +1009,11 @@ struct AsyncCopyGlobalToLocalOpConversion
     // For paged async copies, use the contiguity hint as the primary
     // vector size.  Addresses are contiguous within a physical page
     // (verified: TILE_SIZE divides PAGE_SIZE for the frozen kernel).
-    unsigned maxVec;
-    bool isPagedAsync = op->hasAttr("pact.paged_load");
-    llvm::errs() << "[PACT LLVM Lowering] async_copy: isPaged=" << isPagedAsync
-                 << " contiguityHint=" << op.getContiguity() << "\n";
-    if (isPagedAsync) {
-      maxVec = op.getContiguity();  // trust the hint from PrefetchInsert
-    } else {
-      maxVec = getContiguity(op.getSrc());
-      if (mask)
-        maxVec = std::min(maxVec, getMaskAlignment(mask));
+    unsigned maxVec = getContiguity(op.getSrc());
+    if (mask) {
+      maxVec = std::min(maxVec, getMaskAlignment(mask));
     }
+    // If the op has a contiguity hint use it to increase the vector size.
     maxVec = std::max(maxVec, op.getContiguity());
     // The maximum vector size is 128 bits on NVIDIA GPUs.
     maxVec = std::min(maxVec, 128 / resElemTy.getIntOrFloatBitWidth());
@@ -1049,6 +1043,9 @@ struct AsyncCopyGlobalToLocalOpConversion
                            ArrayRef<Value> vals, Value shmemAddr, int startIdx,
                            VectorType vecTy,
                            std::optional<Value> ctaId) -> SmallVector<Value> {
+      llvm::errs() << "[PACT LLVM Lowering] emitCpAsync: startIdx=" << startIdx
+                   << " nElem=" << vecTy.getNumElements()
+                   << " hasMask=" << hasMask << "\n";
       assert(!ctaId.has_value() && "cp.async does not support cross-cta loads");
       assert(isa<VectorType>(vecTy));
       auto *ctx = rewriter.getContext();
@@ -1092,16 +1089,23 @@ struct AsyncCopyGlobalToLocalOpConversion
         getSharedMemoryObjectFromStruct(loc, llDst, resElemTy, rewriter);
     auto smemLayout = ttg::toLinearLayout(dstTy);
     auto cvt = srcLayout.invertAndCompose(smemLayout);
+    llvm::errs() << "[PACT LLVM Lowering] cvt.isTrivialOver(block)="
+                 << cvt.isTrivialOver({str_attr("block")}) << "\n";
     if (!cvt.isTrivialOver({str_attr("block")})) {
       return emitError(loc,
                        "cp.async does not support non-trivial block dimension");
     }
+    llvm::errs() << "[PACT LLVM Lowering] calling lowerLdSt...\n";
     auto affineOffset = smemObj.getShmemOffset(loc, rewriter, dstTy);
     auto maskSpanAffineOffset = SharedMemoryObject::getMaskSpanOffsets(dstTy);
     auto [laneId, warpId] = getLaneAndWarpId(rewriter, loc);
+    // Pass std::nullopt for maxVec to allow layout permutations.
+    // The contiguity hint already constrains vecBytes at the lowering level.
     lowerLdSt(loc, ctx, cvt, vals, resElemTy, smemObj.getBase(),
               /*paddingShifts=*/{}, affineOffset, maskSpanAffineOffset, laneId,
-              warpId, rewriter, targetInfo, maxVec, emitCpAsync);
+              warpId, rewriter, targetInfo, /*maybeMaxVecElems=*/std::nullopt,
+              emitCpAsync);
+    llvm::errs() << "[PACT LLVM Lowering] lowerLdSt completed, replacing op...\n";
 
     // Drop the result token.
     Value zero = LLVM::ConstantOp::create(rewriter, op.getLoc(),

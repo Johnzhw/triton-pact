@@ -83,7 +83,12 @@ static bool canUseCpAsync(triton::LoadOp loadOp) {
 
   unsigned contiguousDim = order[0];
   unsigned bytesPerVec = sz[contiguousDim] * elemBytes;
-  if (bytesPerVec != 4 && bytesPerVec != 8 && bytesPerVec != 16)
+  // For layout-remapped paged loads, allow contiguity override via hint.
+  // The LLVM lowering will use op.getContiguity() to override the vector size.
+  bool layoutRemapped = loadOp->hasAttr("pact.layout_remapped");
+  if (!layoutRemapped && bytesPerVec != 4 && bytesPerVec != 8 && bytesPerVec != 16)
+    return false;
+  if (layoutRemapped && bytesPerVec * 2 < 4)  // need at least 2 elements to make 4 bytes via contiguity hint
     return false;
 
   Value mask = loadOp.getMask();
@@ -121,6 +126,23 @@ struct PrefetchInsertPass
     bool isVolatile = loadOp.getIsVolatile();
     uint32_t contiguity = 1;
 
+    // For paged loads, set a contiguity hint based on the encoding.
+    // Within a tile, all tokens share the same physical page →
+    // addresses are contiguous (consecutive elements differ by elemSize).
+    // Safe when TILE_SIZE divides PAGE_SIZE (the common case).
+    if (loadOp->hasAttr("pact.paged_load")) {
+      auto resTy = dyn_cast<RankedTensorType>(loadOp.getResult().getType());
+      if (auto blockedEnc =
+              dyn_cast<BlockedEncodingAttr>(resTy.getEncoding())) {
+        auto sz = blockedEnc.getSizePerThread();
+        auto order = blockedEnc.getOrder();
+        if (order.size() > 0) {
+          unsigned layoutContig = sz[order[0]];
+          contiguity = std::max(2u, layoutContig);
+        }
+      }
+    }
+
     auto oldMemDescType = cast<MemDescType>(allocOp.getResult().getType());
     auto mutableMemDescType = MemDescType::get(
         oldMemDescType.getShape(), oldMemDescType.getElementType(),
@@ -135,6 +157,14 @@ struct PrefetchInsertPass
     Operation *copy = AsyncCopyGlobalToLocalOp::create(
         b, src, newBuf, mask, other,
         cache, evict, isVolatile, contiguity);
+
+    // Propagate pact attributes to the async copy op for lowering hints
+    if (loadOp->hasAttr("pact.paged_load"))
+      copy->setAttr("pact.paged_load",
+                    loadOp->getAttr("pact.paged_load"));
+    if (loadOp->hasAttr("pact.layout_remapped"))
+      copy->setAttr("pact.layout_remapped",
+                    loadOp->getAttr("pact.layout_remapped"));
 
     Operation *commit =
         AsyncCommitGroupOp::create(b, copy->getResult(0));

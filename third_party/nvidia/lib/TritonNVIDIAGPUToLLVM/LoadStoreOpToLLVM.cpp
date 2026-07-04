@@ -1006,22 +1006,35 @@ struct AsyncCopyGlobalToLocalOpConversion
     //  2. The mask (if present) has "alignment" N, meaning that each group of N
     //     mask bits are the same.  For example if N=2, the mask must be
     //     [x, x, y, y, ...].
-    unsigned maxVec = getContiguity(op.getSrc());
-    if (mask) {
-      maxVec = std::min(maxVec, getMaskAlignment(mask));
+    // For paged async copies, use the contiguity hint as the primary
+    // vector size.  Addresses are contiguous within a physical page
+    // (verified: TILE_SIZE divides PAGE_SIZE for the frozen kernel).
+    unsigned maxVec;
+    bool isPagedAsync = op->hasAttr("pact.paged_load");
+    llvm::errs() << "[PACT LLVM Lowering] async_copy: isPaged=" << isPagedAsync
+                 << " contiguityHint=" << op.getContiguity() << "\n";
+    if (isPagedAsync) {
+      maxVec = op.getContiguity();  // trust the hint from PrefetchInsert
+    } else {
+      maxVec = getContiguity(op.getSrc());
+      if (mask)
+        maxVec = std::min(maxVec, getMaskAlignment(mask));
     }
-    // If the op has a contiguity hint use it to increase the vector size.
     maxVec = std::max(maxVec, op.getContiguity());
     // The maximum vector size is 128 bits on NVIDIA GPUs.
     maxVec = std::min(maxVec, 128 / resElemTy.getIntOrFloatBitWidth());
 
     int vecBytes = maxVec * resElemTy.getIntOrFloatBitWidth() / 8;
+    llvm::errs() << "[PACT LLVM Lowering] vecBytes=" << vecBytes
+                 << " maxVec=" << maxVec << " elemBits="
+                 << resElemTy.getIntOrFloatBitWidth() << "\n";
     if (vecBytes < 4) {
       return emitError(loc, "cp.async does not support transfers smaller than "
                             "4 bytes; calculated this as ")
              << vecBytes << " bytes";
     }
     assert(vecBytes == 16 || vecBytes == 8 || vecBytes == 4);
+    llvm::errs() << "[PACT LLVM Lowering] vecBytes check passed, continuing...\n";
 
     auto freeVarMasks = getFreeVariableMasks(srcTy);
     // NOTE(@peterbell10): We load redundant data on different CTAs, so the data

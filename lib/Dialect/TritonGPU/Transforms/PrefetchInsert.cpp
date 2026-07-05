@@ -112,6 +112,141 @@ static bool canUseCpAsync(triton::LoadOp loadOp) {
   return true;
 }
 
+//===----------------------------------------------------------------------===//
+// Helper: clone a value's definition chain, replacing oldIV with newIV.
+// Walks the use-def chain from `origVal` back through ops in `forBody`,
+// collects them in topological order, then clones each one with the IV
+// substitution applied.  Returns the cloned value corresponding to origVal,
+// or a null Value if no cloning was needed (origVal doesn't depend on IV).
+//===----------------------------------------------------------------------===//
+static Value cloneChainWithIVReplacement(Value origVal, Value oldIV,
+                                          Value newIV, Block *forBody,
+                                          ImplicitLocOpBuilder &builder) {
+  // If origVal already equals oldIV, just return newIV
+  if (origVal == oldIV)
+    return newIV;
+
+  // Step 1: collect ops in the definition chain (BFS from origVal upward)
+  SmallVector<Operation *> chainOps; // top-down (defs before uses)
+  SmallVector<Value> worklist;
+  SmallPtrSet<Operation *, 16> seen;
+  DenseMap<Value, Value> cloneMap;
+
+  worklist.push_back(origVal);
+  cloneMap[oldIV] = newIV;
+
+  while (!worklist.empty()) {
+    Value val = worklist.pop_back_val();
+    if (cloneMap.count(val))
+      continue;
+
+    // Block arguments that aren't the IV are left as-is
+    auto blockArg = dyn_cast<BlockArgument>(val);
+    if (blockArg) {
+      cloneMap[val] = val; // pass through unchanged
+      continue;
+    }
+
+    Operation *defOp = val.getDefiningOp();
+    if (!defOp || seen.count(defOp))
+      continue;
+
+    // Only clone ops inside the loop body.
+    // For ops outside the loop, map results to themselves (pass-through).
+    if (!defOp->getBlock() || defOp->getBlock() != forBody) {
+      for (Value res : defOp->getResults())
+        cloneMap[res] = res;
+      continue;
+    }
+
+    seen.insert(defOp);
+    chainOps.push_back(defOp);
+
+    // Visit operands
+    for (Value operand : defOp->getOperands()) {
+      if (!cloneMap.count(operand))
+        worklist.push_back(operand);
+    }
+  }
+
+  if (chainOps.empty()) {
+    // origVal doesn't depend on anything inside the loop — pass through
+    return origVal;
+  }
+
+  // Step 2: reverse to get topological order (defs before uses)
+  std::reverse(chainOps.begin(), chainOps.end());
+
+  llvm::errs() << "[PACT cloneChain] Cloning " << chainOps.size()
+               << " ops with IV replacement\n";
+
+  // Step 3: clone each op in topological order.
+  // Use iterative approach: repeatedly clone ops whose operands are all mapped,
+  // until all ops are cloned or no progress is made.
+  SmallVector<Operation *> pending(chainOps.begin(), chainOps.end());
+  while (!pending.empty()) {
+    bool madeProgress = false;
+    SmallVector<Operation *> nextPending;
+
+    for (Operation *op : pending) {
+      // Check if all operands are already mapped.
+      // Add pass-through mappings for loop-invariant values on the fly.
+      bool allMapped = true;
+      for (Value operand : op->getOperands()) {
+        if (cloneMap.count(operand))
+          continue;
+        // Loop-invariant: block arg (not IV) or defined outside forBody
+        auto *defOp = operand.getDefiningOp();
+        if (!defOp || defOp->getBlock() != forBody) {
+          cloneMap[operand] = operand; // pass-through
+          continue;
+        }
+        allMapped = false;
+        break;
+      }
+      if (!allMapped) {
+        nextPending.push_back(op);
+        continue;
+      }
+
+      madeProgress = true;
+
+      // Build new operands
+      SmallVector<Value> newOperands;
+      for (Value operand : op->getOperands())
+        newOperands.push_back(cloneMap.lookup(operand));
+
+      // Clone and insert
+      Operation *cloned = op->clone();
+      if (!cloned) {
+        llvm::errs() << "  FAILED to clone " << op->getName() << "\n";
+        return Value();
+      }
+      builder.insert(cloned);
+
+      // Set the substituted operands
+      for (unsigned i = 0; i < newOperands.size(); ++i)
+        cloned->setOperand(i, newOperands[i]);
+
+      // Map old results to new results
+      for (auto [oldRes, newRes] :
+           llvm::zip(op->getResults(), cloned->getResults()))
+        cloneMap[oldRes] = newRes;
+    }
+
+    if (!madeProgress) {
+      llvm::errs() << "[PACT cloneChain] ERROR: " << nextPending.size()
+                   << " ops unclonable (dependency cycle or missing operands)\n";
+      return Value();
+    }
+    pending = std::move(nextPending);
+  }
+
+  return cloneMap.lookup(origVal);
+
+  return cloneMap.lookup(origVal);
+}
+
 struct PrefetchInsertPass
     : public impl::TritonGPUPrefetchInsertBase<PrefetchInsertPass> {
 
@@ -240,11 +375,20 @@ struct PrefetchInsertPass
     return success();
   }
 
-  /// Double-buffer conversion for all eligible loads in a single scf.for loop.
-  /// Step 1 (no yield prefetch): allocate 2x buffers before the loop,
-  /// insert j%2 buffer selection + async_copy + wait + local_load at each
-  /// load's original position.  No software pipelining yet — just verify
-  /// the multi-buffer mechanism works.
+  /// Double-buffer conversion with software pipelining.
+  ///
+  /// Pattern:
+  ///   Prologue (before loop): async_copy ptr(j=0) → buf[0], commit
+  ///
+  ///   Loop body (iteration j):
+  ///     1. j%2, wait(0) — get data prefetched by prev iteration or prologue
+  ///     2. local_load buf[j%2] — use current iteration's data
+  ///     3. Compute ptr for j+1 (clone ptr chain with IV→j+1)
+  ///     4. async_copy ptr(j+1) → buf[(j+1)%2], commit — prefetch for next iter
+  ///     5. ... computation runs concurrently with step 4 ...
+  ///
+  ///   The prologue is created by cloning the ptr definition chain with the
+  ///   induction variable replaced by constant 0, before the scf.for.
   LogicalResult convertDoubleBuffer(scf::ForOp forOp,
                                      SmallVectorImpl<PagedLoadInfo> &loads,
                                      OpBuilder &builder) {
@@ -252,28 +396,44 @@ struct PrefetchInsertPass
       return success();
 
     Location loc = forOp.getLoc();
+    Block *bodyBlock = forOp.getBody();
 
-    // ── Step 1: allocate 2× buffers BEFORE the loop ──────────────────
+    // Get induction variable — used for j%2 and ptr cloning
+    Value iv = forOp.getInductionVar();
+    Type ivType = iv.getType();
+
+    // ── Constants (matching IV type) ──────────────────────────────────
+    ImplicitLocOpBuilder constBuilder(loc, builder);
+    constBuilder.setInsertionPoint(forOp);
+
+    Value c0, c1, c2;
+    if (auto intTy = dyn_cast<IntegerType>(ivType)) {
+      unsigned w = intTy.getWidth();
+      c0 = arith::ConstantIntOp::create(constBuilder, loc, 0, w);
+      c1 = arith::ConstantIntOp::create(constBuilder, loc, 1, w);
+      c2 = arith::ConstantIntOp::create(constBuilder, loc, 2, w);
+    } else {
+      c0 = arith::ConstantIndexOp::create(constBuilder, loc, 0);
+      c1 = arith::ConstantIndexOp::create(constBuilder, loc, 1);
+      c2 = arith::ConstantIndexOp::create(constBuilder, loc, 2);
+    }
+
+    // ── Step 1: allocate 2× buffers BEFORE the loop ───────────────────
     struct DoubleBuf {
       Value alloc2x;       // multi-buffered MemDesc<[2, shape...]>
-      PagedLoadInfo info;
-      // Saved operands for yield prefetch
-      Value src;           // ptr from original load
+      triton::LoadOp loadOp;
+      LocalAllocOp allocOp;
+      Value origSrc;       // ptr from original load
       Value mask;
       Value other;
       triton::CacheModifier cache;
       triton::EvictionPolicy evict;
       bool isVolatile;
       uint32_t contiguity;
-      // Saved attributes (before loadOp is erased)
       Attribute pactPagedLoadAttr;
       Attribute pactLayoutRemappedAttr;
     };
     SmallVector<DoubleBuf> bufs;
-
-    // Induction variable and constant, available to yield-prefetch block
-    Value iv;
-    Value c2;  // constant 2, used by body and (when enabled) yield prefetch
 
     {
       ImplicitLocOpBuilder b(loc, builder);
@@ -286,16 +446,16 @@ struct PrefetchInsertPass
         auto oldMemDescType =
             cast<MemDescType>(allocOp.getResult().getType());
 
-        // Use the same non-swizzled encoding strategy as single-buffer
         Attribute newSharedEnc;
         if (loadOp->hasAttr("pact.paged_load")) {
           auto ctx = oldMemDescType.getEncoding().getContext();
-          auto swizzledEnc =
-              mlir::cast<SwizzledSharedEncodingAttr>(oldMemDescType.getEncoding());
+          auto swizzledEnc = mlir::cast<SwizzledSharedEncodingAttr>(
+              oldMemDescType.getEncoding());
           auto order = swizzledEnc.getOrder();
           auto cgaLayout = swizzledEnc.getCGALayout();
           newSharedEnc = SwizzledSharedEncodingAttr::get(
-              ctx, /*vec=*/2, /*perPhase=*/1, /*maxPhase=*/1, order, cgaLayout);
+              ctx, /*vec=*/2, /*perPhase=*/1, /*maxPhase=*/1, order,
+              cgaLayout);
         } else {
           newSharedEnc = oldMemDescType.getEncoding();
         }
@@ -305,119 +465,154 @@ struct PrefetchInsertPass
             newSharedEnc, oldMemDescType.getMemorySpace(),
             /*mutableMemory=*/true);
 
-        // Create 2× multi-buffered type and allocation
-        auto multiBufType = triton::getMultiBufferedType(mutableMemDescType, 2);
+        auto multiBufType =
+            triton::getMultiBufferedType(mutableMemDescType, 2);
         Value alloc2x = LocalAllocOp::create(b, multiBufType).getResult();
 
-        bufs.push_back({alloc2x, info});
-        llvm::errs() << "[PACT DoubleBuf] Allocated 2x buffer for load\n";
+        // Gather async_copy operands from the original load
+        Value src = loadOp.getPtr();
+        Value mask = loadOp.getMask();
+        Value other = loadOp.getOther();
+        auto cache = loadOp.getCache();
+        auto evict = loadOp.getEvict();
+        bool isVolatile = loadOp.getIsVolatile();
+        uint32_t contiguity = 1;
+
+        if (loadOp->hasAttr("pact.paged_load")) {
+          auto resTy =
+              dyn_cast<RankedTensorType>(loadOp.getResult().getType());
+          if (auto blockedEnc =
+                  dyn_cast<BlockedEncodingAttr>(resTy.getEncoding())) {
+            auto sz = blockedEnc.getSizePerThread();
+            auto order = blockedEnc.getOrder();
+            if (order.size() > 0) {
+              unsigned layoutContig = sz[order[0]];
+              contiguity = std::max(2u, layoutContig);
+            }
+          }
+        }
+
+        // Skip splat-1 mask
+        bool isAllOnes = false;
+        if (mask) {
+          if (auto constOp = mask.getDefiningOp<arith::ConstantOp>()) {
+            if (auto denseAttr =
+                    dyn_cast<DenseIntElementsAttr>(constOp.getValue())) {
+              if (denseAttr.isSplat() &&
+                  denseAttr.getSplatValue<APInt>().isOne())
+                isAllOnes = true;
+            }
+          }
+        }
+        Value asyncMask = isAllOnes ? Value() : mask;
+
+        DoubleBuf db;
+        db.alloc2x = alloc2x;
+        db.loadOp = loadOp;
+        db.allocOp = allocOp;
+        db.origSrc = src;
+        db.mask = asyncMask;
+        db.other = other;
+        db.cache = cache;
+        db.evict = evict;
+        db.isVolatile = isVolatile;
+        db.contiguity = contiguity;
+        db.pactPagedLoadAttr = loadOp->getAttr("pact.paged_load");
+        db.pactLayoutRemappedAttr = loadOp->getAttr("pact.layout_remapped");
+        bufs.push_back(db);
+
+        llvm::errs() << "[PACT DoubleBuf] Allocated 2x buffer\n";
       }
     }
 
-    // ── Step 2: inside loop body, at each load's position ────────────
-    // Insert: j%2 → buffer_view → async_copy → commit → wait → local_load
+    // ── Step 2: Prologue — prefetch iter 0 data into buf[0] ──────────
+    // Clone the ptr computation chain with IV replaced by constant 0,
+    // inserted before the loop.
+    SmallVector<Value> prologueCommits;
+    {
+      ImplicitLocOpBuilder pb(loc, builder);
+      pb.setInsertionPoint(forOp);
 
-    // Pre-compute j%2 once inside the loop (shared across loads)
-    ImplicitLocOpBuilder bodyBuilder(loc, builder);
-    bodyBuilder.setInsertionPointToStart(forOp.getBody());
+      for (unsigned i = 0; i < bufs.size(); ++i) {
+        auto &db = bufs[i];
+        // Clone ptr chain: replace IV with constant 0
+        Value ptr0 = cloneChainWithIVReplacement(
+            db.origSrc, iv, c0, bodyBlock, pb);
 
-    iv = forOp.getInductionVar();
-    Type ivType = iv.getType();
-    Value c0;
-    if (auto intTy = dyn_cast<IntegerType>(ivType)) {
-      unsigned width = intTy.getWidth();
-      c2 = arith::ConstantIntOp::create(bodyBuilder, loc, 2, width);
-      c0 = arith::ConstantIntOp::create(bodyBuilder, loc, 0, width);
-    } else {
-      // IndexType fallback
-      c2 = arith::ConstantIndexOp::create(bodyBuilder, loc, 2);
-      c0 = arith::ConstantIndexOp::create(bodyBuilder, loc, 0);
+        if (!ptr0) {
+          llvm::errs() << "[PACT DoubleBuf] WARNING: prologue clone "
+                          "returned null, skipping\n";
+          continue;
+        }
+
+        // buf[0] = prologue data
+        Value bufView0 = triton::createSingleBufferView(pb, db.alloc2x, 0);
+
+        Operation *copy = AsyncCopyGlobalToLocalOp::create(
+            pb, ptr0, bufView0, db.mask, db.other,
+            db.cache, db.evict, db.isVolatile, db.contiguity);
+
+        if (db.pactPagedLoadAttr)
+          copy->setAttr("pact.paged_load", db.pactPagedLoadAttr);
+        if (db.pactLayoutRemappedAttr)
+          copy->setAttr("pact.layout_remapped", db.pactLayoutRemappedAttr);
+
+        Operation *commit =
+            AsyncCommitGroupOp::create(pb, copy->getResult(0));
+        prologueCommits.push_back(commit->getResult(0));
+
+        llvm::errs() << "[PACT DoubleBuf] Prologue prefetch to buf[0]\n";
+      }
     }
+
+    // ── Step 3: Body start — j%2 + wait(0) ──────────────────────────
+    ImplicitLocOpBuilder bodyBuilder(loc, builder);
+    bodyBuilder.setInsertionPointToStart(bodyBlock);
+
     Value idx = arith::RemSIOp::create(bodyBuilder, loc, iv, c2);
 
+    // Cast idx to i32 for MemDescIndex (if needed)
+    Value idxI32 = idx;
+    if (isa<IndexType>(idx.getType()))
+      idxI32 = arith::IndexCastUIOp::create(bodyBuilder, bodyBuilder.getI32Type(), idx);
+
+    // wait(0) — drains prologue (iter 0) or previous iteration's prefetch.
+    // wait 0 drains all pending groups; the token is just a dummy reference.
+    Value waitToken;
+    if (!prologueCommits.empty()) {
+      waitToken = prologueCommits.front();
+    }
+    AsyncWaitOp::create(bodyBuilder, waitToken, 0);
+
+    // ── Step 4: Compute j+1 and idxNext for yield prefetch ───────────
+    Value jPlus1 = arith::AddIOp::create(bodyBuilder, loc, iv, c1);
+    Value idxNext = arith::RemSIOp::create(bodyBuilder, loc, jPlus1, c2);
+    Value idxNextI32 = idxNext;
+    if (isa<IndexType>(idxNext.getType()))
+      idxNextI32 = arith::IndexCastUIOp::create(bodyBuilder, bodyBuilder.getI32Type(), idxNext);
+
+    // ── Step 5: For each load, local_load + async_copy next ──────────
+    // We process loads at their original position:
+    //   a) local_load from buf[j%2] (replaces old local_load)
+    //   b) clone next ptr + async_copy into buf[(j+1)%2] + commit
     for (auto &db : bufs) {
-      auto &info = db.info;
-      auto &loadOp = info.loadOp;
-      auto &allocOp = info.allocOp;
+      auto &loadOp = db.loadOp;
+      auto &allocOp = db.allocOp;
+      Location loadLoc = loadOp.getLoc();
 
-      // ── Create async_copy + wait + local_load at the load position ──
-      ImplicitLocOpBuilder lb(loc, builder);
-      lb.setInsertionPoint(loadOp);
+      // Save the block position before the loadOp for later insertions
+      Block *loadBlock = loadOp->getBlock();
+      Block::iterator loadPos(loadOp);
+      // loadPos points to loadOp; inserting at loadPos puts new ops BEFORE loadOp
 
-      // Select buffer view: buf[idx]
-      // Induction variable is index type in MLIR; cast to i32 for MemDescIndex
-      Value idxCast = idx;
-      if (isa<IndexType>(idx.getType())) {
-        idxCast = arith::IndexCastUIOp::create(lb, lb.getI32Type(), idx);
-      }
-      Value bufView = triton::createSingleBufferView(lb, db.alloc2x, idxCast);
+      // -- 5a: Create bufView and replace local_load --
+      // Use a temporary builder at the load position
+      ImplicitLocOpBuilder lb(loadLoc, builder);
+      lb.setInsertionPoint(loadBlock, loadPos);
 
-      // Gather async_copy operands from the original load
-      Value src = loadOp.getPtr();
-      Value mask = loadOp.getMask();
-      Value other = loadOp.getOther();
-      auto cache = loadOp.getCache();
-      auto evict = loadOp.getEvict();
-      bool isVolatile = loadOp.getIsVolatile();
-      uint32_t contiguity = 1;
+      Value bufView = triton::createSingleBufferView(lb, db.alloc2x, idxI32);
 
-      if (loadOp->hasAttr("pact.paged_load")) {
-        auto resTy =
-            dyn_cast<RankedTensorType>(loadOp.getResult().getType());
-        if (auto blockedEnc =
-                dyn_cast<BlockedEncodingAttr>(resTy.getEncoding())) {
-          auto sz = blockedEnc.getSizePerThread();
-          auto order = blockedEnc.getOrder();
-          if (order.size() > 0) {
-            unsigned layoutContig = sz[order[0]];
-            contiguity = std::max(2u, layoutContig);
-          }
-        }
-      }
-
-      // Skip splat-1 mask
-      bool isAllOnes = false;
-      if (mask) {
-        if (auto constOp = mask.getDefiningOp<arith::ConstantOp>()) {
-          if (auto denseAttr =
-                  dyn_cast<DenseIntElementsAttr>(constOp.getValue())) {
-            if (denseAttr.isSplat() &&
-                denseAttr.getSplatValue<APInt>().isOne())
-              isAllOnes = true;
-          }
-        }
-      }
-      Value asyncMask = isAllOnes ? Value() : mask;
-
-      // Save operands for later yield prefetch
-      db.src = src;
-      db.mask = asyncMask;
-      db.other = other;
-      db.cache = cache;
-      db.evict = evict;
-      db.isVolatile = isVolatile;
-      db.contiguity = contiguity;
-      db.pactPagedLoadAttr = loadOp->getAttr("pact.paged_load");
-      db.pactLayoutRemappedAttr = loadOp->getAttr("pact.layout_remapped");
-
-      Operation *copy = AsyncCopyGlobalToLocalOp::create(
-          lb, src, bufView, asyncMask, other,
-          cache, evict, isVolatile, contiguity);
-
-      if (loadOp->hasAttr("pact.paged_load"))
-        copy->setAttr("pact.paged_load",
-                      loadOp->getAttr("pact.paged_load"));
-      if (loadOp->hasAttr("pact.layout_remapped"))
-        copy->setAttr("pact.layout_remapped",
-                      loadOp->getAttr("pact.layout_remapped"));
-
-      Operation *commit =
-          AsyncCommitGroupOp::create(lb, copy->getResult(0));
-
-      Operation *wait =
-          AsyncWaitOp::create(lb, commit->getResult(0), 0);
-
-      // Replace uses of old local_alloc → local_load
+      // Replace old local_alloc uses with local_load from bufView
       Value oldMemDesc = allocOp.getResult();
       SmallVector<OpOperand *> memDescUses;
       for (auto &use : oldMemDesc.getUses())
@@ -429,7 +624,7 @@ struct PrefetchInsertPass
           lb.setInsertionPoint(oldLocalLoad);
           Type resultType = oldLocalLoad.getResult().getType();
           auto newLocalLoad = LocalLoadOp::create(
-              lb, resultType, bufView, wait->getResult(0));
+              lb, resultType, bufView, /*token=*/Value());
           oldLocalLoad.getResult().replaceAllUsesWith(
               newLocalLoad.getResult());
           oldLocalLoad->erase();
@@ -438,67 +633,40 @@ struct PrefetchInsertPass
         }
       }
 
-      allocOp.erase();
-      loadOp.erase();
-      llvm::errs() << "[PACT DoubleBuf] Converted load (start-of-body)\n";
-    }
+      // -- 5b: clone j+1 ptr and prefetch into alternate buffer --
+      // Do this BEFORE erasing loadOp — the IP points to before loadOp
+      lb.setInsertionPoint(loadBlock, loadPos);
+      Value nextPtr = cloneChainWithIVReplacement(
+          db.origSrc, iv, jPlus1, bodyBlock, lb);
 
-    // ── Step 3: yield prefetch → buf_{(j+1)%2} ──────────────────────
-    // DISABLED for now: mechanism works but prefetches j's data (same ptr
-    // as in-body load), which is redundant until we compute j+1's ptr.
-    // The yield prefetch mechanism compiles and runs without dominance
-    // errors — the type mismatch (index vs i32) was the root cause of
-    // the earlier dominance failure.
-    //
-    // TODO: compute j+1 ptr at yield point by tracing block table lookup
-    //       with iv+1, then re-enable. Also need prologue prefetch for
-    //       iter 0 and remove async_copy from in-body (keep only wait+load).
-#if 0
-    {
-      ImplicitLocOpBuilder yb(loc, builder);
-      // Insert before the scf.yield terminator
-      Block *bodyBlock = forOp.getBody();
-      Operation *yieldOp = bodyBlock->getTerminator();
-      yb.setInsertionPoint(yieldOp);
-
-      // Compute (idx+1)%2 as the alternate buffer index
-      Value idxNext;
-      Value c1;
-      Type ivType = iv.getType();
-      if (auto intTy = dyn_cast<IntegerType>(ivType)) {
-        c1 = arith::ConstantIntOp::create(yb, loc, 1, intTy.getWidth());
-      } else {
-        c1 = arith::ConstantIndexOp::create(yb, loc, 1);
-      }
-      idxNext = arith::RemSIOp::create(
-          yb, loc,
-          arith::AddIOp::create(yb, loc, iv, c1),
-          c2);
-
-      for (auto &db : bufs) {
-        // Cast idxNext to i32 for MemDescIndex
-        Value idxCast = idxNext;
-        if (isa<IndexType>(idxNext.getType())) {
-          idxCast = arith::IndexCastUIOp::create(yb, yb.getI32Type(), idxNext);
-        }
-        Value bufViewNext = triton::createSingleBufferView(yb, db.alloc2x, idxCast);
+      if (nextPtr) {
+        lb.setInsertionPoint(loadBlock, loadPos);
+        Value bufViewNext =
+            triton::createSingleBufferView(lb, db.alloc2x, idxNextI32);
 
         Operation *prefetchCopy = AsyncCopyGlobalToLocalOp::create(
-            yb, db.src, bufViewNext, db.mask, db.other,
+            lb, nextPtr, bufViewNext, db.mask, db.other,
             db.cache, db.evict, db.isVolatile, db.contiguity);
 
-        // Propagate pact attributes (from saved attrs)
         if (db.pactPagedLoadAttr)
           prefetchCopy->setAttr("pact.paged_load", db.pactPagedLoadAttr);
         if (db.pactLayoutRemappedAttr)
-          prefetchCopy->setAttr("pact.layout_remapped", db.pactLayoutRemappedAttr);
+          prefetchCopy->setAttr("pact.layout_remapped",
+                                db.pactLayoutRemappedAttr);
 
-        AsyncCommitGroupOp::create(yb, prefetchCopy->getResult(0));
-        llvm::errs() << "[PACT DoubleBuf] Added yield prefetch\n";
+        AsyncCommitGroupOp::create(lb, prefetchCopy->getResult(0));
+        llvm::errs() << "[PACT DoubleBuf] Prefetch j+1 to alternate buf\n";
+      } else {
+        llvm::errs() << "[PACT DoubleBuf] WARNING: in-body clone "
+                        "returned null, skipping prefetch\n";
       }
-    }
-#endif
 
+      // -- Clean up old allocOp and loadOp --
+      allocOp.erase();
+      loadOp.erase();
+    }
+
+    llvm::errs() << "[PACT DoubleBuf] Pipelined conversion complete\n";
     return success();
   }
 

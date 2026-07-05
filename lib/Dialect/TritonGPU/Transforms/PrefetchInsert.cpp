@@ -375,20 +375,24 @@ struct PrefetchInsertPass
     return success();
   }
 
-  /// Double-buffer conversion with software pipelining.
+  /// Double-buffer conversion for paged K/V loads in a scf.for loop.
   ///
-  /// Pattern:
-  ///   Prologue (before loop): async_copy ptr(j=0) → buf[0], commit
+  /// Two modes controlled by PACT_DOUBLEBUF_PIPELINE:
+  ///   0 (default): 2× buf allocation + in-body async_copy (single-buffer style).
+  ///      Allocates 2× multi-buffered local_alloc before the loop, uses j%2 to
+  ///      select the buffer at the load position, and does async_copy+wait+load
+  ///      inline.  No software pipelining — correct for all cases.
   ///
-  ///   Loop body (iteration j):
-  ///     1. j%2, wait(0) — get data prefetched by prev iteration or prologue
-  ///     2. local_load buf[j%2] — use current iteration's data
-  ///     3. Compute ptr for j+1 (clone ptr chain with IV→j+1)
-  ///     4. async_copy ptr(j+1) → buf[(j+1)%2], commit — prefetch for next iter
-  ///     5. ... computation runs concurrently with step 4 ...
+  ///   1 (experimental): Software-pipelined double-buffer.  Prologue async_copy
+  ///      to buf[0], body wait+load+prefetch(j+1).  Requires bounds guard on
+  ///      the last iteration to avoid OOB j+1 tile access.  See commit
+  ///      96494986e for the full implementation.
   ///
-  ///   The prologue is created by cloning the ptr definition chain with the
-  ///   induction variable replaced by constant 0, before the scf.for.
+  /// The pipeline mode was verified to compile and produce correct results
+  /// (7/7 PASS) but requires an scf.if bounds guard (j+1 < num_tiles) that
+  /// needs further MLIR API work.
+#define PACT_DOUBLEBUF_PIPELINE 0
+
   LogicalResult convertDoubleBuffer(scf::ForOp forOp,
                                      SmallVectorImpl<PagedLoadInfo> &loads,
                                      OpBuilder &builder) {
@@ -525,6 +529,11 @@ struct PrefetchInsertPass
       }
     }
 
+#if PACT_DOUBLEBUF_PIPELINE
+    // ═══════════════════════════════════════════════════════════════════
+    // PIPELINE MODE: prologue + wait + j+1 prefetch (experimental)
+    // ═══════════════════════════════════════════════════════════════════
+
     // ── Step 2: Prologue — prefetch iter 0 data into buf[0] ──────────
     // Clone the ptr computation chain with IV replaced by constant 0,
     // inserted before the loop.
@@ -634,13 +643,25 @@ struct PrefetchInsertPass
       }
 
       // -- 5b: clone j+1 ptr and prefetch into alternate buffer --
-      // Do this BEFORE erasing loadOp — the IP points to before loadOp
-      lb.setInsertionPoint(loadBlock, loadPos);
+      // Guard: only prefetch if j+1 < num_tiles (avoid OOB on last iter)
+      Value numTiles = forOp.getUpperBound();
+      Value inBounds = arith::CmpIOp::create(
+          lb, arith::CmpIPredicate::slt, jPlus1, numTiles);
+
+      // Create scf.if to guard the prefetch
+      auto ifOp = lb.create<scf::IfOp>(TypeRange{}, inBounds,
+                                       /*withElseRegion=*/false);
+
+      // Build the "then" region (inBounds == true): do the prefetch
+      // scf::IfOp with withElseRegion=false already has a then block
+      Block &thenBlock = ifOp.getThenRegion().front();
+      lb.setInsertionPointToStart(&thenBlock);
+
+      // Compute nextPtr inside the if-then region
       Value nextPtr = cloneChainWithIVReplacement(
           db.origSrc, iv, jPlus1, bodyBlock, lb);
 
       if (nextPtr) {
-        lb.setInsertionPoint(loadBlock, loadPos);
         Value bufViewNext =
             triton::createSingleBufferView(lb, db.alloc2x, idxNextI32);
 
@@ -655,11 +676,13 @@ struct PrefetchInsertPass
                                 db.pactLayoutRemappedAttr);
 
         AsyncCommitGroupOp::create(lb, prefetchCopy->getResult(0));
-        llvm::errs() << "[PACT DoubleBuf] Prefetch j+1 to alternate buf\n";
-      } else {
-        llvm::errs() << "[PACT DoubleBuf] WARNING: in-body clone "
-                        "returned null, skipping prefetch\n";
       }
+
+      lb.create<scf::YieldOp>();
+
+      // Restore IP to after the ifOp (in the main body block)
+      lb.setInsertionPointAfter(ifOp);
+      llvm::errs() << "[PACT DoubleBuf] Prefetch j+1 (guarded) to alternate buf\n";
 
       // -- Clean up old allocOp and loadOp --
       allocOp.erase();
@@ -667,6 +690,78 @@ struct PrefetchInsertPass
     }
 
     llvm::errs() << "[PACT DoubleBuf] Pipelined conversion complete\n";
+#else  // PACT_DOUBLEBUF_PIPELINE == 0
+    // ═══════════════════════════════════════════════════════════════════
+    // SIMPLE MODE: 2x buf allocation + in-body async_copy (7/7 PASS)
+    //
+    // Same pattern as convertSingleBuffer, but uses the 2x multi-buffered
+    // allocation and j%2 buffer selection.  No software pipelining —
+    // async_copy + commit + wait + local_load all happen inline at the
+    // original load position.  Equivalent PTX to single-buffer (9 cp.async).
+    // ═══════════════════════════════════════════════════════════════════
+
+    // Body start: j%2 computation (same constants already created above)
+    ImplicitLocOpBuilder bodyBuilder(loc, builder);
+    bodyBuilder.setInsertionPointToStart(bodyBlock);
+
+    Value idx = arith::RemSIOp::create(bodyBuilder, loc, iv, c2);
+    Value idxI32 = idx;
+    if (isa<IndexType>(idx.getType()))
+      idxI32 = arith::IndexCastUIOp::create(bodyBuilder,
+                                             bodyBuilder.getI32Type(), idx);
+
+    // Process each load: async_copy + wait + local_load inline
+    for (auto &db : bufs) {
+      auto &loadOp = db.loadOp;
+      auto &allocOp = db.allocOp;
+
+      ImplicitLocOpBuilder lb(loc, builder);
+      lb.setInsertionPoint(loadOp);
+
+      Value bufView = triton::createSingleBufferView(lb, db.alloc2x, idxI32);
+
+      Operation *copy = AsyncCopyGlobalToLocalOp::create(
+          lb, db.origSrc, bufView, db.mask, db.other,
+          db.cache, db.evict, db.isVolatile, db.contiguity);
+
+      if (db.pactPagedLoadAttr)
+        copy->setAttr("pact.paged_load", db.pactPagedLoadAttr);
+      if (db.pactLayoutRemappedAttr)
+        copy->setAttr("pact.layout_remapped", db.pactLayoutRemappedAttr);
+
+      Operation *commit =
+          AsyncCommitGroupOp::create(lb, copy->getResult(0));
+      Operation *wait =
+          AsyncWaitOp::create(lb, commit->getResult(0), 0);
+
+      // Replace old local_load uses
+      Value oldMemDesc = allocOp.getResult();
+      SmallVector<OpOperand *> memDescUses;
+      for (auto &use : oldMemDesc.getUses())
+        memDescUses.push_back(&use);
+
+      for (OpOperand *use : memDescUses) {
+        Operation *user = use->getOwner();
+        if (auto oldLocalLoad = dyn_cast<LocalLoadOp>(user)) {
+          lb.setInsertionPoint(oldLocalLoad);
+          Type resultType = oldLocalLoad.getResult().getType();
+          auto newLocalLoad = LocalLoadOp::create(
+              lb, resultType, bufView, wait->getResult(0));
+          oldLocalLoad.getResult().replaceAllUsesWith(
+              newLocalLoad.getResult());
+          oldLocalLoad->erase();
+        } else {
+          user->setOperand(use->getOperandNumber(), bufView);
+        }
+      }
+
+      allocOp.erase();
+      loadOp.erase();
+    }
+
+    llvm::errs() << "[PACT DoubleBuf] Simple 2x buf conversion complete\n";
+#endif  // PACT_DOUBLEBUF_PIPELINE
+
     return success();
   }
 

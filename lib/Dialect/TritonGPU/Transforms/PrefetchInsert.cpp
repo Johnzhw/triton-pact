@@ -402,9 +402,20 @@ struct PrefetchInsertPass
     Location loc = forOp.getLoc();
     Block *bodyBlock = forOp.getBody();
 
-    // Get induction variable — used for j%2 and ptr cloning
+    // Get induction variable
     Value iv = forOp.getInductionVar();
     Type ivType = iv.getType();
+
+    // Simple mode: delegate each load to convertSingleBuffer.
+    // No 2x buf, no MemDescIndex — avoids non-swizzled SMEM alignment
+    // issues and the cp.async partial-tile OOB problem.
+#if !PACT_DOUBLEBUF_PIPELINE
+    for (auto &info : loads) {
+      if (failed(convertSingleBuffer(info.loadOp, info.allocOp, builder)))
+        llvm::errs() << "[PACT] convertSingleBuffer failed in loop\n";
+    }
+    return success();
+#endif
 
     // ── Constants (matching IV type) ──────────────────────────────────
     ImplicitLocOpBuilder constBuilder(loc, builder);

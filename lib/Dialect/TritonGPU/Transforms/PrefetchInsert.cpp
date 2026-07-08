@@ -383,18 +383,14 @@ struct PrefetchInsertPass
   ///      select the buffer at the load position, and does async_copy+wait+load
   ///      inline.  No software pipelining — correct for all cases.
   ///
-  ///   1 (default): Software-pipelined double-buffer.  Prologue async_copy
-  ///      to buf[0], body wait+load+prefetch(j+1).  The j+1 prefetch on the
-  ///      last iteration may access OOB memory — this is a known limitation
-  ///      (tracked as P1).  The OOB data is never used because the loop
-  ///      terminates immediately after.  A proper scf.if bounds guard
-  ///      (j+1 < num_tiles) was attempted but caused MLIR verification
-  ///      failures; future work should revisit with a different approach
-  ///      (e.g., select-based async_copy mask, or prologue clone approach).
-  ///
-  /// The pipeline mode was verified to compile and produce correct results
-  /// (7/7 PASS) at commit 96494986e.
-#define PACT_DOUBLEBUF_PIPELINE 1
+  ///   1 (experimental): Software-pipelined double-buffer.  Prologue async_copy
+  ///      to buf[0], body wait+load+prefetch(j+1).  Code compiles and passes
+  ///      MLIR verification (7/7 PASS at 96494986e), but has two known issues:
+  ///      (a) j+1 OOB on last iteration — needs scf.if bounds guard
+  ///      (b) cudaErrorMisalignedAddress in cp.async nBytes=2 paired path
+  ///      (also affects simple mode with CUDA_LAUNCH_BLOCKING=1).
+  ///      Disabled until both issues are resolved.
+#define PACT_DOUBLEBUF_PIPELINE 0
 
   LogicalResult convertDoubleBuffer(scf::ForOp forOp,
                                      SmallVectorImpl<PagedLoadInfo> &loads,

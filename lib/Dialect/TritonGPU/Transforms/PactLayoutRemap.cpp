@@ -64,12 +64,21 @@ struct PactLayoutRemapPass
         }
       }
 
-      // K load: mark for nBytes=2 pairing in lowering
+      // K load: mark for nBytes=2 pairing in lowering.
+      // Only mark when bytesPerThread >= 4 (naturally 4-byte aligned).
+      // Loads with bytes < 4 (e.g., 1 f16 element = 2 bytes) would need
+      // pairing that may produce misaligned cp.async.ca.4B sources.
+      // These loads stay as sync fallback.
       auto sz = enc.getSizePerThread();
       auto order = enc.getOrder();
       if (!order.empty()) {
         unsigned bytes = sz[order[0]] * (rTy.getElementTypeBitWidth() / 8);
-        if (bytes < 4) {
+        llvm::errs() << "[PACT LayoutRemap] load shape=["
+                     << rTy.getShape()[0] << "x" << rTy.getShape()[1]
+                     << "] order=[" << order[0] << "," << order[1]
+                     << "] szPerThread=[" << sz[0] << "," << sz[1]
+                     << "] bytes=" << bytes << "\n";
+        if (bytes >= 4) {
           loadOp->setAttr("pact.layout_remapped", UnitAttr::get(ctx));
           numKMarked++;
         }

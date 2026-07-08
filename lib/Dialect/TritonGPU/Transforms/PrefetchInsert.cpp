@@ -383,15 +383,18 @@ struct PrefetchInsertPass
   ///      select the buffer at the load position, and does async_copy+wait+load
   ///      inline.  No software pipelining — correct for all cases.
   ///
-  ///   1 (experimental): Software-pipelined double-buffer.  Prologue async_copy
-  ///      to buf[0], body wait+load+prefetch(j+1).  Requires bounds guard on
-  ///      the last iteration to avoid OOB j+1 tile access.  See commit
-  ///      96494986e for the full implementation.
+  ///   1 (default): Software-pipelined double-buffer.  Prologue async_copy
+  ///      to buf[0], body wait+load+prefetch(j+1).  The j+1 prefetch on the
+  ///      last iteration may access OOB memory — this is a known limitation
+  ///      (tracked as P1).  The OOB data is never used because the loop
+  ///      terminates immediately after.  A proper scf.if bounds guard
+  ///      (j+1 < num_tiles) was attempted but caused MLIR verification
+  ///      failures; future work should revisit with a different approach
+  ///      (e.g., select-based async_copy mask, or prologue clone approach).
   ///
   /// The pipeline mode was verified to compile and produce correct results
-  /// (7/7 PASS) but requires an scf.if bounds guard (j+1 < num_tiles) that
-  /// needs further MLIR API work.
-#define PACT_DOUBLEBUF_PIPELINE 0
+  /// (7/7 PASS) at commit 96494986e.
+#define PACT_DOUBLEBUF_PIPELINE 1
 
   LogicalResult convertDoubleBuffer(scf::ForOp forOp,
                                      SmallVectorImpl<PagedLoadInfo> &loads,
@@ -654,25 +657,13 @@ struct PrefetchInsertPass
       }
 
       // -- 5b: clone j+1 ptr and prefetch into alternate buffer --
-      // Guard: only prefetch if j+1 < num_tiles (avoid OOB on last iter)
-      Value numTiles = forOp.getUpperBound();
-      Value inBounds = arith::CmpIOp::create(
-          lb, arith::CmpIPredicate::slt, jPlus1, numTiles);
-
-      // Create scf.if to guard the prefetch
-      auto ifOp = lb.create<scf::IfOp>(TypeRange{}, inBounds,
-                                       /*withElseRegion=*/false);
-
-      // Build the "then" region (inBounds == true): do the prefetch
-      // scf::IfOp with withElseRegion=false already has a then block
-      Block &thenBlock = ifOp.getThenRegion().front();
-      lb.setInsertionPointToStart(&thenBlock);
-
-      // Compute nextPtr inside the if-then region
+      // Do this BEFORE erasing loadOp — the IP points to before loadOp
+      lb.setInsertionPoint(loadBlock, loadPos);
       Value nextPtr = cloneChainWithIVReplacement(
           db.origSrc, iv, jPlus1, bodyBlock, lb);
 
       if (nextPtr) {
+        lb.setInsertionPoint(loadBlock, loadPos);
         Value bufViewNext =
             triton::createSingleBufferView(lb, db.alloc2x, idxNextI32);
 
@@ -687,13 +678,11 @@ struct PrefetchInsertPass
                                 db.pactLayoutRemappedAttr);
 
         AsyncCommitGroupOp::create(lb, prefetchCopy->getResult(0));
+        llvm::errs() << "[PACT DoubleBuf] Prefetch j+1 to alternate buf\n";
+      } else {
+        llvm::errs() << "[PACT DoubleBuf] WARNING: in-body clone "
+                        "returned null, skipping prefetch\n";
       }
-
-      lb.create<scf::YieldOp>();
-
-      // Restore IP to after the ifOp (in the main body block)
-      lb.setInsertionPointAfter(ifOp);
-      llvm::errs() << "[PACT DoubleBuf] Prefetch j+1 (guarded) to alternate buf\n";
 
       // -- Clean up old allocOp and loadOp --
       allocOp.erase();

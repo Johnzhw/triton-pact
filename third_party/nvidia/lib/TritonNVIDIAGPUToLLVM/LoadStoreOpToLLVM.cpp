@@ -1067,6 +1067,14 @@ struct AsyncCopyGlobalToLocalOpConversion
         auto *srcOp = ptxBuilder.newAddrOperand(srcElem, "l");
         auto *copySz = ptxBuilder.newConstantOperand(cpSizeVal);
         auto *srcSz = ptxBuilder.newConstantOperand(cpSizeVal);
+        if (hasMask) {
+          // For partial tiles: use per-element mask to guard the paired 4B
+          // load.  When the even element is masked out (OOB), set srcSize=0
+          // to skip the load.  When the even element is valid, the 4B region
+          // starting at its address lies within the same page and is safe.
+          Value szVal = b.select(maskElem, b.i32_val(cpSizeVal), b.i32_val(0));
+          srcSz = ptxBuilder.newOperand(szVal, "r");
+        }
         copyAsyncOp(dstOp, srcOp, copySz, srcSz).maybePredicate(threadPred);
         ptxBuilder.launch(rewriter, loc, void_ty(ctx));
         return {};

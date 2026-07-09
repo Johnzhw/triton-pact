@@ -274,6 +274,28 @@ private:
     // It's symmetric to case B.
     // Case 4: If contiguity(lhs) == 1 and contiguity(rhs) == 1,
     // It's trivial that contiguity is 1
+    if constexpr (std::is_same_v<OpTy, triton::AddPtrOp>) {
+      // PACT: For paged KV loads, the offset chain has arange×stride
+      // muls where stride=1 is a runtime parameter.  The MulIOp visitor
+      // correctly drops contiguity (values are strided, not consecutive),
+      // but at the addptr level the head_dim elements are byte-contiguous
+      // in memory (page_base + block_offset + arange(16)×1 within a page).
+      // Override contiguity on head_dim for paged addptr results.
+      if (!op.getResult().getUsers().empty()) {
+        for (auto *user : op.getResult().getUsers()) {
+          if (auto loadOp = dyn_cast<triton::LoadOp>(user)) {
+            if (loadOp->hasAttr("pact.paged_load")) {
+              // dim is head_dim → all head_dim elements contiguous in page
+              auto ptrTy = cast<RankedTensorType>(op.getResult().getType());
+              int64_t headSize = ptrTy.getShape()[dim];
+              LDBG("paged addptr: override contiguity[" << dim << "]="
+                   << headSize);
+              return headSize;
+            }
+          }
+        }
+      }
+    }
     return std::max(gcd(lhs.getConstancy(dim), rhs.getContiguity(dim)),
                     gcd(lhs.getContiguity(dim), rhs.getConstancy(dim)));
   }
@@ -299,6 +321,18 @@ private:
       elemSize = std::max<int64_t>(
           1, triton::getPointeeBitWidth(op.getPtr().getType()) / 8);
       rhsDivisibility = multiplyDivisor(rhs.getDivisibility(dim), elemSize);
+      // PACT: For paged loads, boost divisibility on head_dim.
+      // The base ptr is page-aligned (≥16B) and head_dim elements within
+      // a page are naturally elemSize-aligned → at least 4B for f16.
+      for (auto *user : op.getResult().getUsers()) {
+        if (auto loadOp = dyn_cast<triton::LoadOp>(user)) {
+          if (loadOp->hasAttr("pact.paged_load")) {
+            lhsDivisibility = std::max(lhsDivisibility, int64_t(16));
+            rhsDivisibility = std::max(rhsDivisibility, elemSize * 2);
+            break;
+          }
+        }
+      }
     }
     if (lhs.getContiguity(dim) > 1 && rhs.getContiguity(dim) > 1) {
       // If both operands are contiguous, the in-group offsets are:

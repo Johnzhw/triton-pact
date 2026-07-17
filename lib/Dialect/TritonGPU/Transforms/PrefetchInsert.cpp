@@ -623,12 +623,13 @@ struct PrefetchInsertPass
 
     // ── Step 2: Prologue — prefetch iter 0 data into buf[0] ──────────
     // Clone the ptr computation chain with IV replaced by constant 0,
-    // inserted before the loop.
+    // inserted before the loop.  All async copies share one merged commit.
     SmallVector<Value> prologueCommits;
     {
       ImplicitLocOpBuilder pb(loc, builder);
       pb.setInsertionPoint(forOp);
 
+      SmallVector<Value> prologueAsyncTokens;
       for (unsigned i = 0; i < bufs.size(); ++i) {
         auto &db = bufs[i];
         // Clone ptr chain: replace IV with constant 0
@@ -653,11 +654,17 @@ struct PrefetchInsertPass
         if (db.pactLayoutRemappedAttr)
           copy->setAttr("pact.layout_remapped", db.pactLayoutRemappedAttr);
 
-        Operation *commit =
-            AsyncCommitGroupOp::create(pb, copy->getResult(0));
-        prologueCommits.push_back(commit->getResult(0));
+        prologueAsyncTokens.push_back(copy->getResult(0));
 
         llvm::errs() << "[PACT DoubleBuf] Prologue prefetch to buf[0]\n";
+      }
+
+      // Merged commit for all prologue async copies
+      if (!prologueAsyncTokens.empty()) {
+        Operation *commit = AsyncCommitGroupOp::create(pb, prologueAsyncTokens);
+        prologueCommits.push_back(commit->getResult(0));
+        llvm::errs() << "[PACT DoubleBuf] Prologue merged commit for "
+                     << prologueAsyncTokens.size() << " async copies\n";
       }
     }
 
@@ -690,7 +697,9 @@ struct PrefetchInsertPass
     // ── Step 5: For each load, local_load + async_copy next ──────────
     // We process loads at their original position:
     //   a) local_load from buf[j%2] (replaces old local_load)
-    //   b) clone next ptr + async_copy into buf[(j+1)%2] + commit
+    //   b) clone next ptr + async_copy into buf[(j+1)%2]
+    //   c) Merged commit for all async copies (reduces overhead)
+    SmallVector<Value> bodyAsyncTokens;
     for (auto &db : bufs) {
       auto &loadOp = db.loadOp;
       auto &allocOp = db.allocOp;
@@ -699,10 +708,8 @@ struct PrefetchInsertPass
       // Save the block position before the loadOp for later insertions
       Block *loadBlock = loadOp->getBlock();
       Block::iterator loadPos(loadOp);
-      // loadPos points to loadOp; inserting at loadPos puts new ops BEFORE loadOp
 
       // -- 5a: Create bufView and replace local_load --
-      // Use a temporary builder at the load position
       ImplicitLocOpBuilder lb(loadLoc, builder);
       lb.setInsertionPoint(loadBlock, loadPos);
 
@@ -741,7 +748,6 @@ struct PrefetchInsertPass
       }
 
       // -- 5b: clone j+1 ptr and prefetch into alternate buffer --
-      // Do this BEFORE erasing loadOp — the IP points to before loadOp
       lb.setInsertionPoint(loadBlock, loadPos);
       Value nextPtr = cloneChainWithIVReplacement(
           db.origSrc, iv, jPlus1, bodyBlock, lb);
@@ -761,7 +767,7 @@ struct PrefetchInsertPass
           prefetchCopy->setAttr("pact.layout_remapped",
                                 db.pactLayoutRemappedAttr);
 
-        AsyncCommitGroupOp::create(lb, prefetchCopy->getResult(0));
+        bodyAsyncTokens.push_back(prefetchCopy->getResult(0));
         llvm::errs() << "[PACT DoubleBuf] Prefetch j+1 to alternate buf\n";
       } else {
         llvm::errs() << "[PACT DoubleBuf] WARNING: in-body clone "
@@ -771,6 +777,17 @@ struct PrefetchInsertPass
       // -- Clean up old loadOp --
       // (allocOp was already erased in Step 5a if it existed)
       loadOp.erase();
+    }
+    // ── Step 5c: Merged commit for all prefetch async copies ─────────
+    // Instead of one commit per async copy, batch all tokens into one
+    // commit group.  Reduces instruction overhead without affecting
+    // correctness (wait(0) drains all pending groups).
+    if (!bodyAsyncTokens.empty()) {
+      ImplicitLocOpBuilder cb(loc, builder);
+      cb.setInsertionPointAfter(bodyAsyncTokens.back().getDefiningOp());
+      AsyncCommitGroupOp::create(cb, bodyAsyncTokens);
+      llvm::errs() << "[PACT DoubleBuf] Merged commit for "
+                   << bodyAsyncTokens.size() << " async copies\n";
     }
 
     llvm::errs() << "[PACT DoubleBuf] Pipelined conversion complete\n";

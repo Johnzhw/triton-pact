@@ -45,6 +45,50 @@ namespace gpu {
 
 namespace {
 
+/// Find the block_table load in the ptr chain of a paged KV load.
+/// Walks backward from the load's ptr through addptr, arith, and reshape
+/// ops to find the tt.load with pact.block_table_lookup attribute.
+static triton::LoadOp findBlockTableLoad(Value ptr, Value &tailOut) {
+  // Walk from ptr backward through the SSA chain.
+  SmallVector<Value> worklist;
+  SmallPtrSet<Value, 16> visited;
+  worklist.push_back(ptr);
+  for (int depth = 0; depth < 32 && !worklist.empty(); ++depth) {
+    SmallVector<Value> next;
+    for (Value val : worklist) {
+      if (!visited.insert(val).second)
+        continue;
+      auto *defOp = val.getDefiningOp();
+      if (!defOp) {
+        // Block argument — might be the IV or other loop arg
+        if (auto blockArg = dyn_cast<BlockArgument>(val)) {
+          // Don't walk into block arguments (IV, iter args)
+          continue;
+        }
+        continue;
+      }
+      // If this is the block_table load, we found it
+      if (auto loadOp = dyn_cast<triton::LoadOp>(defOp)) {
+        if (loadOp->hasAttr("pact.block_table_lookup")) {
+          // tailOut is the value just downstream from the block_table load.
+          // Walk back from ptr to find the immediate user of the block_table
+          // load result in the chain.
+          tailOut = ptr; // default: use ptr as tail
+          return loadOp;
+        }
+      }
+      // Skip obvious non-chain ops (masks, scalars, etc.)
+      if (isa<arith::ConstantOp>(defOp))
+        continue;
+      // Walk through intermediate ops: addptr, arith, reshape, etc.
+      for (Value operand : defOp->getOperands())
+        next.push_back(operand);
+    }
+    worklist = std::move(next);
+  }
+  return nullptr;
+}
+
 /// Walk the use-def chain from the load result to find the LocalAllocOp.
 static LocalAllocOp findLocalAllocThroughLayoutConversions(
     triton::LoadOp loadOp) {
@@ -120,10 +164,16 @@ static bool canUseCpAsync(triton::LoadOp loadOp) {
 // collects them in topological order, then clones each one with the IV
 // substitution applied.  Returns the cloned value corresponding to origVal,
 // or a null Value if no cloning was needed (origVal doesn't depend on IV).
+//
+// When `stopMap` is provided, any value whose defining op is in stopMap
+// is NOT cloned — the mapped replacement value is used instead.  This
+// allows the caller to pre-compute expensive sub-chains (e.g., block_table
+// loads) and share them across multiple clone chains.
 //===----------------------------------------------------------------------===//
 static Value cloneChainWithIVReplacement(Value origVal, Value oldIV,
                                           Value newIV, Block *forBody,
-                                          ImplicitLocOpBuilder &builder) {
+                                          ImplicitLocOpBuilder &builder,
+                    const DenseMap<Operation *, Value> *stopMap = nullptr) {
   // If origVal already equals oldIV, just return newIV
   if (origVal == oldIV)
     return newIV;
@@ -152,6 +202,12 @@ static Value cloneChainWithIVReplacement(Value origVal, Value oldIV,
     Operation *defOp = val.getDefiningOp();
     if (!defOp || seen.count(defOp))
       continue;
+
+    // Check stopMap: if this op should not be cloned, use the replacement.
+    if (stopMap && stopMap->count(defOp)) {
+      cloneMap[val] = stopMap->lookup(defOp);
+      continue;
+    }
 
     // Only clone ops inside the loop body.
     // For ops outside the loop, map results to themselves (pass-through).
@@ -694,6 +750,37 @@ struct PrefetchInsertPass
     if (isa<IndexType>(idxNext.getType()))
       idxNextI32 = arith::IndexCastUIOp::create(bodyBuilder, bodyBuilder.getI32Type(), idxNext);
 
+    // ── Pre-step: Pre-compute block_table lookup for iter j+1 ─────────
+    // The K and V loads share the same phys_block pointer from the
+    // block_table lookup.  Instead of cloning this lookup inside each
+    // cloneChain call (2× per iteration), compute it once here and
+    // share across both prefetches.
+    //
+    // IMPORTANT: insert at the position of the FIRST load, not at body
+    // start.  jPlus1 was inserted at body start; inserting before it
+    // would create a dominance violation.
+    DenseMap<Operation *, Value> sharedBlockTableMap;
+    SmallVector<Operation *> sharedBTOps;
+    if (!bufs.empty()) {
+      ImplicitLocOpBuilder sbtb(loc, builder);
+      auto &firstLoad = bufs[0].loadOp;
+      sbtb.setInsertionPoint(firstLoad);
+      for (auto &db : bufs) {
+        Value _tail;
+        auto btLoad = findBlockTableLoad(db.origSrc, _tail);
+        if (btLoad && !sharedBlockTableMap.count(btLoad)) {
+          Value physNext = cloneChainWithIVReplacement(
+              btLoad.getResult(), iv, jPlus1, bodyBlock, sbtb);
+          if (physNext) {
+            sharedBlockTableMap[btLoad] = physNext;
+            sharedBTOps.push_back(btLoad);
+            llvm::errs() << "[PACT DoubleBuf] Shared block_table"
+                         << " prefetch for iter j+1\n";
+          }
+        }
+      }
+    }
+
     // ── Step 5: For each load, local_load + async_copy next ──────────
     // We process loads at their original position:
     //   a) local_load from buf[j%2] (replaces old local_load)
@@ -748,9 +835,13 @@ struct PrefetchInsertPass
       }
 
       // -- 5b: clone j+1 ptr and prefetch into alternate buffer --
+      // Pass sharedBlockTableMap so cloneChain reuses the pre-computed
+      // phys_block instead of cloning the block_table load again.
       lb.setInsertionPoint(loadBlock, loadPos);
+      const DenseMap<Operation *, Value> *stopMap =
+          sharedBlockTableMap.empty() ? nullptr : &sharedBlockTableMap;
       Value nextPtr = cloneChainWithIVReplacement(
-          db.origSrc, iv, jPlus1, bodyBlock, lb);
+          db.origSrc, iv, jPlus1, bodyBlock, lb, stopMap);
 
       if (nextPtr) {
         lb.setInsertionPoint(loadBlock, loadPos);

@@ -27,9 +27,11 @@
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/Transforms/Passes.h"
 #include "triton/Dialect/TritonGPU/Transforms/PipeliningUtility.h"
+#include "triton/Dialect/Triton/Transforms/LoopPeeling.h"
 
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/MapVector.h"
+#include "llvm/ADT/STLExtras.h"
 #include "llvm/Support/raw_ostream.h"
 
 using namespace mlir;
@@ -252,7 +254,7 @@ struct PrefetchInsertPass
 
   struct PagedLoadInfo {
     triton::LoadOp loadOp;
-    LocalAllocOp allocOp;
+    LocalAllocOp allocOp;       // may be null if no existing local_alloc
     scf::ForOp forOp;
     bool asyncEligible = false;
   };
@@ -271,9 +273,6 @@ struct PrefetchInsertPass
     uint32_t contiguity = 1;
 
     // For paged loads, set a contiguity hint based on the encoding.
-    // Within a tile, all tokens share the same physical page →
-    // addresses are contiguous (consecutive elements differ by elemSize).
-    // Safe when TILE_SIZE divides PAGE_SIZE (the common case).
     if (loadOp->hasAttr("pact.paged_load")) {
       auto resTy = dyn_cast<RankedTensorType>(loadOp.getResult().getType());
       if (auto blockedEnc =
@@ -287,35 +286,66 @@ struct PrefetchInsertPass
       }
     }
 
-    auto oldMemDescType = cast<MemDescType>(allocOp.getResult().getType());
-    auto oldEnc = oldMemDescType.getEncoding();
-
-    // For paged loads, use a non-swizzled (trivial) shared memory encoding.
-    // Swizzled layouts produce register-to-offset mappings that can't be
-    // vectorized (largestVectorisation returns elemsPerVec=1 → nBytes=2).
-    // A trivial layout (perPhase=1, maxPhase=1) eliminates swizzling and
-    // allows cp.async vectorization.
+    // Determine SMEM encoding. If we have an allocOp, use its encoding
+    // as the base. Otherwise, create a non-swizzled SMEM encoding from
+    // the load's blocked encoding.
     Attribute newSharedEnc;
-    if (loadOp->hasAttr("pact.paged_load")) {
-      auto ctx = oldEnc.getContext();
-      auto swizzledEnc = mlir::cast<SwizzledSharedEncodingAttr>(oldEnc);
-      auto order = swizzledEnc.getOrder();
-      auto cgaLayout = swizzledEnc.getCGALayout();
+    MemDescType mutableMemDescType;
+    Type loadResultType = loadOp.getResult().getType();
+
+    if (allocOp) {
+      auto oldMemDescType = cast<MemDescType>(allocOp.getResult().getType());
+      auto oldEnc = oldMemDescType.getEncoding();
+
+      if (loadOp->hasAttr("pact.paged_load")) {
+        auto ctx = oldEnc.getContext();
+        auto swizzledEnc = mlir::cast<SwizzledSharedEncodingAttr>(oldEnc);
+        auto order = swizzledEnc.getOrder();
+        auto cgaLayout = swizzledEnc.getCGALayout();
+        newSharedEnc = SwizzledSharedEncodingAttr::get(
+            ctx, /*vec=*/2, /*perPhase=*/1, /*maxPhase=*/1, order, cgaLayout);
+      } else {
+        newSharedEnc = oldEnc;
+      }
+
+      mutableMemDescType = MemDescType::get(
+          oldMemDescType.getShape(), oldMemDescType.getElementType(),
+          newSharedEnc, oldMemDescType.getMemorySpace(),
+          /*mutableMemory=*/true);
+    } else {
+      // No existing allocOp: create SMEM encoding from the load's layout.
+      auto resTy = dyn_cast<RankedTensorType>(loadResultType);
+      if (!resTy)
+        return failure();
+
+      auto blockedEnc =
+          dyn_cast<BlockedEncodingAttr>(resTy.getEncoding());
+      if (!blockedEnc) {
+        llvm::errs() << "[PACT] No blocked encoding on load result\n";
+        return failure();
+      }
+
+      auto ctx = blockedEnc.getContext();
+      auto order = blockedEnc.getOrder();
+      // Get CGA layout from the blocked encoding
+      auto cgaLayout = triton::gpu::getCGALayout(blockedEnc);
+
+      Attribute sharedMemorySpace =
+          triton::gpu::SharedMemorySpaceAttr::get(ctx);
       newSharedEnc = SwizzledSharedEncodingAttr::get(
           ctx, /*vec=*/2, /*perPhase=*/1, /*maxPhase=*/1, order, cgaLayout);
-    } else {
-      newSharedEnc = oldEnc;
-    }
 
-    auto mutableMemDescType = MemDescType::get(
-        oldMemDescType.getShape(), oldMemDescType.getElementType(),
-        newSharedEnc, oldMemDescType.getMemorySpace(),
-        /*mutableMemory=*/true);
+      auto shape = resTy.getShape();
+      auto elemType = resTy.getElementType();
+      mutableMemDescType = MemDescType::get(
+          SmallVector<int64_t>(shape.begin(), shape.end()),
+          elemType, newSharedEnc, sharedMemorySpace,
+          /*mutableMemory=*/true);
+    }
 
     ImplicitLocOpBuilder b(loc, builder);
 
-    // For splat-1 masks (all-ones), skip the mask operand — cp.async
-    // can be unconditional and the mask just adds overhead in lowering.
+    // For splat-1 masks (all-ones), skip the mask operand
     bool isAllOnes = false;
     if (mask) {
       if (auto constOp = mask.getDefiningOp<arith::ConstantOp>()) {
@@ -336,7 +366,7 @@ struct PrefetchInsertPass
         b, src, newBuf, asyncMask, other,
         cache, evict, isVolatile, contiguity);
 
-    // Propagate pact attributes to the async copy op for lowering hints
+    // Propagate pact attributes
     if (loadOp->hasAttr("pact.paged_load"))
       copy->setAttr("pact.paged_load",
                     loadOp->getAttr("pact.paged_load"));
@@ -350,27 +380,38 @@ struct PrefetchInsertPass
     Operation *wait =
         AsyncWaitOp::create(b, commit->getResult(0), 0);
 
-    Value oldMemDesc = allocOp.getResult();
-    SmallVector<OpOperand *> memDescUses;
-    for (auto &use : oldMemDesc.getUses())
-      memDescUses.push_back(&use);
+    if (allocOp) {
+      // Replace uses of old MemDesc
+      Value oldMemDesc = allocOp.getResult();
+      SmallVector<OpOperand *> memDescUses;
+      for (auto &use : oldMemDesc.getUses())
+        memDescUses.push_back(&use);
 
-    for (OpOperand *use : memDescUses) {
-      Operation *user = use->getOwner();
-      if (auto oldLocalLoad = dyn_cast<LocalLoadOp>(user)) {
-        b.setInsertionPoint(oldLocalLoad);
-        Type resultType = oldLocalLoad.getResult().getType();
-        auto newLocalLoad = LocalLoadOp::create(
-            b, resultType, newBuf, wait->getResult(0));
-        oldLocalLoad.getResult().replaceAllUsesWith(
-            newLocalLoad.getResult());
-        oldLocalLoad->erase();
-      } else {
-        user->setOperand(use->getOperandNumber(), newBuf);
+      for (OpOperand *use : memDescUses) {
+        Operation *user = use->getOwner();
+        if (auto oldLocalLoad = dyn_cast<LocalLoadOp>(user)) {
+          b.setInsertionPoint(oldLocalLoad);
+          Type resultType = oldLocalLoad.getResult().getType();
+          auto newLocalLoad = LocalLoadOp::create(
+              b, resultType, newBuf, wait->getResult(0));
+          oldLocalLoad.getResult().replaceAllUsesWith(
+              newLocalLoad.getResult());
+          oldLocalLoad->erase();
+        } else {
+          user->setOperand(use->getOperandNumber(), newBuf);
+        }
       }
+
+      allocOp.erase();
+    } else {
+      // No existing allocOp: replace load result uses directly
+      // with local_load from the new SMEM buffer.
+      b.setInsertionPointAfter(wait);
+      auto localLoad = LocalLoadOp::create(
+          b, loadResultType, newBuf, wait->getResult(0));
+      loadOp.getResult().replaceAllUsesWith(localLoad.getResult());
     }
 
-    allocOp.erase();
     loadOp.erase();
     return success();
   }
@@ -390,7 +431,7 @@ struct PrefetchInsertPass
   ///      (b) cudaErrorMisalignedAddress in cp.async nBytes=2 paired path
   ///      (also affects simple mode with CUDA_LAUNCH_BLOCKING=1).
   ///      Disabled until both issues are resolved.
-#define PACT_DOUBLEBUF_PIPELINE 0
+#define PACT_DOUBLEBUF_PIPELINE 1
 
   LogicalResult convertDoubleBuffer(scf::ForOp forOp,
                                      SmallVectorImpl<PagedLoadInfo> &loads,
@@ -457,27 +498,63 @@ struct PrefetchInsertPass
         auto &loadOp = info.loadOp;
         auto &allocOp = info.allocOp;
 
-        auto oldMemDescType =
-            cast<MemDescType>(allocOp.getResult().getType());
-
         Attribute newSharedEnc;
-        if (loadOp->hasAttr("pact.paged_load")) {
-          auto ctx = oldMemDescType.getEncoding().getContext();
-          auto swizzledEnc = mlir::cast<SwizzledSharedEncodingAttr>(
-              oldMemDescType.getEncoding());
-          auto order = swizzledEnc.getOrder();
-          auto cgaLayout = swizzledEnc.getCGALayout();
+        MemDescType mutableMemDescType;
+
+        if (allocOp) {
+          auto oldMemDescType =
+              cast<MemDescType>(allocOp.getResult().getType());
+
+          if (loadOp->hasAttr("pact.paged_load")) {
+            auto ctx = oldMemDescType.getEncoding().getContext();
+            auto swizzledEnc = mlir::cast<SwizzledSharedEncodingAttr>(
+                oldMemDescType.getEncoding());
+            auto order = swizzledEnc.getOrder();
+            auto cgaLayout = swizzledEnc.getCGALayout();
+            newSharedEnc = SwizzledSharedEncodingAttr::get(
+                ctx, /*vec=*/2, /*perPhase=*/1, /*maxPhase=*/1, order,
+                cgaLayout);
+          } else {
+            newSharedEnc = oldMemDescType.getEncoding();
+          }
+
+          mutableMemDescType = MemDescType::get(
+              oldMemDescType.getShape(), oldMemDescType.getElementType(),
+              newSharedEnc, oldMemDescType.getMemorySpace(),
+              /*mutableMemory=*/true);
+        } else {
+          // No existing allocOp: build SMEM encoding from load layout
+          auto resTy =
+              dyn_cast<RankedTensorType>(loadOp.getResult().getType());
+          if (!resTy) {
+            llvm::errs() << "[PACT DoubleBuf] ERROR: no ranked tensor type\n";
+            continue;
+          }
+
+          auto blockedEnc =
+              dyn_cast<BlockedEncodingAttr>(resTy.getEncoding());
+          if (!blockedEnc) {
+            llvm::errs() << "[PACT DoubleBuf] ERROR: no blocked encoding\n";
+            continue;
+          }
+
+          auto ctx = blockedEnc.getContext();
+          auto order = blockedEnc.getOrder();
+          // Get CGA layout from the blocked encoding's own CGA layout
+          auto cgaLayout = triton::gpu::getCGALayout(blockedEnc);
+          Attribute sharedMemorySpace =
+              triton::gpu::SharedMemorySpaceAttr::get(ctx);
           newSharedEnc = SwizzledSharedEncodingAttr::get(
               ctx, /*vec=*/2, /*perPhase=*/1, /*maxPhase=*/1, order,
               cgaLayout);
-        } else {
-          newSharedEnc = oldMemDescType.getEncoding();
-        }
 
-        auto mutableMemDescType = MemDescType::get(
-            oldMemDescType.getShape(), oldMemDescType.getElementType(),
-            newSharedEnc, oldMemDescType.getMemorySpace(),
-            /*mutableMemory=*/true);
+          auto shape = resTy.getShape();
+          auto elemType = resTy.getElementType();
+          mutableMemDescType = MemDescType::get(
+              SmallVector<int64_t>(shape.begin(), shape.end()),
+              elemType, newSharedEnc, sharedMemorySpace,
+              /*mutableMemory=*/true);
+        }
 
         auto multiBufType =
             triton::getMultiBufferedType(mutableMemDescType, 2);
@@ -631,25 +708,36 @@ struct PrefetchInsertPass
 
       Value bufView = triton::createSingleBufferView(lb, db.alloc2x, idxI32);
 
-      // Replace old local_alloc uses with local_load from bufView
-      Value oldMemDesc = allocOp.getResult();
-      SmallVector<OpOperand *> memDescUses;
-      for (auto &use : oldMemDesc.getUses())
-        memDescUses.push_back(&use);
+      Type loadResultType = loadOp.getResult().getType();
 
-      for (OpOperand *use : memDescUses) {
-        Operation *user = use->getOwner();
-        if (auto oldLocalLoad = dyn_cast<LocalLoadOp>(user)) {
-          lb.setInsertionPoint(oldLocalLoad);
-          Type resultType = oldLocalLoad.getResult().getType();
-          auto newLocalLoad = LocalLoadOp::create(
-              lb, resultType, bufView, /*token=*/Value());
-          oldLocalLoad.getResult().replaceAllUsesWith(
-              newLocalLoad.getResult());
-          oldLocalLoad->erase();
-        } else {
-          user->setOperand(use->getOperandNumber(), bufView);
+      if (allocOp) {
+        // Replace old local_alloc uses with local_load from bufView
+        Value oldMemDesc = allocOp.getResult();
+        SmallVector<OpOperand *> memDescUses;
+        for (auto &use : oldMemDesc.getUses())
+          memDescUses.push_back(&use);
+
+        for (OpOperand *use : memDescUses) {
+          Operation *user = use->getOwner();
+          if (auto oldLocalLoad = dyn_cast<LocalLoadOp>(user)) {
+            lb.setInsertionPoint(oldLocalLoad);
+            Type resultType = oldLocalLoad.getResult().getType();
+            auto newLocalLoad = LocalLoadOp::create(
+                lb, resultType, bufView, /*token=*/Value());
+            oldLocalLoad.getResult().replaceAllUsesWith(
+                newLocalLoad.getResult());
+            oldLocalLoad->erase();
+          } else {
+            user->setOperand(use->getOperandNumber(), bufView);
+          }
         }
+        allocOp.erase();
+      } else {
+        // No existing allocOp: replace load result uses directly
+        lb.setInsertionPoint(loadBlock, loadPos);
+        auto localLoad = LocalLoadOp::create(
+            lb, loadResultType, bufView, /*token=*/Value());
+        loadOp.getResult().replaceAllUsesWith(localLoad.getResult());
       }
 
       // -- 5b: clone j+1 ptr and prefetch into alternate buffer --
@@ -680,12 +768,63 @@ struct PrefetchInsertPass
                         "returned null, skipping prefetch\n";
       }
 
-      // -- Clean up old allocOp and loadOp --
-      allocOp.erase();
+      // -- Clean up old loadOp --
+      // (allocOp was already erased in Step 5a if it existed)
       loadOp.erase();
     }
 
     llvm::errs() << "[PACT DoubleBuf] Pipelined conversion complete\n";
+
+    // ── Step 6: Peel the last iteration to avoid OOB prefetch ──────────
+    // The pipeline body does wait+load+prefetch(j+1).  On the last
+    // iteration (j=N-1), the prefetch for j+1=N would access OOB
+    // addresses.  Instead of an scf.if guard on every iteration, we peel
+    // the last iteration into an epilogue where the prefetch ops are
+    // removed.  The peeled iteration runs outside the loop with only
+    // wait+load (the data was prefetched in the penultimate loop iter).
+    //
+    // Edge cases handled by peelLoopEpilogue:
+    //   - N=1: loop runs 0 iters, epilogue runs once (data from prologue)
+    //   - N=2: loop runs 1 iter (prefetch for iter 1), epilogue consumes it
+    {
+      llvm::errs() << "[PACT DoubleBuf] Peeling last iteration"
+                   << " to eliminate OOB prefetch\n";
+      mlir::triton::peelLoopEpilogue(forOp);
+
+      // After peeling, the epilogue is an scf.if after the forOp.
+      // Its then-region contains a clone of the full loop body (including
+      // the prefetch async_copy+commit).  Remove those prefetch ops.
+      // The peelLoopEpilogue inserts computation ops (lastIV, cond) between
+      // the forOp and the scf.if, so walk forward to find the ifOp.
+      Operation *nextOp = forOp->getNextNode();
+      scf::IfOp ifOp = nullptr;
+      while (nextOp) {
+        ifOp = dyn_cast<scf::IfOp>(nextOp);
+        if (ifOp) break;
+        nextOp = nextOp->getNextNode();
+      }
+      if (ifOp) {
+        Block &epilogueBlock = ifOp.getThenRegion().front();
+        SmallVector<Operation *> toErase;
+        for (auto &op : epilogueBlock.without_terminator()) {
+          if (isa<AsyncCopyGlobalToLocalOp>(op) ||
+              isa<AsyncCommitGroupOp>(op)) {
+            toErase.push_back(&op);
+          }
+        }
+        // Erase in reverse order: commit uses async_copy result, so
+        // erase commit first, then async_copy.
+        for (auto *op : llvm::reverse(toErase)) {
+          op->dropAllUses();
+          op->erase();
+        }
+        llvm::errs() << "[PACT DoubleBuf] Epilogue: removed "
+                     << toErase.size() << " prefetch op(s)\n";
+      } else {
+        llvm::errs() << "[PACT DoubleBuf] WARNING: expected scf.if"
+                     << " epilogue after loop peeling\n";
+      }
+    }
 #else  // PACT_DOUBLEBUF_PIPELINE == 0
     // ═══════════════════════════════════════════════════════════════════
     // SIMPLE MODE: 2x buf allocation + in-body async_copy (7/7 PASS)
@@ -780,19 +919,23 @@ struct PrefetchInsertPass
         return WalkResult::advance();
 
       forOp.walk([&](triton::LoadOp loadOp) {
-        if (!loadOp->hasAttr("pact.paged_load"))
+        if (!loadOp->hasAttr("pact.paged_load")) {
           return WalkResult::advance();
+        }
 
         LocalAllocOp allocOp =
             findLocalAllocThroughLayoutConversions(loadOp);
-        if (!allocOp)
+        // allocOp may be null — we'll create our own SMEM
+
+        if (!canUseCpAsync(loadOp)) {
           return WalkResult::advance();
+        }
 
         PagedLoadInfo info;
         info.loadOp = loadOp;
-        info.allocOp = allocOp;
+        info.allocOp = allocOp;  // may be null
         info.forOp = forOp;
-        info.asyncEligible = canUseCpAsync(loadOp);
+        info.asyncEligible = true;
         pagedLoads.push_back(info);
         return WalkResult::advance();
       });

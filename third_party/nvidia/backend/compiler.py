@@ -281,6 +281,16 @@ class CUDABackend(BaseBackend):
         passes.ttgpuir.add_optimize_thread_locality(pm)
         passes.ttgpuir.add_accelerate_matmul(pm)
         passes.ttgpuir.add_remove_layout_conversions(pm)
+        # PACT: PactLayoutRemap + PrefetchInsert must run BEFORE
+        # optimize_dot_operands and prefetch/pipeline passes, which
+        # restructure the load→local_alloc pattern.  Running here
+        # (after layout setup, before dot operand optimization)
+        # ensures PACT can intercept the loads with intact local_alloc.
+        if knobs.pact.enable and knobs.pact.enable_layout_remap:
+            passes.ttgpuir.add_pact_layout_remap(pm)
+        if knobs.pact.enable and knobs.pact.enable_prefetch_insert \
+           and capability // 10 >= 8:
+            passes.ttgpuir.add_prefetch_insert(pm)
         passes.ttgpuir.add_optimize_dot_operands(pm, capability >= 80)
         nvidia.passes.ttnvgpuir.add_optimize_descriptor_encoding(pm)
         passes.ttir.add_loop_aware_cse(pm)
@@ -338,16 +348,6 @@ class CUDABackend(BaseBackend):
             passes.ttgpuir.add_remove_layout_conversions(pm)
             passes.common.add_canonicalizer(pm)
             passes.common.add_cse(pm)
-
-        # PACT: PactLayoutRemap runs before PrefetchInsert to fix layout/mask.
-        if knobs.pact.enable and knobs.pact.enable_layout_remap:
-            passes.ttgpuir.add_pact_layout_remap(pm)
-        # PACT: Schedule PrefetchInsert last, after all other TTGIR passes.
-        # This ensures local_alloc ops created by optimize_dot_operands,
-        # prefetch, pipeline, or coalesce_async_copy are visible.
-        if knobs.pact.enable and knobs.pact.enable_prefetch_insert \
-           and capability // 10 >= 8:
-            passes.ttgpuir.add_prefetch_insert(pm)
 
         pm.run(mod, 'make_ttgir')
         metadata["tensordesc_meta"] = mod.get_tensordesc_metadata()

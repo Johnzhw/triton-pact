@@ -730,10 +730,17 @@ struct PrefetchInsertPass
 
     Value idx = arith::RemSIOp::create(bodyBuilder, loc, iv, c2);
 
-    // Cast idx to i32 for MemDescIndex (if needed)
+    // Cast idx to i32 for MemDescIndex (if needed).
+    // MemDescIndex requires i32; IV may be i64 or index type.
     Value idxI32 = idx;
-    if (isa<IndexType>(idx.getType()))
+    Type idxType = idx.getType();
+    if (isa<IndexType>(idxType)) {
       idxI32 = arith::IndexCastUIOp::create(bodyBuilder, bodyBuilder.getI32Type(), idx);
+    } else if (auto intTy = dyn_cast<IntegerType>(idxType)) {
+      if (intTy.getWidth() != 32) {
+        idxI32 = arith::TruncIOp::create(bodyBuilder, bodyBuilder.getI32Type(), idx);
+      }
+    }
 
     // wait(0) — drains prologue (iter 0) or previous iteration's prefetch.
     // wait 0 drains all pending groups; the token is just a dummy reference.
@@ -747,8 +754,14 @@ struct PrefetchInsertPass
     Value jPlus1 = arith::AddIOp::create(bodyBuilder, loc, iv, c1);
     Value idxNext = arith::RemSIOp::create(bodyBuilder, loc, jPlus1, c2);
     Value idxNextI32 = idxNext;
-    if (isa<IndexType>(idxNext.getType()))
+    Type idxNextType = idxNext.getType();
+    if (isa<IndexType>(idxNextType)) {
       idxNextI32 = arith::IndexCastUIOp::create(bodyBuilder, bodyBuilder.getI32Type(), idxNext);
+    } else if (auto intTy = dyn_cast<IntegerType>(idxNextType)) {
+      if (intTy.getWidth() != 32) {
+        idxNextI32 = arith::TruncIOp::create(bodyBuilder, bodyBuilder.getI32Type(), idxNext);
+      }
+    }
 
     // ── Pre-step: Pre-compute block_table lookup for iter j+1 ─────────
     // The K and V loads share the same phys_block pointer from the

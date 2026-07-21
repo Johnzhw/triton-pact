@@ -372,6 +372,25 @@ def TritonGPUAddressStrengthReduce : Pass<"tritongpu-address-strength-reduce", "
                            "mlir::arith::ArithDialect"];
 }
 
+def TritonGPUBlockTableSMEMHoist : Pass<"tritongpu-block-table-smem-hoist", "mlir::ModuleOp"> {
+  let summary = "Hoist block_table loads to SMEM before paged attention tile loop";
+  let description = [{
+    Hoists the block_table lookup (tt.load with pact.block_table_lookup) out
+    of the tile loop: allocates shared memory for the entire block_table row
+    (Nb × i32 entries), async-copies it from global memory before the loop,
+    and replaces the in-loop loads with local_load from SMEM.
+
+    This eliminates ~300-cycle global memory loads per tile iteration,
+    replacing them with ~20-cycle SMEM reads. Only applied when the SMEM
+    budget is sufficient (entries × 4 bytes < available SMEM) and the
+    sequence length is compile-time inferable.
+  }];
+  let dependentDialects = ["mlir::triton::gpu::TritonGPUDialect",
+                           "mlir::triton::TritonDialect",
+                           "mlir::scf::SCFDialect",
+                           "mlir::arith::ArithDialect"];
+}
+
 def TritonGPUPactLayoutRemap : Pass<"tritongpu-pact-layout-remap", "mlir::ModuleOp"> {
   let summary = "Remap paged KV load layouts for cp.async eligibility";
   let description = [{

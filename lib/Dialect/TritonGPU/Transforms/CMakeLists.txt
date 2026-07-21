@@ -26,6 +26,7 @@ add_triton_library(TritonGPUTransforms
   Prefetch.cpp
   PrefetchInsert.cpp
   AddressStrengthReduce.cpp
+  BlockTableSMEMHoist.cpp
   PactLayoutRemap.cpp
   RemoveLayoutConversions.cpp
   ReorderInstructions.cpp

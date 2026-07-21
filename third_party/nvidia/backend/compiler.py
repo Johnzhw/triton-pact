@@ -288,6 +288,10 @@ class CUDABackend(BaseBackend):
         # ensures PACT can intercept the loads with intact local_alloc.
         # NOTE: AddressStrengthReduce is disabled — LLVM SCEV handles
         # address strength reduction more effectively at the LLVM level.
+        # BlockTableSMEMHoist: copies block_table row to SMEM before loop,
+        # replacing per-iteration global loads with SMEM reads.
+        if knobs.pact.enable and knobs.pact.enable_bt_smem_hoist:
+            passes.ttgpuir.add_block_table_smem_hoist(pm)
         if knobs.pact.enable and knobs.pact.enable_layout_remap:
             passes.ttgpuir.add_pact_layout_remap(pm)
         if knobs.pact.enable and knobs.pact.enable_prefetch_insert \

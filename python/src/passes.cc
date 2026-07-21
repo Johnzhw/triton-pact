@@ -100,6 +100,8 @@ void init_triton_passes_ttgpuir(py::module &&m) {
   ADD_PASS_WRAPPER_0("add_pact_layout_remap", createTritonGPUPactLayoutRemap);
   ADD_PASS_WRAPPER_0("add_address_strength_reduce",
                      createTritonGPUAddressStrengthReduce);
+  ADD_PASS_WRAPPER_0("add_block_table_smem_hoist",
+                     createTritonGPUBlockTableSMEMHoist);
   ADD_PASS_WRAPPER_0("add_global_sanitizer",
                      createTritonInstrumentGlobalSanitizer);
   ADD_PASS_WRAPPER_0("add_concurrency_sanitizer",

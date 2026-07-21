@@ -286,10 +286,8 @@ class CUDABackend(BaseBackend):
         # restructure the load→local_alloc pattern.  Running here
         # (after layout setup, before dot operand optimization)
         # ensures PACT can intercept the loads with intact local_alloc.
-        # AddressStrengthReduce hoists loop-invariant address terms
-        # before PrefetchInsert, reducing per-iteration compute.
-        if knobs.pact.enable and knobs.pact.enable_address_sr:
-            passes.ttgpuir.add_address_strength_reduce(pm)
+        # NOTE: AddressStrengthReduce is disabled — LLVM SCEV handles
+        # address strength reduction more effectively at the LLVM level.
         if knobs.pact.enable and knobs.pact.enable_layout_remap:
             passes.ttgpuir.add_pact_layout_remap(pm)
         if knobs.pact.enable and knobs.pact.enable_prefetch_insert \

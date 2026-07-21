@@ -580,6 +580,7 @@ class pact_knobs(base_knobs):
     enable_prefetch_insert: env_bool = env_bool("PACT_ENABLE_PREFETCH_INSERT", True)
     enable_layout_remap: env_bool = env_bool("PACT_ENABLE_LAYOUT_REMAP", True)
     enable_bt_prefetch: env_bool = env_bool("PACT_ENABLE_BT_PREFETCH", True)
+    enable_address_sr: env_bool = env_bool("PACT_ENABLE_ADDRESS_SR", True)
     dump_ir: env_bool = env_bool("PACT_DUMP_IR", False)
     verbose: env_bool = env_bool("PACT_VERBOSE", False)
 

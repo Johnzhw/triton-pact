@@ -355,6 +355,23 @@ def TritonGPUPrefetchInsert : Pass<"tritongpu-prefetch-insert", "mlir::ModuleOp"
                            "mlir::arith::ArithDialect"];
 }
 
+def TritonGPUAddressStrengthReduce : Pass<"tritongpu-address-strength-reduce", "mlir::ModuleOp"> {
+  let summary = "Address Strength Reduction for paged attention tile loops";
+  let description = [{
+    Hoists loop-invariant address computation terms out of paged attention
+    tile loops (scf.for with pact.prefetch_eligible).  When PAGE_SIZE is a
+    compile-time constant and matches TILE_SIZE, the page-offset and
+    head-dimension terms are loop-invariant and can be computed once before
+    the loop.  For PAGE_SIZE > TILE_SIZE, additionally rewrites same-page
+    address updates as simple IV recurrence (addr += TILE_SIZE * stride).
+    Falls back to no-op when the pattern is not recognized.
+  }];
+  let dependentDialects = ["mlir::triton::gpu::TritonGPUDialect",
+                           "mlir::triton::TritonDialect",
+                           "mlir::scf::SCFDialect",
+                           "mlir::arith::ArithDialect"];
+}
+
 def TritonGPUPactLayoutRemap : Pass<"tritongpu-pact-layout-remap", "mlir::ModuleOp"> {
   let summary = "Remap paged KV load layouts for cp.async eligibility";
   let description = [{

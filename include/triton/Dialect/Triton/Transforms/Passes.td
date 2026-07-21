@@ -101,6 +101,22 @@ def TritonPactPrefetch : Pass<"triton-pact-prefetch", "mlir::ModuleOp"> {
   let dependentDialects = ["mlir::triton::TritonDialect", "mlir::arith::ArithDialect"];
 }
 
+def TritonBlockTableScalarize : Pass<"triton-block-table-scalarize", "mlir::ModuleOp"> {
+  let summary = "Scalarize uniform block_table tensor loads to scalar+splat";
+  let description = [{
+    Converts block_table tensor gather loads (tt.load with
+    pact.block_table_lookup, loading tensor<16xi32> where all 16 lanes
+    carry the same value) into a scalar load + splat.  This eliminates
+    redundant lanes and simplifies downstream optimizations.
+
+    Only applied when uniformity can be proven: PAGE_SIZE and TILE_SIZE
+    are compile-time constants, TILE_SIZE <= PAGE_SIZE, and the page index
+    computation is divsi(j*TILE + offs_t, PAGE) which yields identical
+    values for all lanes when TILE divides PAGE.
+  }];
+  let dependentDialects = ["mlir::triton::TritonDialect", "mlir::arith::ArithDialect"];
+}
+
 def TritonPatternSpecialize : Pass<"triton-pattern-specialize", "mlir::ModuleOp"> {
   let summary = "Specialize MQA/GQA head mapping for paged attention";
   let description = [{

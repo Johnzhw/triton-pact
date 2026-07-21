@@ -11,6 +11,7 @@ add_triton_library(TritonTransforms
   PageTransform.cpp
   PatternSpecialize.cpp
   PactPrefetch.cpp
+  BlockTableScalarize.cpp
   ReorderBroadcast.cpp
   RewriteTensorDescriptorToPointer.cpp
   ArithTypeConversion.cpp

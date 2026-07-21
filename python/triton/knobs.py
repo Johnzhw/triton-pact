@@ -581,7 +581,8 @@ class pact_knobs(base_knobs):
     enable_layout_remap: env_bool = env_bool("PACT_ENABLE_LAYOUT_REMAP", True)
     enable_bt_prefetch: env_bool = env_bool("PACT_ENABLE_BT_PREFETCH", True)
     enable_address_sr: env_bool = env_bool("PACT_ENABLE_ADDRESS_SR", False)
-    enable_bt_smem_hoist: env_bool = env_bool("PACT_ENABLE_BT_SMEM_HOIST", True)
+    enable_bt_smem_hoist: env_bool = env_bool("PACT_ENABLE_BT_SMEM_HOIST", False)
+    enable_bt_scalarize: env_bool = env_bool("PACT_ENABLE_BT_SCALARIZE", True)
     dump_ir: env_bool = env_bool("PACT_DUMP_IR", False)
     verbose: env_bool = env_bool("PACT_VERBOSE", False)
 

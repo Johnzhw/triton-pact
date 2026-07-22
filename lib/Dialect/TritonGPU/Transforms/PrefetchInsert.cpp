@@ -1067,9 +1067,15 @@ struct PrefetchInsertPass
     for (auto &i : pagedLoads) {
       if (i.asyncEligible) asyncOk++; else syncOk++;
     }
+    // Phase 3: Read page_size for specialization
+    int64_t pageSize = 0;
+    if (auto attr = mod->getAttrOfType<IntegerAttr>("pact.page_size"))
+      pageSize = attr.getInt();
+
     llvm::errs() << "[PACT PrefetchInsert] Found " << pagedLoads.size()
                  << " paged load(s): " << asyncOk << " async-eligible, "
-                 << syncOk << " sync-fallback\n";
+                 << syncOk << " sync-fallback"
+                 << "  (page_size=" << pageSize << ")\n";
 
     // Group eligible loads by their enclosing scf.for loop.
     // Loads in the same loop share j%2 computation and can later

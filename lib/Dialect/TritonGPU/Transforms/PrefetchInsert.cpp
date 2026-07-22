@@ -517,7 +517,7 @@ struct PrefetchInsertPass
     int64_t tilesPerPage = (tileSize > 0 && pageSize >= tileSize)
                                ? pageSize / tileSize
                                : 0;
-    if (tilesPerPage > 1) {
+    if (tilesPerPage > 0) {
       llvm::errs() << "[PACT DoubleBuf] page_size=" << pageSize
                    << " TILE=" << tileSize
                    << " → " << tilesPerPage
@@ -808,31 +808,24 @@ struct PrefetchInsertPass
         auto btLoad = findBlockTableLoad(db.origSrc, _tail);
         if (btLoad && !sharedBlockTableMap.count(btLoad)) {
           Value physNext;
-          if (tilesPerPage > 1) {
-            // Phase 3 optimization: when PAGE_SIZE >= TILE_SIZE,
-            // page_idx = (j*TILE + offs)//PAGE_SIZE = j // ratio
-            // is uniform across all lanes (since offs < TILE <= PAGE).
-            // Replace tensor cloneChain with scalar chain.
-            //
-            // When tilesPerPage == 1: page_idx == j (the IV!)
-            // When tilesPerPage >  1: page_idx = j / ratio
+          if (tilesPerPage > 0) {
+            // Phase 3: when PAGE_SIZE >= TILE_SIZE, page_idx =
+            // (j*TILE+offs)//PAGE = j // ratio is uniform across
+            // all lanes (offs < TILE <= PAGE → offs doesn't affect
+            // the division result). Replace tensor cloneChain with
+            // scalar: page_idx → addptr → load → splat.
             Value scalarBTBase =
                 btLoad.getPtr()
                     .getDefiningOp()
                     ->getOperand(0)
                     .getDefiningOp()
-                    ->getOperand(0); // tt.splat→scalar
+                    ->getOperand(0);
 
-            Value pageIdxScalar;
-            if (tilesPerPage == 1) {
-              // page_idx == j (IV itself!)
-              pageIdxScalar = jPlus1; // page_idx for j+1
-            } else {
-              Value cRatio = arith::ConstantIntOp::create(
-                  sbtb, loc, tilesPerPage, 32);
-              pageIdxScalar = arith::DivSIOp::create(
-                  sbtb, loc, jPlus1, cRatio);
-            }
+            int64_t ratio = tilesPerPage; // >= 1, guaranteed
+            Value cRatio = arith::ConstantIntOp::create(
+                sbtb, loc, ratio, 32);
+            Value pageIdxScalar = arith::DivSIOp::create(
+                sbtb, loc, jPlus1, cRatio);
             // Extend to i64 for addptr compatibility
             Value pageIdxI64 = arith::ExtSIOp::create(
                 sbtb, loc, sbtb.getI64Type(), pageIdxScalar);
@@ -848,9 +841,7 @@ struct PrefetchInsertPass
                 sbtb, loc, btLoad.getResult().getType(),
                 scalarLoad.getResult());
             llvm::errs() << "[PACT DoubleBuf] Scalar BT ("
-                         << tilesPerPage << " tiles/page"
-                         << (tilesPerPage == 1 ? ", idx==IV" : "")
-                         << ")\n";
+                         << ratio << " tiles/page)\n";
           } else {
             physNext = cloneChainWithIVReplacement(
                 btLoad.getResult(), iv, jPlus1, bodyBlock, sbtb);

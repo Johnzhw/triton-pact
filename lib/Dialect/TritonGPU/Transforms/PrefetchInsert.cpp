@@ -487,7 +487,7 @@ struct PrefetchInsertPass
   ///      (b) cudaErrorMisalignedAddress in cp.async nBytes=2 paired path
   ///      (also affects simple mode with CUDA_LAUNCH_BLOCKING=1).
   ///      Disabled until both issues are resolved.
-#define PACT_DOUBLEBUF_PIPELINE 0
+#define PACT_DOUBLEBUF_PIPELINE 1
 
   LogicalResult convertDoubleBuffer(scf::ForOp forOp,
                                      SmallVectorImpl<PagedLoadInfo> &loads,

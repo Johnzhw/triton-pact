@@ -1,25 +1,13 @@
 //===- PactPrefetch.cpp - PACT Block Table Prefetch Pass ------------------===//
 //
-// Restructures the tile loop to prefetch the next iteration's block_table
-// lookup while computing the current iteration's attention.
+// Inserts cache-warming prefetch loads at the end of the tile loop.
+// For each iteration j, after computing attention, we issue a load for
+// the block_table entry that iteration j+1 will need.  When iteration j+1
+// starts and performs its own block_table load, the data is likely already
+// in L1 cache, hiding global memory latency.
 //
-// Before:
-//   for tile in 0..N:
-//     phys = load(block_table + tile_offset // PAGE_SIZE)
-//     K = load(K_cache + phys * stride + ...)
-//     V = load(V_cache + phys * stride + ...)
-//     compute(Q, K, V)
-//
-// After:
-//   phys_0 = load(block_table + offset_0 // PAGE_SIZE)        // prologue
-//   for tile in 0..N iter_args(phys = phys_0):
-//     // Prefetch next tile
-//     if tile+1 < N:
-//       phys_next = load(block_table + offset_{tile+1} // PAGE_SIZE)
-//     K = load(K_cache + phys * stride + ...)
-//     V = load(V_cache + phys * stride + ...)
-//     compute(Q, K, V)
-//     scf.yield phys_next  // carries to next iteration
+// This is a non-intrusive "cache warmup" strategy — the loop structure
+// is unchanged; we only add prefetch loads before the scf.yield.
 //
 //===----------------------------------------------------------------------===//
 
@@ -28,7 +16,6 @@
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/IR/BuiltinTypes.h"
-#include "mlir/IR/ImplicitLocOpBuilder.h"
 #include "mlir/IR/Value.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/Triton/Transforms/Passes.h"
@@ -43,48 +30,93 @@ namespace mlir::triton {
 
 namespace {
 
-/// Find the value that represents `seq_offset` used in the block_table
-/// address computation: seq_offset // PAGE_SIZE.
-/// We look for arith.divsi (or arith.shrsi after canonicalization) that
-/// feeds into a tt.load with pact.block_table_lookup.
-static Value findSeqOffsetSource(Operation *btLoad) {
-  // The block_table load's pointer is tt.addptr(base, page_idx)
-  // where page_idx = seq_offset // PAGE_SIZE (divsi or shrsi)
-  Value ptr = btLoad->getOperand(0);
-  while (true) {
-    auto *defOp = ptr.getDefiningOp();
-    if (!defOp) break;
-    if (defOp->getName().getStringRef() == "tt.addptr") {
-      // The second operand of addptr is the index (page_idx)
-      Value idx = defOp->getOperand(1);
-      // Walk through splat/broadcast/expand_dims to find the scalar or source
-      auto *idxOp = idx.getDefiningOp();
-      if (idxOp) {
-        auto name = idxOp->getName().getStringRef();
-        if (name == "tt.splat" || name == "tt.broadcast" || name == "tt.expand_dims")
-          idx = idxOp->getOperand(0);
-      }
-      // Now idx should be page_idx. Walk further to find seq_offset.
-      Value pageIdx = idx;
-      auto *pageOp = pageIdx.getDefiningOp();
-      if (pageOp) {
-        auto name = pageOp->getName().getStringRef();
-        if (name == "arith.divsi" || name == "arith.floordivsi" ||
-            name == "arith.shrsi") {
-          // First operand is seq_offset
-          return pageOp->getOperand(0);
-        }
-        if (name == "arith.extsi" || name == "arith.index_cast") {
-          return pageOp->getOperand(0);
-        }
-      }
-      // Recurse down addptr chain
-      ptr = defOp->getOperand(0);
-      continue;
+/// Lightweight analysis: extract loop-invariant values needed to compute
+/// phys at an arbitrary IV value.
+struct PrefetchInfo {
+  Value tileSize;         // i32 constant (TILE_SIZE, typically 16)
+  Value offsM;            // tensor<16xi32> (tt.make_range 0..15)
+  Value pageSize;         // tensor<16xi32> (PAGE_SIZE constant)
+  Value btScalarPtr;      // !tt.ptr<i32> — scalar block_table base (outside loop)
+  Type btSplatPtrType;    // tensor<16x!tt.ptr<i32>>
+  Type btLoadType;        // tensor<16xi32>
+  Value numTiles;         // i32 upper bound
+  bool valid = false;
+};
+
+static PrefetchInfo analyzeBlockTable(scf::ForOp forOp) {
+  PrefetchInfo info;
+  info.numTiles = forOp.getUpperBound();
+
+  Operation *btLoad = nullptr;
+  forOp.walk([&](Operation *op) {
+    if (op->hasAttr("pact.block_table_lookup")) {
+      btLoad = op;
+      return WalkResult::interrupt();
     }
-    break;
+    return WalkResult::advance();
+  });
+  if (!btLoad)
+    return info;
+
+  info.btLoadType = btLoad->getResult(0).getType();
+
+  auto loadOp = dyn_cast<triton::LoadOp>(btLoad);
+  if (!loadOp)
+    return info;
+  Value btPtr = loadOp.getPtr();
+
+  // bt_ptr = tt.addptr %btBaseSplat, %page_idx
+  auto *addptrOp = btPtr.getDefiningOp();
+  if (!addptrOp || addptrOp->getName().getStringRef() != "tt.addptr")
+    return info;
+  Value btBaseSplat = addptrOp->getOperand(0);
+  info.btSplatPtrType = btBaseSplat.getType();
+  Value pageIdx = addptrOp->getOperand(1);
+
+  // page_idx = divsi %seq_tensor, %pageSize
+  auto *divOp = pageIdx.getDefiningOp();
+  if (!divOp ||
+      (divOp->getName().getStringRef() != "arith.divsi" &&
+       divOp->getName().getStringRef() != "arith.floordivsi" &&
+       divOp->getName().getStringRef() != "arith.shrsi"))
+    return info;
+  Value seqTensor = divOp->getOperand(0);
+  info.pageSize = divOp->getOperand(1);
+
+  // seq_tensor = addi %seq_splat, %offs_m
+  auto *addiOp = seqTensor.getDefiningOp();
+  if (!addiOp || addiOp->getName().getStringRef() != "arith.addi")
+    return info;
+  Value a0 = addiOp->getOperand(0), a1 = addiOp->getOperand(1);
+  auto *s0 = a0.getDefiningOp(), *s1 = a1.getDefiningOp();
+  Value splatVal;
+  if (s0 && s0->getName().getStringRef() == "tt.splat") {
+    splatVal = a0;
+    info.offsM = a1;
+  } else if (s1 && s1->getName().getStringRef() == "tt.splat") {
+    splatVal = a1;
+    info.offsM = a0;
+  } else {
+    return info;
   }
-  return Value();
+
+  // seq_scalar = arith.muli %iv, %tileSize
+  Value seqScalar = splatVal.getDefiningOp()->getOperand(0);
+  auto *muliOp = seqScalar.getDefiningOp();
+  if (!muliOp || muliOp->getName().getStringRef() != "arith.muli")
+    return info;
+  info.tileSize = (muliOp->getOperand(0) == forOp.getInductionVar())
+                      ? muliOp->getOperand(1)
+                      : muliOp->getOperand(0);
+
+  // btBaseSplat = tt.splat %scalarPtr
+  auto *splatBase = btBaseSplat.getDefiningOp();
+  if (!splatBase || splatBase->getName().getStringRef() != "tt.splat")
+    return info;
+  info.btScalarPtr = splatBase->getOperand(0);
+
+  info.valid = true;
+  return info;
 }
 
 struct PactPrefetchPass
@@ -94,64 +126,73 @@ struct PactPrefetchPass
     ModuleOp mod = getOperation();
     int numTransformed = 0;
 
+    SmallVector<scf::ForOp> worklist;
     mod.walk([&](scf::ForOp forOp) {
-      // Check if this loop has paged access
-      auto *parentOp = forOp->getParentOp();
-      bool isPaged = false;
-      while (parentOp) {
-        if (parentOp->hasAttr("pact.has_paged_access")) {
-          isPaged = true;
+      auto *p = forOp->getParentOp();
+      while (p) {
+        if (p->hasAttr("pact.has_paged_access")) {
+          worklist.push_back(forOp);
           break;
         }
-        parentOp = parentOp->getParentOp();
+        p = p->getParentOp();
       }
-      if (!isPaged)
-        return WalkResult::advance();
-
-      // Find the block_table load
-      Operation *btLoad = nullptr;
-      forOp.walk([&](Operation *op) {
-        if (op->hasAttr("pact.block_table_lookup")) {
-          btLoad = op;
-          return WalkResult::interrupt();
-        }
-        return WalkResult::advance();
-      });
-      if (!btLoad)
-        return WalkResult::advance();
-
-      // Analyze seq_offset source — needed to compute next iteration's offset
-      Value seqOffsetSrc = findSeqOffsetSource(btLoad);
-      if (!seqOffsetSrc) {
-        llvm::errs() << "[PACT PactPrefetch] Could not trace seq_offset source\n";
-        return WalkResult::advance();
-      }
-
-      llvm::errs() << "[PACT PactPrefetch] Block table prefetch restructuring\n";
-
-      // The loop restructuring is complex. It requires:
-      // 1. Duplicating the block_table load + its address computation
-      //    for the prologue (iteration 0)
-      // 2. Modifying the scf.for to carry phys_block as an iteration arg
-      // 3. Moving the block_table load to compute iteration i+1's value
-      // 4. Adding a conditional guard (if tile+1 < N) for the last iteration
-      //
-      // This level of IR manipulation requires the MLIR PatternRewriter
-      // and careful handling of the SSA use-def chain.  For now, we
-      // mark the loop as eligible and log the analysis result.
-
-      forOp->setAttr("pact.prefetch_eligible", UnitAttr::get(&getContext()));
-      forOp->setAttr("pact.prefetch_seq_offset",
-                     StringAttr::get(&getContext(),
-                                     "identified"));
-      numTransformed++;
-
-      return WalkResult::advance();
     });
 
+    for (auto forOp : worklist) {
+      auto info = analyzeBlockTable(forOp);
+      if (!info.valid) {
+        forOp->setAttr("pact.prefetch_eligible",
+                       UnitAttr::get(&getContext()));
+        continue;
+      }
+
+      insertPrefetch(forOp, info);
+      numTransformed++;
+    }
+
     if (numTransformed > 0)
-      llvm::errs() << "[PACT PactPrefetch] Marked " << numTransformed
-                   << " loop(s) as prefetch-eligible\n";
+      llvm::errs() << "[PACT PactPrefetch] Prefetch inserted in "
+                   << numTransformed << " loop(s)\n";
+  }
+
+private:
+  /// Insert a prefetch load at the end of the loop body (before yield).
+  void insertPrefetch(scf::ForOp forOp, const PrefetchInfo &info) {
+    Location loc = forOp.getLoc();
+    // Insert before the terminator (yield) of the for body.
+    // Use the iterator right before the terminator.
+    Block *body = forOp.getBody();
+    auto termIt = body->getTerminator()->getIterator();
+    OpBuilder builder(body, termIt);
+
+    Value iv = forOp.getInductionVar();
+
+    // j_next = iv + 1
+    Value c1 = arith::ConstantIntOp::create(builder, loc, 1, 32);
+    Value jNext = arith::AddIOp::create(builder, loc, iv, c1);
+
+    // Build the prefetch chain directly (no scf.if — the OOB load on
+    // the last iteration is harmless since its result is unused)
+    Value snScalar =
+        arith::MulIOp::create(builder, loc, jNext, info.tileSize);
+    Value snSplat =
+        triton::SplatOp::create(builder, loc, info.btLoadType, snScalar);
+    Value sn =
+        arith::AddIOp::create(builder, loc, snSplat, info.offsM);
+    Value pn =
+        arith::DivSIOp::create(builder, loc, sn, info.pageSize);
+    Value bts =
+        triton::SplatOp::create(builder, loc, info.btSplatPtrType,
+                                 info.btScalarPtr);
+    Value ptrN =
+        triton::AddPtrOp::create(builder, loc, info.btSplatPtrType, bts, pn);
+
+    // Issue the prefetch load — result unused, cache warming only
+    triton::LoadOp::create(builder, loc, info.btLoadType, ptrN,
+                            Value(), Value(),
+                            triton::CacheModifier::CA,
+                            triton::EvictionPolicy::NORMAL, false);
+
   }
 };
 

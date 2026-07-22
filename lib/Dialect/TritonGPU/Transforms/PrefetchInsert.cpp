@@ -799,7 +799,12 @@ struct PrefetchInsertPass
     // would create a dominance violation.
     DenseMap<Operation *, Value> sharedBlockTableMap;
     SmallVector<Operation *> sharedBTOps;
-    if (!bufs.empty()) {
+    // Phase 3: only use shared BT prefetch when page_idx is uniform
+    // (PAGE_SIZE >= TILE_SIZE). When PAGE_SIZE < TILE_SIZE, each lane
+    // maps to a different page → no sharing benefit → skip overhead.
+    bool useSharedBT = (tilesPerPage > 0);
+
+    if (!bufs.empty() && useSharedBT) {
       ImplicitLocOpBuilder sbtb(loc, builder);
       auto &firstLoad = bufs[0].loadOp;
       sbtb.setInsertionPoint(firstLoad);
@@ -809,17 +814,22 @@ struct PrefetchInsertPass
         if (btLoad && !sharedBlockTableMap.count(btLoad)) {
           Value physNext;
           if (tilesPerPage > 0) {
-            // Phase 3: when PAGE_SIZE >= TILE_SIZE, page_idx =
-            // (j*TILE+offs)//PAGE = j // ratio is uniform across
-            // all lanes (offs < TILE <= PAGE → offs doesn't affect
-            // the division result). Replace tensor cloneChain with
-            // scalar: page_idx → addptr → load → splat.
-            Value scalarBTBase =
-                btLoad.getPtr()
-                    .getDefiningOp()
-                    ->getOperand(0)
-                    .getDefiningOp()
-                    ->getOperand(0);
+            // Phase 3: Extract scalar block_table base pointer.
+            //
+            // Two patterns depending on whether BTScalarize ran:
+            // A) Original:  addptr(splat(scalar), tensor_idx) → load
+            // B) Scalarized: addptr(scalar,       scalar_idx) → load
+            //
+            // For A, walk: getPtr→getDefOp→getOperand(0)→getDefOp→getOperand(0)
+            // For B,        getPtr→getDefOp→getOperand(0) (already scalar)
+            Value addptrBase =
+                btLoad.getPtr().getDefiningOp()->getOperand(0);
+            Value scalarBTBase = addptrBase;
+            if (auto *baseSplat = addptrBase.getDefiningOp()) {
+              if (baseSplat->getName().getStringRef() == "tt.splat") {
+                scalarBTBase = baseSplat->getOperand(0);
+              }
+            }
 
             int64_t ratio = tilesPerPage; // >= 1, guaranteed
             Value cRatio = arith::ConstantIntOp::create(
@@ -832,13 +842,24 @@ struct PrefetchInsertPass
             Value btPtrScalar = triton::AddPtrOp::create(
                 sbtb, loc, scalarBTBase.getType(),
                 scalarBTBase, pageIdxI64);
+            // Determine the tensor result type for the splat.
+            // After BTScalarize, btLoad returns i32 (scalar);
+            // before, it returns tensor<16xi32>.  We always
+            // need the tensor form for the stopMap lookup.
+            Type btLoadType = btLoad.getResult().getType();
+            Type btTensorType = btLoadType;
+            if (isa<IntegerType>(btTensorType) && tileSize > 0) {
+              btTensorType = RankedTensorType::get(
+                  {tileSize}, btTensorType);
+            }
+
             auto scalarLoad = triton::LoadOp::create(
                 sbtb, loc, sbtb.getI32Type(), btPtrScalar,
                 Value(), Value(),
                 triton::CacheModifier::NONE,
                 triton::EvictionPolicy::NORMAL, false);
             physNext = triton::SplatOp::create(
-                sbtb, loc, btLoad.getResult().getType(),
+                sbtb, loc, btTensorType,
                 scalarLoad.getResult());
             llvm::errs() << "[PACT DoubleBuf] Scalar BT ("
                          << ratio << " tiles/page)\n";

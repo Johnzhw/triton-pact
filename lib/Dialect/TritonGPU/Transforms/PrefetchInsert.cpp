@@ -491,15 +491,40 @@ struct PrefetchInsertPass
 
   LogicalResult convertDoubleBuffer(scf::ForOp forOp,
                                      SmallVectorImpl<PagedLoadInfo> &loads,
-                                     OpBuilder &builder) {
+                                     OpBuilder &builder,
+                                     int64_t pageSize = 0) {
     if (loads.empty())
       return success();
 
     Location loc = forOp.getLoc();
     Block *bodyBlock = forOp.getBody();
 
-    // Get induction variable
+    // Phase 3: detect TILE_SIZE for page_size specialization
     Value iv = forOp.getInductionVar();
+    int64_t tileSize = 0;
+    for (auto *user : iv.getUsers()) {
+      if (auto mulOp = dyn_cast<arith::MulIOp>(user)) {
+        if (auto cst = dyn_cast<arith::ConstantIntOp>(mulOp.getRhs().getDefiningOp())) {
+          tileSize = cst.value();
+          break;
+        }
+        if (auto cst = dyn_cast<arith::ConstantIntOp>(mulOp.getLhs().getDefiningOp())) {
+          tileSize = cst.value();
+          break;
+        }
+      }
+    }
+    int64_t tilesPerPage = (tileSize > 0 && pageSize >= tileSize)
+                               ? pageSize / tileSize
+                               : 0;
+    if (tilesPerPage > 1) {
+      llvm::errs() << "[PACT DoubleBuf] page_size=" << pageSize
+                   << " TILE=" << tileSize
+                   << " → " << tilesPerPage
+                   << " tiles/page (uniform page_idx, can use scalar BT)\n";
+    }
+
+    // Get induction variable type
     Type ivType = iv.getType();
 
     // Simple mode: delegate each load to convertSingleBuffer.
@@ -787,8 +812,6 @@ struct PrefetchInsertPass
           if (physNext) {
             sharedBlockTableMap[btLoad] = physNext;
             sharedBTOps.push_back(btLoad);
-            llvm::errs() << "[PACT DoubleBuf] Shared block_table"
-                         << " prefetch for iter j+1\n";
           }
         }
       }
@@ -1105,7 +1128,7 @@ struct PrefetchInsertPass
       auto &group = kv.second;
       llvm::errs() << "[PACT PrefetchInsert] Double-buffer loop with "
                    << group.size() << " load(s)\n";
-      if (succeeded(convertDoubleBuffer(forOp, group, builder)))
+      if (succeeded(convertDoubleBuffer(forOp, group, builder, pageSize)))
         converted += group.size();
     }
 

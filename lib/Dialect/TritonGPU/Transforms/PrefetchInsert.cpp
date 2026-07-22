@@ -807,8 +807,45 @@ struct PrefetchInsertPass
         Value _tail;
         auto btLoad = findBlockTableLoad(db.origSrc, _tail);
         if (btLoad && !sharedBlockTableMap.count(btLoad)) {
-          Value physNext = cloneChainWithIVReplacement(
-              btLoad.getResult(), iv, jPlus1, bodyBlock, sbtb);
+          Value physNext;
+          if (tilesPerPage > 1) {
+            // Phase 3 optimization: when PAGE_SIZE >= TILE_SIZE,
+            // page_idx = j // ratio is uniform across all lanes.
+            // Generate a SCALAR chain instead of cloning the full
+            // tensor chain (saves ~6 cloned ops per iteration).
+            //
+            // Scalar chain: j+1 → divsi(ratio) → addptr(base)→ load → splat
+            Value scalarBTBase =
+                btLoad.getPtr()
+                    .getDefiningOp()
+                    ->getOperand(0)
+                    .getDefiningOp()
+                    ->getOperand(0); // tt.splat→scalar
+            Value cRatio = arith::ConstantIntOp::create(
+                sbtb, loc, tilesPerPage, 32);
+            Value pageIdxScalar = arith::DivSIOp::create(
+                sbtb, loc, jPlus1, cRatio);
+            // Extend to i64 for addptr compatibility
+            Value pageIdxI64 = arith::ExtSIOp::create(
+                sbtb, loc, sbtb.getI64Type(), pageIdxScalar);
+            Value btPtrScalar = triton::AddPtrOp::create(
+                sbtb, loc, scalarBTBase.getType(),
+                scalarBTBase, pageIdxI64);
+            auto scalarLoad = triton::LoadOp::create(
+                sbtb, loc, sbtb.getI32Type(), btPtrScalar,
+                Value(), Value(),
+                triton::CacheModifier::NONE,
+                triton::EvictionPolicy::NORMAL, false);
+            physNext = triton::SplatOp::create(
+                sbtb, loc, btLoad.getResult().getType(),
+                scalarLoad.getResult());
+            llvm::errs() << "[PACT DoubleBuf] Scalar BT prefetch"
+                         << " (page_idx=" << tilesPerPage
+                         << " tiles/page)\n";
+          } else {
+            physNext = cloneChainWithIVReplacement(
+                btLoad.getResult(), iv, jPlus1, bodyBlock, sbtb);
+          }
           if (physNext) {
             sharedBlockTableMap[btLoad] = physNext;
             sharedBTOps.push_back(btLoad);

@@ -210,25 +210,23 @@ static OverrideStrategy getOverrideStrategy(triton::LoadOp loadOp, int dim,
   // === Three-strategy decision ===
 
   if (staticallySafe && pageLocalContiguity > 1) {
-    // Case 1: StaticOverride — statically provable safe
     safeContiguity = headSize;
-    LDBG("PACT P3: StaticOverride contiguity[" << dim << "]="
-         << headSize);
+    llvm::errs() << "[PACT P3] StaticOverride: contiguity[" << dim
+                 << "]=" << headSize << " (staticSafe=1, pageLocalCntg="
+                 << pageLocalContiguity << ")\n";
     return OverrideStrategy::StaticOverride;
   }
 
   if (pageLocalContiguity > 1) {
-    // Case 2: ConservativeOverride — partial contiguity w/o static proof
     safeContiguity = pageLocalContiguity;
-    LDBG("PACT P3: ConservativeOverride contiguity[" << dim << "]="
-         << pageLocalContiguity << " (vs headSize=" << headSize
-         << ", requiresGuard=" << requiresGuard << ")");
+    llvm::errs() << "[PACT P3] ConservativeOverride: contiguity[" << dim
+                 << "]=" << pageLocalContiguity << " (headSize=" << headSize
+                 << ", requiresGuard=" << requiresGuard << ")\n";
     return OverrideStrategy::ConservativeOverride;
   }
 
-  // Case 3: NoOverride — cannot determine any safe contiguity
-  LDBG("PACT P3: NoOverride (pageLocalContiguity="
-       << pageLocalContiguity << ")");
+  llvm::errs() << "[PACT P3] NoOverride: pageLocalCntg="
+               << pageLocalContiguity << "\n";
   return OverrideStrategy::NoOverride;
 }
 
@@ -509,15 +507,13 @@ private:
           }
         }
         // P0 (Pass B): fallback — penetrate intermediate ops.
-        // When we can't directly access the LoadOp, use conservative
-        // StaticOverride (same as v1 behavior).
         if (isPactPassBEnabled() && isPactAxisInfoOverrideEnabled()) {
           int depth = getPassBMaxDepth();
           if (reachesPagedLoad(op.getResult(), depth)) {
             auto ptrTy = cast<RankedTensorType>(op.getResult().getType());
             int64_t headSize = ptrTy.getShape()[dim];
-            LDBG("PACT P0+P3: override contiguity[" << dim << "]="
-                 << headSize << " (penetrated, depth=" << depth << ")");
+            llvm::errs() << "[PACT P0] penetration SUCCESS: contiguity[" << dim
+                         << "]=" << headSize << " (depth=" << depth << ")\n";
             return headSize;
           }
         }

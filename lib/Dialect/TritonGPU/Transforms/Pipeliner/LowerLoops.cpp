@@ -160,6 +160,11 @@ static Value createAlloc(scf::ForOp &forOp, Operation *loadOp,
 
 namespace {
 
+static bool isPactStaticProfitabilityEnabled() {
+  const char *env = std::getenv("PACT_ENABLE_STATIC_PROFITABILITY");
+  return !env || std::string(env) != "0";
+}
+
 static bool isPactAutoNumStagesEnabled() {
   const char *env = std::getenv("PACT_ENABLE_AUTO_NUM_STAGES");
   return !env || std::string(env) != "0";
@@ -539,6 +544,20 @@ scf::ForOp lowerLoads(scf::ForOp forOp, CoarseSchedule &schedule,
             cast<RankedTensorType>(op.getResultTypes()[0]), sharedEncoding);
 
         canUseAsyncCp &= copyVecBytes >= 4;
+        // P5: static profitability check
+        if (canUseAsyncCp && isPactStaticProfitabilityEnabled()) {
+          auto chkLoad = cast<tt::LoadOp>(op);
+          int estIters = 128;
+          if (auto hint = chkLoad->getAttrOfType<mlir::IntegerAttr>(
+                  "pact.hint.estimated_iterations"))
+            estIters = hint.getInt();
+          auto profit = isPipelineProfitable(chkLoad, axisInfoAnalysis,
+                                               /*numStages*/3, estIters);
+          if (profit == PipelineProfitability::NotProfitable) {
+            canUseAsyncCp = false;
+            llvm::errs() << "[PACT P5] SKIPPED: not profitable\n";
+          }
+        }
         if (canUseAsyncCp) {
           auto loadOp = cast<tt::LoadOp>(op);
           auto ptr = loadOp.getPtr();
@@ -826,6 +845,8 @@ void createBarrierAndWaitOps(scf::ForOp forOp, CoarseSchedule &schedule,
   int numStages = mainWaitStage - schedule[mma].first + 1;
 
   // P6: Auto num_stages — override with page-aware heuristic
+  llvm::errs() << "[PACT P6 DEBUG] enabled=" << isPactAutoNumStagesEnabled()
+               << " numStages=" << numStages << "\n";
   if (isPactAutoNumStagesEnabled()) {
     int64_t tileBytes = 0;
     int estIterations = 128;
@@ -833,35 +854,37 @@ void createBarrierAndWaitOps(scf::ForOp forOp, CoarseSchedule &schedule,
     int tileTokens = 16;
     bool hasPagedLoad = false;
 
-    forOp.walk([&](tt::LoadOp loadOp) {
-      if (!loadOp->hasAttr("pact.paged_load"))
-        return WalkResult::advance();
-      hasPagedLoad = true;
-      if (auto hintAttr = loadOp->getAttrOfType<mlir::IntegerAttr>(
+    forOp.walk([&](Operation *op) {
+      // Use P4 hints (TTGIR-level) instead of P1 attrs (TTIR-only)
+      if (auto hintAttr = op->getAttrOfType<mlir::IntegerAttr>(
               "pact.hint.tile_bytes")) {
+        hasPagedLoad = true;
         tileBytes += hintAttr.getInt();
       }
-      if (auto hintAttr = loadOp->getAttrOfType<mlir::IntegerAttr>(
+      if (auto hintAttr = op->getAttrOfType<mlir::IntegerAttr>(
               "pact.hint.estimated_iterations")) {
         estIterations = hintAttr.getInt();
       }
-      if (auto attr = loadOp->getAttrOfType<mlir::IntegerAttr>(
-              "pact.page_size"))
+      if (auto attr = op->getAttrOfType<mlir::IntegerAttr>(
+              "pact.hint.page_size"))
         pageSize = attr.getInt();
-      if (auto attr = loadOp->getAttrOfType<mlir::IntegerAttr>(
-              "pact.tile_tokens"))
-        tileTokens = attr.getInt();
+      // tile_tokens is only in TTIR; compute from pageSize/hint if needed
       return WalkResult::advance();
     });
+    if (!hasPagedLoad) hasPagedLoad = (tileBytes > 0);
 
     if (hasPagedLoad) {
-      int smemAvailable = 100 * 1024; // 100KB safe limit
+      int smemAvailable = 100 * 1024;
       int optimalStages =
           computeOptimalNumStages(tileBytes, estIterations, smemAvailable,
                                   pageSize, tileTokens, numStages);
-      LDBG("PACT P6: num_stages " << numStages << " -> " << optimalStages
-           << " (pageSize=" << pageSize << ", tilesPerPage="
-           << (tileTokens > 0 ? pageSize / tileTokens : 0) << ")");
+      llvm::errs() << "[PACT P6] num_stages: " << numStages
+                   << " -> " << optimalStages
+                   << " (tileBytes=" << tileBytes
+                   << ", estIters=" << estIterations
+                   << ", pageSize=" << pageSize
+                   << ", tilesPerPage="
+                   << (tileTokens > 0 ? pageSize / tileTokens : 0) << ")\n";
       numStages = optimalStages;
     }
   }

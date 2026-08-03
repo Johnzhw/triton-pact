@@ -369,43 +369,50 @@ mlir::triton::PipelineProfitability mlir::triton::isPipelineProfitable(
 
   // Rule 1: Too few iterations — pipeline fill/drain dominates
   if (estimatedIterations <= numStages * 2) {
-    LDBG("PACT P5: NOT profitable — too few iters ("
-         << estimatedIterations << " <= " << numStages * 2 << ")");
+    llvm::errs() << "[PACT P5] NOT profitable: too few iters ("
+                 << estimatedIterations << " <= " << numStages * 2 << ")\n";
     return PipelineProfitability::NotProfitable;
   }
   if (estimatedIterations < 16) {
-    LDBG("PACT P5: UNCERTAIN — low iter count ("
-         << estimatedIterations << " < 16)");
+    llvm::errs() << "[PACT P5] UNCERTAIN: low iter count ("
+                 << estimatedIterations << " < 16)\n";
     return PipelineProfitability::Uncertain;
   }
 
-  // Rule 2: Too small tile — cp.async transaction inefficiency
+  // Rule 2: Too small tile
   if (vec < 4 && totalBytes < 128) {
-    LDBG("PACT P5: NOT profitable — tile too small (vec="
-         << vec << ", bytes=" << totalBytes << ")");
+    llvm::errs() << "[PACT P5] NOT profitable: tile too small (vec="
+                 << vec << ", bytes=" << totalBytes << ")\n";
     return PipelineProfitability::NotProfitable;
   }
 
-  // Rule 3: High SMEM pressure — may reduce occupancy
-  int64_t smemLimit = 102400; // 100KB safe limit
+  // Rule 3: High SMEM pressure
+  int64_t smemLimit = 102400;
   int64_t estTotalSMEM = totalBytes * numStages;
   if (estTotalSMEM > smemLimit * 6 / 10) {
-    LDBG("PACT P5: UNCERTAIN — high SMEM ("
-         << estTotalSMEM << "B for " << numStages << " stages)");
+    llvm::errs() << "[PACT P5] UNCERTAIN: high SMEM ("
+                 << estTotalSMEM << "B for " << numStages << " stages)\n";
     return PipelineProfitability::Uncertain;
   }
 
-  // Rule 4: Large tile + long sequence — most profitable
+  // Rule 4: Large tile + long sequence
   if (vec >= 8 && estimatedIterations >= 32 &&
       estTotalSMEM < smemLimit * 3 / 10) {
+    llvm::errs() << "[PACT P5] PROFITABLE: vec=" << vec
+                 << " iters=" << estimatedIterations
+                 << " smem=" << estTotalSMEM << "\n";
     return PipelineProfitability::Profitable;
   }
 
-  // Rule 5: Medium case — assume profitable
+  // Rule 5: Medium case
   if (vec >= 4 && estimatedIterations >= 16) {
+    llvm::errs() << "[PACT P5] LIKELY profitable: vec=" << vec
+                 << " iters=" << estimatedIterations << "\n";
     return PipelineProfitability::LikelyProfitable;
   }
 
+  llvm::errs() << "[PACT P5] UNCERTAIN: vec=" << vec
+               << " iters=" << estimatedIterations << "\n";
   return PipelineProfitability::Uncertain;
 }
 

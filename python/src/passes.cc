@@ -59,6 +59,8 @@ void init_triton_passes_ttir(py::module &&m) {
                      createPACTPageLocalAnalysis);
   ADD_PASS_WRAPPER_0("add_pact_page_major_tile",
                      createPACTPageMajorTile);
+  ADD_PASS_WRAPPER_0("add_pact_run_coalesce",
+                     createPACTRunCoalescing);
   ADD_PASS_OPTION_WRAPPER_4("add_convert_to_ttgpuir",
                             createConvertTritonToTritonGPU, const std::string &,
                             int, int, int);
@@ -106,6 +108,7 @@ void init_triton_passes_ttgpuir(py::module &&m) {
   ADD_PASS_WRAPPER_0("add_pact_layout_remap", createTritonGPUPactLayoutRemap);
   ADD_PASS_WRAPPER_0("add_pact_pipeline_hints", createPACTPipelineHints);
   ADD_PASS_WRAPPER_0("add_pact_guard_fusion", createPACTGuardFusion);
+  ADD_PASS_WRAPPER_0("add_pact_resource_hints", createPACTResourceHints);
   ADD_PASS_WRAPPER_0("add_address_strength_reduce",
                      createTritonGPUAddressStrengthReduce);
   ADD_PASS_WRAPPER_0("add_block_table_smem_hoist",

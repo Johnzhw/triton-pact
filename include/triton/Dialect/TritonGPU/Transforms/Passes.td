@@ -432,4 +432,16 @@ def PACTGuardFusion : Pass<"tritongpu-pact-guard-fusion", "mlir::ModuleOp"> {
                            "mlir::arith::ArithDialect"];
 }
 
+def PACTResourceHints : Pass<"tritongpu-pact-resource-hints", "mlir::ModuleOp"> {
+  let summary = "Aggregate pipeline hints into kernel-level resource estimates";
+  let description = [{
+    Collects P4 pipeline hints across all pact.paged_load ops and outputs a
+    JSON-style module attribute with SMEM/reg/occupancy/memory-bound estimates
+    for NanoFlow-style scheduler consumption.  Default OFF.
+  }];
+  let dependentDialects = ["mlir::triton::gpu::TritonGPUDialect",
+                           "mlir::triton::TritonDialect",
+                           "mlir::arith::ArithDialect"];
+}
+
 #endif

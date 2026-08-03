@@ -155,4 +155,14 @@ def PACTPageMajorTile : Pass<"triton-pact-page-major-tile", "mlir::ModuleOp"> {
   let dependentDialects = ["mlir::triton::TritonDialect", "mlir::arith::ArithDialect"];
 }
 
+def PACTRunCoalescing : Pass<"triton-pact-run-coalescing", "mlir::ModuleOp"> {
+  let summary = "Coalesce sparse token selections into page-aware contiguous runs";
+  let description = [{
+    Groups sparse token indices into page-local contiguous runs for efficient
+    cp.async DMA.  Isolated tokens fall back to scalar gather.  Requires
+    pact.token_mask attribute.  Default OFF.
+  }];
+  let dependentDialects = ["mlir::triton::TritonDialect", "mlir::arith::ArithDialect"];
+}
+
 #endif

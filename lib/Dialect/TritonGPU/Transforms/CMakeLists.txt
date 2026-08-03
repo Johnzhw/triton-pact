@@ -25,6 +25,7 @@ add_triton_library(TritonGPUTransforms
   Pipeliner/Schedule.cpp
   PipelineHints.cpp
   GuardFusion.cpp
+  ResourceHints.cpp
   Prefetch.cpp
   PrefetchInsert.cpp
   AddressStrengthReduce.cpp

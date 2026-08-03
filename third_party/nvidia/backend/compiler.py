@@ -262,6 +262,8 @@ class CUDABackend(BaseBackend):
             passes.ttir.add_pact_page_local_analysis(pm)
         if knobs.pact.enable and knobs.pact.enable_page_major_tile:
             passes.ttir.add_pact_page_major_tile(pm)
+        if knobs.pact.enable and knobs.pact.enable_run_coalesce:
+            passes.ttir.add_pact_run_coalesce(pm)
         passes.common.add_cse(pm)
         passes.common.add_symbol_dce(pm)
         passes.ttir.add_loop_unroll(pm)
@@ -297,6 +299,8 @@ class CUDABackend(BaseBackend):
             passes.ttgpuir.add_pact_pipeline_hints(pm)
         if knobs.pact.enable and knobs.pact.enable_guard_fusion:
             passes.ttgpuir.add_pact_guard_fusion(pm)
+        if knobs.pact.enable and knobs.pact.enable_resource_hints:
+            passes.ttgpuir.add_pact_resource_hints(pm)
         passes.ttgpuir.add_optimize_dot_operands(pm, capability >= 80)
         nvidia.passes.ttnvgpuir.add_optimize_descriptor_encoding(pm)
         passes.ttir.add_loop_aware_cse(pm)

@@ -319,6 +319,96 @@ bool mlir::triton::canBeConvertedToAsyncLoad(
   return width >= 32;
 }
 
+// ═══════════════════════════════════════════════════════════════
+// P5: Static Pipeline Profitability Model
+// ═══════════════════════════════════════════════════════════════
+
+namespace {
+
+static bool isPactStaticProfitabilityEnabled() {
+  const char *env = std::getenv("PACT_ENABLE_STATIC_PROFITABILITY");
+  return !env || std::string(env) != "0";
+}
+
+static double getProfitabilityThreshold() {
+  const char *env = std::getenv("PACT_PROFITABILITY_THRESHOLD");
+  if (env)
+    return std::atof(env);
+  return 0.05;
+}
+
+} // namespace
+
+mlir::triton::PipelineProfitability mlir::triton::isPipelineProfitable(
+    tt::LoadOp loadOp, tt::ModuleAxisInfoAnalysis &axisInfoAnalysis,
+    int numStages, int estimatedIterations) {
+  if (!isPactStaticProfitabilityEnabled())
+    return PipelineProfitability::LikelyProfitable;
+
+  auto tensorTy = dyn_cast<RankedTensorType>(loadOp.getResult().getType());
+  if (!tensorTy)
+    return PipelineProfitability::Uncertain;
+
+  int64_t totalElements = 1;
+  for (auto dim : tensorTy.getShape())
+    totalElements *= dim;
+  int64_t totalBytes = totalElements * 2; // f16
+
+  auto ptr = loadOp.getPtr();
+  unsigned vec = axisInfoAnalysis.getContiguity(ptr);
+
+  // Prefer P4 hints if available
+  if (auto hintBytes = loadOp->getAttrOfType<mlir::IntegerAttr>(
+          "pact.hint.tile_bytes")) {
+    totalBytes = hintBytes.getInt();
+  }
+  if (auto hintIters = loadOp->getAttrOfType<mlir::IntegerAttr>(
+          "pact.hint.estimated_iterations")) {
+    estimatedIterations = hintIters.getInt();
+  }
+
+  // Rule 1: Too few iterations — pipeline fill/drain dominates
+  if (estimatedIterations <= numStages * 2) {
+    LDBG("PACT P5: NOT profitable — too few iters ("
+         << estimatedIterations << " <= " << numStages * 2 << ")");
+    return PipelineProfitability::NotProfitable;
+  }
+  if (estimatedIterations < 16) {
+    LDBG("PACT P5: UNCERTAIN — low iter count ("
+         << estimatedIterations << " < 16)");
+    return PipelineProfitability::Uncertain;
+  }
+
+  // Rule 2: Too small tile — cp.async transaction inefficiency
+  if (vec < 4 && totalBytes < 128) {
+    LDBG("PACT P5: NOT profitable — tile too small (vec="
+         << vec << ", bytes=" << totalBytes << ")");
+    return PipelineProfitability::NotProfitable;
+  }
+
+  // Rule 3: High SMEM pressure — may reduce occupancy
+  int64_t smemLimit = 102400; // 100KB safe limit
+  int64_t estTotalSMEM = totalBytes * numStages;
+  if (estTotalSMEM > smemLimit * 6 / 10) {
+    LDBG("PACT P5: UNCERTAIN — high SMEM ("
+         << estTotalSMEM << "B for " << numStages << " stages)");
+    return PipelineProfitability::Uncertain;
+  }
+
+  // Rule 4: Large tile + long sequence — most profitable
+  if (vec >= 8 && estimatedIterations >= 32 &&
+      estTotalSMEM < smemLimit * 3 / 10) {
+    return PipelineProfitability::Profitable;
+  }
+
+  // Rule 5: Medium case — assume profitable
+  if (vec >= 4 && estimatedIterations >= 16) {
+    return PipelineProfitability::LikelyProfitable;
+  }
+
+  return PipelineProfitability::Uncertain;
+}
+
 void mlir::triton::serializeLatencies(ModuleOp module,
                                       DenseMap<Operation *, int> &opLatency) {
   auto helper = TritonDialect::getLoaded(module)->getLatencyAttrHelper();

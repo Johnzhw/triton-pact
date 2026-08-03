@@ -420,4 +420,16 @@ def PACTPipelineHints : Pass<"tritongpu-pact-pipeline-hints", "mlir::ModuleOp"> 
                            "mlir::arith::ArithDialect"];
 }
 
+def PACTGuardFusion : Pass<"tritongpu-pact-guard-fusion", "mlir::ModuleOp"> {
+  let summary = "Fuse seq boundary and page boundary masks into single comparison";
+  let description = [{
+    Fuses the dual mask pattern (cmp+and+cmp) on pact.paged_load ops into a
+    single min-based comparison.  Only activates when page_boundary_safe=false.
+    Default OFF.
+  }];
+  let dependentDialects = ["mlir::triton::gpu::TritonGPUDialect",
+                           "mlir::triton::TritonDialect",
+                           "mlir::arith::ArithDialect"];
+}
+
 #endif

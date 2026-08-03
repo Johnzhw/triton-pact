@@ -99,6 +99,18 @@ std::pair<Operation *, int64_t> getDefiningOpAndDistance(scf::ForOp forOp,
 int getCopyVecBytes(RankedTensorType registerTy,
                     gpu::SharedEncodingTrait sharedEnc);
 
+// P5: Static pipeline profitability model
+enum class PipelineProfitability {
+  Profitable,        // Clearly profitable
+  LikelyProfitable,  // Likely profitable (default)
+  Uncertain,         // Need profile feedback
+  NotProfitable,     // Skip pipeline
+};
+
+PipelineProfitability isPipelineProfitable(
+    triton::LoadOp loadOp, triton::ModuleAxisInfoAnalysis &axisInfoAnalysis,
+    int numStages, int estimatedIterations);
+
 bool canBeConvertedToAsyncLoad(
     triton::LoadOp loadOp, triton::ModuleAxisInfoAnalysis &axisInfoAnalysis);
 

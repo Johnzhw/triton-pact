@@ -10,6 +10,7 @@ add_triton_library(TritonTransforms
   LoopUnroll.cpp
   PageTransform.cpp
   PageLocalAnalysis.cpp
+  PageMajorTileOrdering.cpp
   PatternSpecialize.cpp
   PactPrefetch.cpp
   BlockTableScalarize.cpp

@@ -594,6 +594,16 @@ class pact_knobs(base_knobs):
     enable_guarded_override: env_bool = env_bool("PACT_ENABLE_GUARDED_OVERRIDE", True)
     # P4: Pipeline hints system (13 hints)
     enable_pipeline_hints: env_bool = env_bool("PACT_ENABLE_PIPELINE_HINTS", True)
+    # P5: Static pipeline profitability model
+    enable_static_profitability: env_bool = env_bool("PACT_ENABLE_STATIC_PROFITABILITY", True)
+    profitability_threshold: env_float = env_float("PACT_PROFITABILITY_THRESHOLD", 0.05)
+    # P6: Auto num_stages selection (page-aware heuristic)
+    enable_auto_num_stages: env_bool = env_bool("PACT_ENABLE_AUTO_NUM_STAGES", True)
+    max_pipeline_stages: env_int = env_int("PACT_MAX_PIPELINE_STAGES", 4)
+    # P7: Page-major tile ordering (default OFF — changes computation order)
+    enable_page_major_tile: env_bool = env_bool("PACT_ENABLE_PAGE_MAJOR_TILE", False)
+    # P8: Mask/page-boundary guard fusion (default OFF)
+    enable_guard_fusion: env_bool = env_bool("PACT_ENABLE_GUARD_FUSION", False)
     dump_ir: env_bool = env_bool("PACT_DUMP_IR", False)
     verbose: env_bool = env_bool("PACT_VERBOSE", False)
 

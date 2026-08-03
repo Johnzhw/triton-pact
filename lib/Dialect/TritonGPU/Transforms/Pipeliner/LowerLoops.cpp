@@ -13,6 +13,9 @@
 #include "triton/Dialect/TritonGPU/Transforms/Utility.h"
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonNvidiaGPU/Transforms/TMAUtilities.h"
+
+#include <cstdlib>
+#include <string>
 #include "triton/Tools/StrUtil.h"
 #include "llvm/Support/Debug.h"
 #include "llvm/Support/ErrorHandling.h"
@@ -149,6 +152,73 @@ static Value createAlloc(scf::ForOp &forOp, Operation *loadOp,
   return triton::createAlloc(
       forOp, cast<RankedTensorType>(loadOp->getResultTypes().front()),
       loadOp->getLoc(), sharedEnc, distance);
+}
+
+// ═══════════════════════════════════════════════════════════════
+// P6: Automatic num_stages Selection (page-aware heuristic)
+// ═══════════════════════════════════════════════════════════════
+
+namespace {
+
+static bool isPactAutoNumStagesEnabled() {
+  const char *env = std::getenv("PACT_ENABLE_AUTO_NUM_STAGES");
+  return !env || std::string(env) != "0";
+}
+
+static int getMaxPipelineStages() {
+  const char *env = std::getenv("PACT_MAX_PIPELINE_STAGES");
+  if (env) {
+    int val = std::atoi(env);
+    return std::max(2, std::min(val, 6));
+  }
+  return 4;
+}
+
+} // namespace
+
+static int computeOptimalNumStages(int64_t tileBytes, int estimatedIterations,
+                                   int64_t smemAvailable, int pageSize,
+                                   int tileTokens, int originalNumStages) {
+  if (!isPactAutoNumStagesEnabled() || pageSize <= 0)
+    return originalNumStages;
+
+  int minStages = 2;
+  int maxStages = getMaxPipelineStages();
+
+  // Constraint 1: SMEM hard limit
+  int maxStagesBySMEM = 1;
+  if (tileBytes > 0) {
+    maxStagesBySMEM = smemAvailable / tileBytes;
+    maxStagesBySMEM = std::max(1, maxStagesBySMEM);
+  }
+  int upperBound = std::min(maxStages, maxStagesBySMEM);
+
+  // Constraint 2: iterations limit (leave room for fill/drain)
+  if (estimatedIterations > 0) {
+    int maxStagesByIter =
+        std::max(2, std::min(maxStages, estimatedIterations / 4));
+    upperBound = std::min(upperBound, maxStagesByIter);
+  }
+
+  upperBound = std::max(minStages, upperBound);
+  if (upperBound <= minStages)
+    return minStages;
+
+  // Page-aware heuristic: tilesPerPage drives L2 locality
+  int tilesPerPage = (tileTokens > 0) ? pageSize / tileTokens : 1;
+
+  if (tilesPerPage >= 4) {
+    // High L2 locality: same physical page → L2 cache absorbs latency
+    return std::max(minStages, upperBound - 1);
+  }
+
+  if (tilesPerPage <= 1) {
+    // Low locality: each iteration crosses page boundary → need deep pipeline
+    return upperBound;
+  }
+
+  // Medium locality (2-3 tiles/page)
+  return std::max(minStages, upperBound - 1);
 }
 
 void createAsyncCopy(scf::ForOp forOp, tt::LoadOp loadOp, Value alloc,
@@ -754,6 +824,47 @@ void createBarrierAndWaitOps(scf::ForOp forOp, CoarseSchedule &schedule,
   }
 
   int numStages = mainWaitStage - schedule[mma].first + 1;
+
+  // P6: Auto num_stages — override with page-aware heuristic
+  if (isPactAutoNumStagesEnabled()) {
+    int64_t tileBytes = 0;
+    int estIterations = 128;
+    int pageSize = 16;
+    int tileTokens = 16;
+    bool hasPagedLoad = false;
+
+    forOp.walk([&](tt::LoadOp loadOp) {
+      if (!loadOp->hasAttr("pact.paged_load"))
+        return WalkResult::advance();
+      hasPagedLoad = true;
+      if (auto hintAttr = loadOp->getAttrOfType<mlir::IntegerAttr>(
+              "pact.hint.tile_bytes")) {
+        tileBytes += hintAttr.getInt();
+      }
+      if (auto hintAttr = loadOp->getAttrOfType<mlir::IntegerAttr>(
+              "pact.hint.estimated_iterations")) {
+        estIterations = hintAttr.getInt();
+      }
+      if (auto attr = loadOp->getAttrOfType<mlir::IntegerAttr>(
+              "pact.page_size"))
+        pageSize = attr.getInt();
+      if (auto attr = loadOp->getAttrOfType<mlir::IntegerAttr>(
+              "pact.tile_tokens"))
+        tileTokens = attr.getInt();
+      return WalkResult::advance();
+    });
+
+    if (hasPagedLoad) {
+      int smemAvailable = 100 * 1024; // 100KB safe limit
+      int optimalStages =
+          computeOptimalNumStages(tileBytes, estIterations, smemAvailable,
+                                  pageSize, tileTokens, numStages);
+      LDBG("PACT P6: num_stages " << numStages << " -> " << optimalStages
+           << " (pageSize=" << pageSize << ", tilesPerPage="
+           << (tileTokens > 0 ? pageSize / tileTokens : 0) << ")");
+      numStages = optimalStages;
+    }
+  }
 
   OpBuilderForStage builder(mma.getLoc(), mma, schedule);
   Value barrierAlloc = createBarrierAlloc(forOp, numStages);

@@ -144,4 +144,15 @@ def PACTPageLocalAnalysis : Pass<"triton-pact-page-local-analysis", "mlir::Modul
   let dependentDialects = ["mlir::triton::TritonDialect", "mlir::arith::ArithDialect"];
 }
 
+def PACTPageMajorTile : Pass<"triton-pact-page-major-tile", "mlir::ModuleOp"> {
+  let summary = "Reorder token-major loops to page-major for L2 locality";
+  let description = [{
+    Transforms single-level scf.for loops (token-major) into double-nested
+    page-major loops (page loop + tile-in-page loop) when page_size >= 2*tile_size.
+    Improves L2 cache locality by grouping consecutive tiles within the same
+    physical page.  Default OFF — changes FP16 accumulation order.
+  }];
+  let dependentDialects = ["mlir::triton::TritonDialect", "mlir::arith::ArithDialect"];
+}
+
 #endif

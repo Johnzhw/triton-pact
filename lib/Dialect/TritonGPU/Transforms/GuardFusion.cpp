@@ -41,19 +41,29 @@ static bool isEnabled() {
 }
 
 // Match: AND of two CMP ops → fuse into min-based single CMP
-struct FuseGuardPattern : public OpRewritePattern<triton::LoadOp> {
-  using OpRewritePattern<triton::LoadOp>::OpRewritePattern;
+// Uses generic Operation* matching since in TTGIR the load op type may differ.
+struct FuseGuardPattern : public RewritePattern {
+  FuseGuardPattern(MLIRContext *ctx)
+      : RewritePattern(MatchAnyOpTypeTag(), /*benefit=*/1, ctx) {}
 
-  LogicalResult matchAndRewrite(triton::LoadOp loadOp,
+  LogicalResult matchAndRewrite(Operation *op,
                                  PatternRewriter &rewriter) const override {
-    if (!loadOp->hasAttr("pact.paged_load"))
+    if (!op->hasAttr("pact.paged_load"))
       return failure();
 
-    // Skip if statically safe (no page boundary mask needed)
-    if (loadOp->hasAttr("pact.page_boundary_safe"))
+    // Need a mask operand — check via getMask() interface
+    auto maskAttr = op->getAttr("pact.paged_load");
+    if (!maskAttr)
       return failure();
 
-    Value mask = loadOp.getMask();
+    // Skip if statically safe
+    if (op->hasAttr("pact.page_boundary_safe"))
+      return failure();
+
+    // Get mask — try operand 1 (common pattern: load ptr, mask, other)
+    Value mask;
+    if (op->getNumOperands() >= 2)
+      mask = op->getOperand(1);
     if (!mask)
       return failure();
 
@@ -71,53 +81,35 @@ struct FuseGuardPattern : public OpRewritePattern<triton::LoadOp> {
       return failure();
 
     // Identify which is seq mask and which is page mask
-    // Heuristic: page mask's RHS is a constant (page_size)
     arith::CmpIOp seqCmp = cmp1, pageCmp = cmp2;
     auto pageConst = pageCmp.getRhs().getDefiningOp<arith::ConstantOp>();
     auto seqConst = seqCmp.getRhs().getDefiningOp<arith::ConstantOp>();
-
-    if (!pageConst && seqConst) {
+    if (!pageConst && seqConst)
       std::swap(seqCmp, pageCmp);
-    }
-
     pageConst = pageCmp.getRhs().getDefiningOp<arith::ConstantOp>();
     if (!pageConst)
       return failure();
 
-    // Build fused mask: min(seq_remaining, page_remaining) < tile_size
-    auto loc = loadOp.getLoc();
-    Value seqLen = seqCmp.getRhs();
-    Value tokenIdx = seqCmp.getLhs();
-    Value seqRemaining = arith::SubIOp::create(rewriter, loc, seqLen, tokenIdx);
-
-    Value pageSizeV = pageCmp.getRhs();
-    Value pageOffset = pageCmp.getLhs();
-    Value pageRemaining = arith::SubIOp::create(rewriter, 
-        loc, pageSizeV, pageOffset);
-
-    Value bound = arith::MinSIOp::create(rewriter, 
-        loc, seqRemaining, pageRemaining);
+    // Build fused mask
+    auto loc = op->getLoc();
+    Value seqRemaining = arith::SubIOp::create(rewriter, loc,
+        seqCmp.getRhs(), seqCmp.getLhs());
+    Value pageRemaining = arith::SubIOp::create(rewriter, loc,
+        pageCmp.getRhs(), pageCmp.getLhs());
+    Value bound = arith::MinSIOp::create(rewriter, loc,
+        seqRemaining, pageRemaining);
 
     int64_t tileSize = 16;
-    if (auto attr = loadOp->getAttrOfType<mlir::IntegerAttr>(
-            "pact.tile_tokens"))
+    if (auto attr = op->getAttrOfType<mlir::IntegerAttr>("pact.tile_tokens"))
       tileSize = attr.getInt();
     Value tileSizeV = arith::ConstantOp::create(rewriter, loc,
         rewriter.getI64IntegerAttr(tileSize));
-    Value effectiveMask = arith::CmpIOp::create(
-        rewriter, loc, arith::CmpIPredicate::slt, tileSizeV, bound);
+    Value effectiveMask = arith::CmpIOp::create(rewriter, loc,
+        arith::CmpIPredicate::slt, tileSizeV, bound);
 
-    auto newLoad = triton::LoadOp::create(
-        rewriter, loc, loadOp.getResult().getType(),
-        loadOp.getPtr(), effectiveMask, loadOp.getOther(),
-        loadOp.getCache(), loadOp.getEvict(), loadOp.getIsVolatile());
-
-    for (auto namedAttr : loadOp->getAttrs()) {
-      newLoad->setAttr(namedAttr.getName(), namedAttr.getValue());
-    }
-
-    rewriter.replaceOp(loadOp, newLoad.getResult());
-    LDBG("PACT P8: fused guard for load");
+    // Replace mask operand and keep everything else the same
+    op->setOperand(1, effectiveMask);
+    llvm::errs() << "[PACT P8] fused guard: replaced dual mask with min-based comparison\n";
     return success();
   }
 };

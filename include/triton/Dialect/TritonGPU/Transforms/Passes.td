@@ -420,6 +420,19 @@ def PACTPipelineHints : Pass<"tritongpu-pact-pipeline-hints", "mlir::ModuleOp"> 
                            "mlir::arith::ArithDialect"];
 }
 
+def PACTAutoNumStages : Pass<"tritongpu-pact-auto-num-stages", "mlir::ModuleOp"> {
+  let summary = "Set page-aware optimal num_stages on paged loops";
+  let description = [{
+    Reads P4 pipeline hints and computes optimal num_stages based on
+    page-aware heuristics (tilesPerPage → L2 locality).  Sets ttg.num_stages
+    loop attribute so the pipeline pass picks up the overridden value.
+    Controlled by PACT_ENABLE_AUTO_NUM_STAGES (default ON).
+  }];
+  let dependentDialects = ["mlir::triton::gpu::TritonGPUDialect",
+                           "mlir::triton::TritonDialect",
+                           "mlir::arith::ArithDialect"];
+}
+
 def PACTGuardFusion : Pass<"tritongpu-pact-guard-fusion", "mlir::ModuleOp"> {
   let summary = "Fuse seq boundary and page boundary masks into single comparison";
   let description = [{

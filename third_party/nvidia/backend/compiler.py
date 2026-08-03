@@ -297,6 +297,8 @@ class CUDABackend(BaseBackend):
             passes.ttgpuir.add_prefetch_insert(pm)
         if knobs.pact.enable and knobs.pact.enable_pipeline_hints:
             passes.ttgpuir.add_pact_pipeline_hints(pm)
+        if knobs.pact.enable and knobs.pact.enable_auto_num_stages:
+            passes.ttgpuir.add_pact_auto_num_stages(pm)
         if knobs.pact.enable and knobs.pact.enable_guard_fusion:
             passes.ttgpuir.add_pact_guard_fusion(pm)
         if knobs.pact.enable and knobs.pact.enable_resource_hints:

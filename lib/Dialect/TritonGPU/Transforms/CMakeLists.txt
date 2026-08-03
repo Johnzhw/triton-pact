@@ -23,6 +23,7 @@ add_triton_library(TritonGPUTransforms
   Pipeliner/MMAv5PipelineUtility.cpp
   Pipeliner/PipeliningUtility.cpp
   Pipeliner/Schedule.cpp
+  AutoNumStages.cpp
   PipelineHints.cpp
   GuardFusion.cpp
   ResourceHints.cpp

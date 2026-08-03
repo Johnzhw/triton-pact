@@ -18,6 +18,7 @@
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/Triton/Transforms/Passes.h"
 
+#include "llvm/ADT/STLExtras.h"
 #include "llvm/Support/Debug.h"
 #include "llvm/Support/raw_ostream.h"
 
@@ -89,13 +90,18 @@ struct PageMajorTileOrderingPass
         return WalkResult::advance();
       }
 
-      // Get upper bound
-      auto upperConst =
-          forOp.getUpperBound().getDefiningOp<arith::ConstantOp>();
+      // Get upper bound — handle both direct constant and bitcast(constant)
+      auto upperVal = forOp.getUpperBound();
+      auto upperConst = upperVal.getDefiningOp<arith::ConstantOp>();
       if (!upperConst) {
-        llvm::errs() << "[PACT P7 DEBUG] upper bound is not constant\n";
-        return WalkResult::advance();
+        // Try peeking through arith.bitcast (TTIR represents constants as
+        // bitcast(const_i32) in scf.for bounds)
+        if (auto bitcast = upperVal.getDefiningOp<arith::BitcastOp>()) {
+          upperConst = bitcast.getOperand().getDefiningOp<arith::ConstantOp>();
+        }
       }
+      if (!upperConst)
+        return WalkResult::advance();
       int64_t numTiles =
           mlir::cast<mlir::IntegerAttr>(upperConst.getValue()).getInt();
 
@@ -139,25 +145,28 @@ struct PageMajorTileOrderingPass
       Value t = tileLoop.getInductionVar();
       Value j = arith::AddIOp::create(builder, loc, pBase, t);
 
-      // Clone original loop body, replacing IV with j
+      // Clone original loop body — map IV and iter args
       mlir::IRMapping mapping;
       mapping.map(forOp.getInductionVar(), j);
-      for (auto &op : forOp.getBody()->without_terminator()) {
+      for (auto [oldArg, newArg] :
+           llvm::zip(forOp.getRegionIterArgs(),
+                     pageLoop.getRegionIterArgs()))
+        mapping.map(oldArg, newArg);
+
+      for (auto &op : forOp.getBody()->without_terminator())
         builder.clone(op, mapping);
-      }
 
       auto oldYield = cast<scf::YieldOp>(forOp.getBody()->getTerminator());
       SmallVector<mlir::Value> tileYieldOperands;
-      for (auto operand : oldYield.getOperands()) {
+      for (auto operand : oldYield.getOperands())
         tileYieldOperands.push_back(mapping.lookup(operand));
-      }
       scf::YieldOp::create(builder, loc, tileYieldOperands);
 
       builder.setInsertionPointAfter(tileLoop);
       scf::YieldOp::create(builder, loc, tileLoop.getResults());
 
       forOp.replaceAllUsesWith(pageLoop.getResults());
-      forOp.erase();
+      forOp->erase();
 
       numTransformed++;
       return WalkResult::advance();

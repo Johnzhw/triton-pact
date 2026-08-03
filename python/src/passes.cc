@@ -107,6 +107,7 @@ void init_triton_passes_ttgpuir(py::module &&m) {
   ADD_PASS_WRAPPER_0("add_prefetch_insert", createTritonGPUPrefetchInsert);
   ADD_PASS_WRAPPER_0("add_pact_layout_remap", createTritonGPUPactLayoutRemap);
   ADD_PASS_WRAPPER_0("add_pact_pipeline_hints", createPACTPipelineHints);
+  ADD_PASS_WRAPPER_0("add_pact_auto_num_stages", createPACTAutoNumStages);
   ADD_PASS_WRAPPER_0("add_pact_guard_fusion", createPACTGuardFusion);
   ADD_PASS_WRAPPER_0("add_pact_resource_hints", createPACTResourceHints);
   ADD_PASS_WRAPPER_0("add_address_strength_reduce",

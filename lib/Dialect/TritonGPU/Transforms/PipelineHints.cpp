@@ -216,6 +216,8 @@ struct PACTPipelineHintsPass
             mlir::IntegerAttr::get(i64Ty, hint_estimatedIterations));
         loadOp->setAttr("pact.hint.tile_bytes",
             mlir::IntegerAttr::get(i64Ty, hint_tileBytes));
+        loadOp->setAttr("pact.hint.tile_tokens",
+            mlir::IntegerAttr::get(i64Ty, tileTokens));
         loadOp->setAttr("pact.hint.prefer_async",
             mlir::BoolAttr::get(ctx, hint_preferAsync));
         loadOp->setAttr("pact.hint.suggested_num_stages",

@@ -496,6 +496,36 @@ struct PageTransformPass
 
         // Annotate as paged KV load
         loadOp->setAttr("pact.paged_load", UnitAttr::get(&getContext()));
+
+        // P1: Extended semantic annotations for Phase 2 modules
+        auto resultTy = cast<RankedTensorType>(loadOp->getResult(0).getType());
+        auto shape = resultTy.getShape();
+
+        // Identify dimensions: dim 0 = seq (tile tokens), last dim = head_dim
+        int64_t seqDim = 0;
+        int64_t headDim = shape.size() - 1;
+        int64_t tileTokens = (seqDim < (int64_t)shape.size()) ? shape[seqDim] : 1;
+        int64_t headSize = (headDim < (int64_t)shape.size()) ? shape[headDim] : 64;
+
+        auto i64Ty = IntegerType::get(&getContext(), 64);
+        loadOp->setAttr("pact.page_size",
+            IntegerAttr::get(i64Ty, pageSize));
+        loadOp->setAttr("pact.tile_tokens",
+            IntegerAttr::get(i64Ty, tileTokens));
+        loadOp->setAttr("pact.head_dim_idx",
+            IntegerAttr::get(i64Ty, headDim));
+        loadOp->setAttr("pact.head_dim_size",
+            IntegerAttr::get(i64Ty, headSize));
+        loadOp->setAttr("pact.seq_dim_idx",
+            IntegerAttr::get(i64Ty, seqDim));
+
+        // page_boundary_safe: static proof that tile doesn't cross page boundary
+        // True when tile size is an exact multiple of page size
+        if (tileTokens > 0 && pageSize > 0 && tileTokens % pageSize == 0) {
+          loadOp->setAttr("pact.page_boundary_safe",
+              BoolAttr::get(&getContext(), true));
+        }
+
         numKVLoadsAnnotated++;
 
         return WalkResult::advance();

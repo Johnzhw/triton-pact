@@ -584,6 +584,12 @@ class pact_knobs(base_knobs):
     enable_bt_smem_hoist: env_bool = env_bool("PACT_ENABLE_BT_SMEM_HOIST", False)
     enable_bt_scalarize: env_bool = env_bool("PACT_ENABLE_BT_SCALARIZE", False)
     enable_axisinfo_override: env_bool = env_bool("PACT_ENABLE_AXISINFO_OVERRIDE", True)
+    # === Phase 2 knobs ===
+    # P0: AxisInfo penetration through intermediate ops (Pass B)
+    enable_pass_b: env_bool = env_bool("PACT_ENABLE_PASS_B", True)
+    pass_b_max_depth: env_int = env_int("PACT_PASS_B_MAX_DEPTH", 4)
+    # P2: Page-local memory analysis
+    enable_page_local_analysis: env_bool = env_bool("PACT_ENABLE_PAGE_LOCAL_ANALYSIS", True)
     dump_ir: env_bool = env_bool("PACT_DUMP_IR", False)
     verbose: env_bool = env_bool("PACT_VERBOSE", False)
 

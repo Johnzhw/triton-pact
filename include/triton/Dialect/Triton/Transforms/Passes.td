@@ -129,4 +129,19 @@ def TritonPatternSpecialize : Pass<"triton-pattern-specialize", "mlir::ModuleOp"
   let dependentDialects = ["mlir::triton::TritonDialect", "mlir::arith::ArithDialect"];
 }
 
+def PACTPageLocalAnalysis : Pass<"triton-pact-page-local-analysis", "mlir::ModuleOp"> {
+  let summary = "Analyze page-local memory contiguity for paged KV loads";
+  let description = [{
+    Reads PACT semantic attributes (pact.page_size, pact.tile_tokens, etc.)
+    from tt.load ops annotated with pact.paged_load, and computes verifiable
+    page-local memory properties: contiguity, safe vector width, static safety,
+    runtime guard requirement, and bytes until page boundary.
+
+    Outputs 5 pact.pagelocal.* attributes consumed by P3 (Guarded Override),
+    P4 (Pipeline Hints), and P8 (Guard Fusion).  Does not modify IR structure
+    or AxisInfo — purely an analysis pass.
+  }];
+  let dependentDialects = ["mlir::triton::TritonDialect", "mlir::arith::ArithDialect"];
+}
+
 #endif

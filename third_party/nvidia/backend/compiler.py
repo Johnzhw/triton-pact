@@ -258,6 +258,8 @@ class CUDABackend(BaseBackend):
             passes.ttir.add_pact_prefetch(pm)
         if knobs.pact.enable and knobs.pact.enable_bt_scalarize:
             passes.ttir.add_block_table_scalarize(pm)
+        if knobs.pact.enable and knobs.pact.enable_page_local_analysis:
+            passes.ttir.add_pact_page_local_analysis(pm)
         passes.common.add_cse(pm)
         passes.common.add_symbol_dce(pm)
         passes.ttir.add_loop_unroll(pm)

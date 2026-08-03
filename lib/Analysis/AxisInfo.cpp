@@ -28,6 +28,119 @@ static bool isPactAxisInfoOverrideEnabled() {
   return !env || std::string(env) != "0";
 }
 
+// ═══════════════════════════════════════════════════════════════
+// P0: AxisInfo penetration through intermediate ops (Pass B)
+// ═══════════════════════════════════════════════════════════════
+
+// Check if an op is a "passthrough" that can be safely penetrated
+// without changing data contiguity semantics.
+static bool isPassthroughOp(Operation *op) {
+  if (!op || op->getNumResults() == 0)
+    return false;
+  auto name = op->getName().getStringRef();
+
+  // Type conversions: preserve data contiguity
+  if (name == "arith.extsi" || name == "arith.extui" ||
+      name == "arith.trunci" || name == "arith.index_cast" ||
+      name == "arith.sitofp")
+    return true;
+
+  // Shape reshapes: change tensor metadata only, not element contiguity
+  if (name == "tt.broadcast" || name == "tt.expand_dims" ||
+      name == "tt.splat")
+    return true;
+
+  return false;
+}
+
+// Check if Pass B (penetration) is enabled via env var.
+// Defaults to ON. Set PACT_ENABLE_PASS_B=0 to disable.
+static bool isPactPassBEnabled() {
+  const char *env = std::getenv("PACT_ENABLE_PASS_B");
+  return !env || std::string(env) != "0";
+}
+
+// Get max penetration depth for Pass B.
+// Default 4, clamped to [1, 8].
+static int getPassBMaxDepth() {
+  const char *env = std::getenv("PACT_PASS_B_MAX_DEPTH");
+  if (env) {
+    int depth = std::atoi(env);
+    return std::max(1, std::min(depth, 8));
+  }
+  return 4;
+}
+
+// Core P0 function: recursively walk the use chain from `val`
+// through passthrough ops to check if it eventually reaches
+// a tt.load with pact.paged_load attribute.
+static bool reachesPagedLoad(Value val, int maxDepth) {
+  if (maxDepth <= 0)
+    return false;
+
+  for (auto *user : val.getUsers()) {
+    // Case 1: direct hit on LoadOp
+    if (auto loadOp = dyn_cast<triton::LoadOp>(user)) {
+      if (loadOp->hasAttr("pact.paged_load") &&
+          isPactAxisInfoOverrideEnabled())
+        return true;
+      continue;
+    }
+
+    // Case 2: penetrate passthrough ops (broadcast, expand_dims, type casts)
+    if (isPassthroughOp(user) && isPactPassBEnabled()) {
+      for (auto result : user->getResults()) {
+        if (result == val)
+          continue;
+        if (reachesPagedLoad(result, maxDepth - 1))
+          return true;
+      }
+      continue;
+    }
+
+    // Case 3: penetrate arith.addi on the non-constant side
+    //   addi(const, dynamic) → follow dynamic side
+    //   addi(dynamic, const) → follow dynamic side
+    if (user->getName().getStringRef() == "arith.addi" &&
+        user->getNumOperands() == 2 && isPactPassBEnabled()) {
+      Value lhs = user->getOperand(0);
+      Value rhs = user->getOperand(1);
+      bool lhsConst = lhs.getDefiningOp<arith::ConstantOp>() != nullptr;
+      bool rhsConst = rhs.getDefiningOp<arith::ConstantOp>() != nullptr;
+
+      if (lhsConst && !rhsConst) {
+        if (reachesPagedLoad(rhs, maxDepth - 1))
+          return true;
+      }
+      if (!lhsConst && rhsConst) {
+        if (reachesPagedLoad(lhs, maxDepth - 1))
+          return true;
+      }
+      continue;
+    }
+
+    // Case 4: penetrate arith.muli on the non-constant side (similar to addi)
+    if (user->getName().getStringRef() == "arith.muli" &&
+        user->getNumOperands() == 2 && isPactPassBEnabled()) {
+      Value lhs = user->getOperand(0);
+      Value rhs = user->getOperand(1);
+      bool lhsConst = lhs.getDefiningOp<arith::ConstantOp>() != nullptr;
+      bool rhsConst = rhs.getDefiningOp<arith::ConstantOp>() != nullptr;
+
+      if (lhsConst && !rhsConst) {
+        if (reachesPagedLoad(rhs, maxDepth - 1))
+          return true;
+      }
+      if (!lhsConst && rhsConst) {
+        if (reachesPagedLoad(lhs, maxDepth - 1))
+          return true;
+      }
+      continue;
+    }
+  }
+  return false;
+}
+
 constexpr int64_t kMaxDivisor = highestPowOf2Divisor<int64_t>(0);
 
 template <typename... Args> int64_t gcd(int64_t a, int64_t b, Args... args) {
@@ -305,6 +418,18 @@ private:
             }
           }
         }
+        // P0 (Pass B): fallback — penetrate intermediate ops to find
+        // pact.paged_load when AddPtrOp→LoadOp is not a direct edge.
+        if (isPactPassBEnabled() && isPactAxisInfoOverrideEnabled()) {
+          int depth = getPassBMaxDepth();
+          if (reachesPagedLoad(op.getResult(), depth)) {
+            auto ptrTy = cast<RankedTensorType>(op.getResult().getType());
+            int64_t headSize = ptrTy.getShape()[dim];
+            LDBG("PACT P0: override contiguity[" << dim << "]=" << headSize
+                 << " (penetrated, maxDepth=" << depth << ")");
+            return headSize;
+          }
+        }
       }
     }
     return std::max(gcd(lhs.getConstancy(dim), rhs.getContiguity(dim)),
@@ -343,6 +468,15 @@ private:
             rhsDivisibility = std::max(rhsDivisibility, elemSize * 2);
             break;
           }
+        }
+      }
+      // P0 (Pass B) fallback for divisibility: penetrate intermediate ops.
+      if (isPactPassBEnabled() && isPactAxisInfoOverrideEnabled()) {
+        int depth = getPassBMaxDepth();
+        if (reachesPagedLoad(op.getResult(), depth)) {
+          lhsDivisibility = std::max(lhsDivisibility, int64_t(16));
+          rhsDivisibility = std::max(rhsDivisibility, elemSize * 2);
+          LDBG("PACT P0: divisibility boost via penetration");
         }
       }
     }

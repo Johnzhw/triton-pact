@@ -55,6 +55,8 @@ void init_triton_passes_ttir(py::module &&m) {
   ADD_PASS_WRAPPER_0("add_pattern_specialize", createTritonPatternSpecialize);
   ADD_PASS_WRAPPER_0("add_block_table_scalarize",
                      createTritonBlockTableScalarize);
+  ADD_PASS_WRAPPER_0("add_pact_page_local_analysis",
+                     createPACTPageLocalAnalysis);
   ADD_PASS_OPTION_WRAPPER_4("add_convert_to_ttgpuir",
                             createConvertTritonToTritonGPU, const std::string &,
                             int, int, int);

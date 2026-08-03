@@ -102,6 +102,7 @@ void init_triton_passes_ttgpuir(py::module &&m) {
                      createTritonGPUCoalesceAsyncCopy);
   ADD_PASS_WRAPPER_0("add_prefetch_insert", createTritonGPUPrefetchInsert);
   ADD_PASS_WRAPPER_0("add_pact_layout_remap", createTritonGPUPactLayoutRemap);
+  ADD_PASS_WRAPPER_0("add_pact_pipeline_hints", createPACTPipelineHints);
   ADD_PASS_WRAPPER_0("add_address_strength_reduce",
                      createTritonGPUAddressStrengthReduce);
   ADD_PASS_WRAPPER_0("add_block_table_smem_hoist",

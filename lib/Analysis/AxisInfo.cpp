@@ -141,6 +141,97 @@ static bool reachesPagedLoad(Value val, int maxDepth) {
   return false;
 }
 
+// ═══════════════════════════════════════════════════════════════
+// P3: Guarded AxisInfo Override — three-strategy decision
+// ═══════════════════════════════════════════════════════════════
+
+enum class OverrideStrategy {
+  NoOverride,            // No override: use original AxisInfo inference
+  StaticOverride,        // Statically safe: tile provably fits within page
+  ConservativeOverride,  // Conservative: partial contiguity, needs guard
+};
+
+// Check if guarded override is enabled via env var.
+// Defaults to ON. Set PACT_ENABLE_GUARDED_OVERRIDE=0 to revert to
+// v1 behavior (unconditional headSize override).
+static bool isPactGuardedOverrideEnabled() {
+  const char *env = std::getenv("PACT_ENABLE_GUARDED_OVERRIDE");
+  return !env || std::string(env) != "0";
+}
+
+// Core P3 decision function: determine the override strategy and safe
+// contiguity value by consulting P2's page-local analysis results.
+static OverrideStrategy getOverrideStrategy(triton::LoadOp loadOp, int dim,
+                                            int64_t &safeContiguity) {
+  // Guard 1: must have pact.paged_load
+  if (!loadOp->hasAttr("pact.paged_load"))
+    return OverrideStrategy::NoOverride;
+
+  // Guard 2: AxisInfo override global switch
+  if (!isPactAxisInfoOverrideEnabled())
+    return OverrideStrategy::NoOverride;
+
+  // Guard 3: get headSize from result tensor shape or P1 attribute
+  auto resultTy = cast<RankedTensorType>(loadOp.getResult().getType());
+  int64_t headSize = 64;
+  if (auto attr = loadOp->getAttrOfType<IntegerAttr>("pact.head_dim_size")) {
+    headSize = attr.getInt();
+  } else if (dim < (int64_t)resultTy.getShape().size()) {
+    headSize = resultTy.getShape()[dim];
+  }
+
+  // If guarded override is disabled → revert to v1 unconditional behavior
+  if (!isPactGuardedOverrideEnabled()) {
+    safeContiguity = headSize;
+    LDBG("PACT P3(v1): unconditional override contiguity["
+         << dim << "]=" << headSize);
+    return OverrideStrategy::StaticOverride;
+  }
+
+  // Read P2 analysis results
+  bool staticallySafe = false;
+  if (auto attr = loadOp->getAttrOfType<BoolAttr>(
+          "pact.pagelocal.statically_safe")) {
+    staticallySafe = attr.getValue();
+  }
+
+  int64_t pageLocalContiguity = 1;
+  if (auto attr = loadOp->getAttrOfType<IntegerAttr>(
+          "pact.pagelocal.contiguity")) {
+    pageLocalContiguity = attr.getInt();
+  }
+
+  bool requiresGuard = false;
+  if (auto attr = loadOp->getAttrOfType<BoolAttr>(
+          "pact.pagelocal.requires_guard")) {
+    requiresGuard = attr.getValue();
+  }
+
+  // === Three-strategy decision ===
+
+  if (staticallySafe && pageLocalContiguity > 1) {
+    // Case 1: StaticOverride — statically provable safe
+    safeContiguity = headSize;
+    LDBG("PACT P3: StaticOverride contiguity[" << dim << "]="
+         << headSize);
+    return OverrideStrategy::StaticOverride;
+  }
+
+  if (pageLocalContiguity > 1) {
+    // Case 2: ConservativeOverride — partial contiguity w/o static proof
+    safeContiguity = pageLocalContiguity;
+    LDBG("PACT P3: ConservativeOverride contiguity[" << dim << "]="
+         << pageLocalContiguity << " (vs headSize=" << headSize
+         << ", requiresGuard=" << requiresGuard << ")");
+    return OverrideStrategy::ConservativeOverride;
+  }
+
+  // Case 3: NoOverride — cannot determine any safe contiguity
+  LDBG("PACT P3: NoOverride (pageLocalContiguity="
+       << pageLocalContiguity << ")");
+  return OverrideStrategy::NoOverride;
+}
+
 constexpr int64_t kMaxDivisor = highestPowOf2Divisor<int64_t>(0);
 
 template <typename... Args> int64_t gcd(int64_t a, int64_t b, Args... args) {
@@ -407,26 +498,26 @@ private:
       if (!op.getResult().getUsers().empty()) {
         for (auto *user : op.getResult().getUsers()) {
           if (auto loadOp = dyn_cast<triton::LoadOp>(user)) {
-            if (loadOp->hasAttr("pact.paged_load") &&
-                isPactAxisInfoOverrideEnabled()) {
-              // dim is head_dim → all head_dim elements contiguous in page
-              auto ptrTy = cast<RankedTensorType>(op.getResult().getType());
-              int64_t headSize = ptrTy.getShape()[dim];
-              LDBG("paged addptr: override contiguity[" << dim << "]="
-                   << headSize);
-              return headSize;
+            // P3: use guarded three-strategy decision
+            int64_t safeContiguity = 0;
+            auto strategy = getOverrideStrategy(loadOp, dim, safeContiguity);
+            if (strategy == OverrideStrategy::StaticOverride ||
+                strategy == OverrideStrategy::ConservativeOverride) {
+              return safeContiguity;
             }
+            // NoOverride → continue checking other users
           }
         }
-        // P0 (Pass B): fallback — penetrate intermediate ops to find
-        // pact.paged_load when AddPtrOp→LoadOp is not a direct edge.
+        // P0 (Pass B): fallback — penetrate intermediate ops.
+        // When we can't directly access the LoadOp, use conservative
+        // StaticOverride (same as v1 behavior).
         if (isPactPassBEnabled() && isPactAxisInfoOverrideEnabled()) {
           int depth = getPassBMaxDepth();
           if (reachesPagedLoad(op.getResult(), depth)) {
             auto ptrTy = cast<RankedTensorType>(op.getResult().getType());
             int64_t headSize = ptrTy.getShape()[dim];
-            LDBG("PACT P0: override contiguity[" << dim << "]=" << headSize
-                 << " (penetrated, maxDepth=" << depth << ")");
+            LDBG("PACT P0+P3: override contiguity[" << dim << "]="
+                 << headSize << " (penetrated, depth=" << depth << ")");
             return headSize;
           }
         }
@@ -457,13 +548,14 @@ private:
       elemSize = std::max<int64_t>(
           1, triton::getPointeeBitWidth(op.getPtr().getType()) / 8);
       rhsDivisibility = multiplyDivisor(rhs.getDivisibility(dim), elemSize);
-      // PACT: For paged loads, boost divisibility on head_dim.
+      // PACT P3: boost divisibility when P3 strategy says override is safe.
       // The base ptr is page-aligned (≥16B) and head_dim elements within
       // a page are naturally elemSize-aligned → at least 4B for f16.
       for (auto *user : op.getResult().getUsers()) {
         if (auto loadOp = dyn_cast<triton::LoadOp>(user)) {
-          if (loadOp->hasAttr("pact.paged_load") &&
-              isPactAxisInfoOverrideEnabled()) {
+          int64_t safeContiguity = 0;
+          auto strategy = getOverrideStrategy(loadOp, dim, safeContiguity);
+          if (strategy != OverrideStrategy::NoOverride) {
             lhsDivisibility = std::max(lhsDivisibility, int64_t(16));
             rhsDivisibility = std::max(rhsDivisibility, elemSize * 2);
             break;
@@ -476,7 +568,7 @@ private:
         if (reachesPagedLoad(op.getResult(), depth)) {
           lhsDivisibility = std::max(lhsDivisibility, int64_t(16));
           rhsDivisibility = std::max(rhsDivisibility, elemSize * 2);
-          LDBG("PACT P0: divisibility boost via penetration");
+          LDBG("PACT P0+P3: divisibility boost via penetration");
         }
       }
     }

@@ -590,6 +590,10 @@ class pact_knobs(base_knobs):
     pass_b_max_depth: env_int = env_int("PACT_PASS_B_MAX_DEPTH", 4)
     # P2: Page-local memory analysis
     enable_page_local_analysis: env_bool = env_bool("PACT_ENABLE_PAGE_LOCAL_ANALYSIS", True)
+    # P3: Guarded AxisInfo override (three strategies)
+    enable_guarded_override: env_bool = env_bool("PACT_ENABLE_GUARDED_OVERRIDE", True)
+    # P4: Pipeline hints system (13 hints)
+    enable_pipeline_hints: env_bool = env_bool("PACT_ENABLE_PIPELINE_HINTS", True)
     dump_ir: env_bool = env_bool("PACT_DUMP_IR", False)
     verbose: env_bool = env_bool("PACT_VERBOSE", False)
 

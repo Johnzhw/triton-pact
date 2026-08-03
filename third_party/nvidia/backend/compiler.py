@@ -291,6 +291,8 @@ class CUDABackend(BaseBackend):
         if knobs.pact.enable and knobs.pact.enable_prefetch_insert \
            and capability // 10 >= 8:
             passes.ttgpuir.add_prefetch_insert(pm)
+        if knobs.pact.enable and knobs.pact.enable_pipeline_hints:
+            passes.ttgpuir.add_pact_pipeline_hints(pm)
         passes.ttgpuir.add_optimize_dot_operands(pm, capability >= 80)
         nvidia.passes.ttnvgpuir.add_optimize_descriptor_encoding(pm)
         passes.ttir.add_loop_aware_cse(pm)

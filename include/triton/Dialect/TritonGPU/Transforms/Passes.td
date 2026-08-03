@@ -405,4 +405,19 @@ def TritonGPUPactLayoutRemap : Pass<"tritongpu-pact-layout-remap", "mlir::Module
                            "mlir::arith::ArithDialect"];
 }
 
+def PACTPipelineHints : Pass<"tritongpu-pact-pipeline-hints", "mlir::ModuleOp"> {
+  let summary = "Compute pipeline hints for paged KV loads";
+  let description = [{
+    Reads PACT P1/P2 semantic attributes from tt.load ops annotated with
+    pact.paged_load, and computes 13 hint values covering page geometry,
+    safety margins, iteration estimates, and optimization suggestions.
+
+    Hints are consumed by: Coalesce (hints 1-2), Pipeline (hints 3-11),
+    and LLVM lowering (hints 12-13).  Controlled by PACT_ENABLE_PIPELINE_HINTS.
+  }];
+  let dependentDialects = ["mlir::triton::gpu::TritonGPUDialect",
+                           "mlir::triton::TritonDialect",
+                           "mlir::arith::ArithDialect"];
+}
+
 #endif

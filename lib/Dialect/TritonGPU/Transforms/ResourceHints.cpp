@@ -56,7 +56,6 @@ struct PACTResourceHintsPass
     int estimatedIterations = 0;
 
     mod.walk([&](Operation *op) {
-      // Use P4 hints to detect paged loads (works in TTGIR)
       if (!op->hasAttr("pact.hint.tile_bytes"))
         return WalkResult::advance();
 

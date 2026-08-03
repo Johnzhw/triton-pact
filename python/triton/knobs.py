@@ -607,6 +607,10 @@ class pact_knobs(base_knobs):
     enable_run_coalesce: env_bool = env_bool("PACT_ENABLE_RUN_COALESCE", False)
     # P10: NanoFlow resource hints (default OFF)
     enable_resource_hints: env_bool = env_bool("PACT_ENABLE_RESOURCE_HINTS", False)
+    # === Phase 2: Proton-powered profile feedback ===
+    enable_proton_feedback: env_bool = env_bool("PACT_ENABLE_PROTON_FEEDBACK", False)
+    proton_sample_interval: env_int = env_int("PACT_PROTON_SAMPLE_INTERVAL", 50)
+    proton_profile_db_path: env_str = env_str("PACT_PROTON_PROFILE_DB_PATH", "")
     dump_ir: env_bool = env_bool("PACT_DUMP_IR", False)
     verbose: env_bool = env_bool("PACT_VERBOSE", False)
 

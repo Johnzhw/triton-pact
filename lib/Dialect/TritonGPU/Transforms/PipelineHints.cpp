@@ -243,6 +243,54 @@ struct PACTPipelineHintsPass
       llvm::errs() << "[PACT P4] Pipeline Hints: attached to "
                    << numHintsAttached << " paged load(s)\n";
     }
+
+    // P10: Module-level resource hints — use data already collected above.
+    const char *rhEnv = std::getenv("PACT_ENABLE_RESOURCE_HINTS");
+    if (rhEnv && std::string(rhEnv) == "1" && numHintsAttached > 0) {
+      int maxStages = 0, estIters = 0, totalRegs = 0;
+      int64_t totalBytes = 0;
+      bool hasAsync = false;
+
+      // Re-walk only the loads we already found (cheap, module already walked)
+      mod.walk([&](triton::LoadOp loadOp) {
+        if (!loadOp->hasAttr("pact.hint.tile_bytes"))
+          return WalkResult::advance();
+        totalBytes += loadOp->getAttrOfType<mlir::IntegerAttr>(
+            "pact.hint.tile_bytes").getInt();
+        if (auto a = loadOp->getAttrOfType<mlir::IntegerAttr>(
+                "pact.hint.suggested_num_stages"))
+          maxStages = std::max(maxStages, (int)a.getInt());
+        if (auto a = loadOp->getAttrOfType<mlir::IntegerAttr>(
+                "pact.hint.estimated_iterations"))
+          estIters = std::max(estIters, (int)a.getInt());
+        if (auto a = loadOp->getAttrOfType<mlir::IntegerAttr>(
+                "pact.hint.safe_async_copy_width"))
+          if (a.getInt() >= 4) hasAsync = true;
+        return WalkResult::advance();
+      });
+
+      int64_t smem = totalBytes * std::max(2, maxStages);
+      int numWarps = 4;
+      if (auto a = mod->getAttrOfType<mlir::IntegerAttr>("ttg.num-warps"))
+        numWarps = a.getInt();
+      int rpt = std::max(1, totalRegs / std::max(1, numWarps * 32));
+      int mwr = std::max(1, std::min(65536/(rpt*32), 48));
+      double occ = (double)mwr / 48.0;
+      bool memB = ((double)totalBytes/numHintsAttached >= 256) || (estIters < 64);
+
+      std::string json = "{\"cp_async\":" + std::string(hasAsync?"true":"false") +
+        ",\"num_paged_loads\":" + std::to_string(numHintsAttached) +
+        ",\"num_stages\":" + std::to_string(maxStages) +
+        ",\"est_smem_bytes\":" + std::to_string(smem) +
+        ",\"est_regs_per_thread\":" + std::to_string(rpt) +
+        ",\"est_occupancy\":" + std::to_string(occ).substr(0,4) +
+        ",\"est_iterations\":" + std::to_string(estIters) +
+        ",\"est_tile_bytes\":" + std::to_string(totalBytes) +
+        ",\"memory_bound\":" + std::string(memB?"true":"false") +
+        ",\"fill_drain_cost_iter\":" + std::to_string(maxStages*2) + "}";
+      mod->setAttr("pact.resource_hints", mlir::StringAttr::get(&getContext(), json));
+      llvm::errs() << "[PACT P4+P10] Resource Hints: " << json << "\n";
+    }
   }
 };
 

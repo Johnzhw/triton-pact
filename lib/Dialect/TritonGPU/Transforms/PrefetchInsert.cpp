@@ -814,14 +814,6 @@ struct PrefetchInsertPass
         if (btLoad && !sharedBlockTableMap.count(btLoad)) {
           Value physNext;
           if (tilesPerPage > 0) {
-            // Phase 3: Extract scalar block_table base pointer.
-            //
-            // Two patterns depending on whether BTScalarize ran:
-            // A) Original:  addptr(splat(scalar), tensor_idx) → load
-            // B) Scalarized: addptr(scalar,       scalar_idx) → load
-            //
-            // For A, walk: getPtr→getDefOp→getOperand(0)→getDefOp→getOperand(0)
-            // For B,        getPtr→getDefOp→getOperand(0) (already scalar)
             Value addptrBase =
                 btLoad.getPtr().getDefiningOp()->getOperand(0);
             Value scalarBTBase = addptrBase;
@@ -984,10 +976,6 @@ struct PrefetchInsertPass
     // the last iteration into an epilogue where the prefetch ops are
     // removed.  The peeled iteration runs outside the loop with only
     // wait+load (the data was prefetched in the penultimate loop iter).
-    //
-    // Edge cases handled by peelLoopEpilogue:
-    //   - N=1: loop runs 0 iters, epilogue runs once (data from prologue)
-    //   - N=2: loop runs 1 iter (prefetch for iter 1), epilogue consumes it
     {
       llvm::errs() << "[PACT DoubleBuf] Peeling last iteration"
                    << " to eliminate OOB prefetch\n";

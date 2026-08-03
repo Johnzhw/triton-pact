@@ -277,21 +277,11 @@ class CUDABackend(BaseBackend):
         # optimize TTGIR
         passes.ttgpuir.add_coalesce(pm)
         passes.ttgpuir.add_f32_dot_tc(pm, emuTF32)
-        # TODO(Qingyi): Move PlanCTAPass to the front of CoalescePass
         nvidia.passes.ttnvgpuir.add_plan_cta(pm)
         passes.ttgpuir.add_remove_layout_conversions(pm)
         passes.ttgpuir.add_optimize_thread_locality(pm)
         passes.ttgpuir.add_accelerate_matmul(pm)
         passes.ttgpuir.add_remove_layout_conversions(pm)
-        # PACT: PactLayoutRemap + PrefetchInsert must run BEFORE
-        # optimize_dot_operands and prefetch/pipeline passes, which
-        # restructure the load→local_alloc pattern.  Running here
-        # (after layout setup, before dot operand optimization)
-        # ensures PACT can intercept the loads with intact local_alloc.
-        # NOTE: AddressStrengthReduce is disabled — LLVM SCEV handles
-        # address strength reduction more effectively at the LLVM level.
-        # BlockTableSMEMHoist: copies block_table row to SMEM before loop,
-        # replacing per-iteration global loads with SMEM reads.
         if knobs.pact.enable and knobs.pact.enable_bt_smem_hoist:
             passes.ttgpuir.add_block_table_smem_hoist(pm)
         if knobs.pact.enable and knobs.pact.enable_layout_remap:

@@ -10,6 +10,8 @@
 #include "llvm/Support/raw_ostream.h"
 
 #include <numeric>
+#include <cstdlib>
+#include <string>
 
 #define DEBUG_TYPE "axis-info"
 #define DBGS() (llvm::dbgs() << "[" DEBUG_TYPE "]: ")
@@ -17,6 +19,14 @@
 
 namespace mlir::triton {
 namespace {
+
+// PACT: check if AxisInfo override is enabled via env var.
+// Defaults to ON (backward-compatible). Set PACT_ENABLE_AXISINFO_OVERRIDE=0
+// to disable the contiguity/divisibility boost for paged loads.
+static bool isPactAxisInfoOverrideEnabled() {
+  const char *env = std::getenv("PACT_ENABLE_AXISINFO_OVERRIDE");
+  return !env || std::string(env) != "0";
+}
 
 constexpr int64_t kMaxDivisor = highestPowOf2Divisor<int64_t>(0);
 
@@ -284,7 +294,8 @@ private:
       if (!op.getResult().getUsers().empty()) {
         for (auto *user : op.getResult().getUsers()) {
           if (auto loadOp = dyn_cast<triton::LoadOp>(user)) {
-            if (loadOp->hasAttr("pact.paged_load")) {
+            if (loadOp->hasAttr("pact.paged_load") &&
+                isPactAxisInfoOverrideEnabled()) {
               // dim is head_dim → all head_dim elements contiguous in page
               auto ptrTy = cast<RankedTensorType>(op.getResult().getType());
               int64_t headSize = ptrTy.getShape()[dim];
@@ -326,7 +337,8 @@ private:
       // a page are naturally elemSize-aligned → at least 4B for f16.
       for (auto *user : op.getResult().getUsers()) {
         if (auto loadOp = dyn_cast<triton::LoadOp>(user)) {
-          if (loadOp->hasAttr("pact.paged_load")) {
+          if (loadOp->hasAttr("pact.paged_load") &&
+              isPactAxisInfoOverrideEnabled()) {
             lhsDivisibility = std::max(lhsDivisibility, int64_t(16));
             rhsDivisibility = std::max(rhsDivisibility, elemSize * 2);
             break;

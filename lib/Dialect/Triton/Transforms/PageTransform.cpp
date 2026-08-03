@@ -54,6 +54,15 @@ static Value traceToBasePointer(Value ptr,
         continue;
       }
     }
+    // P0/P1: penetrate splat/broadcast — same scalar, reshaped to tensor
+    if (defOp->getNumResults() == 1 && defOp->getNumOperands() >= 1) {
+      auto name = defOp->getName().getStringRef();
+      if (name == "tt.splat" || name == "tt.broadcast" ||
+          name == "tt.expand_dims") {
+        ptr = defOp->getOperand(0);
+        continue;
+      }
+    }
     break;
   }
   return ptr;
@@ -151,9 +160,16 @@ static bool hasDivOrRemByConst(Value val, int64_t divisor, bool checkDiv,
     }
   }
 
-  // Recurse into operands (skip constants)
+  // Recurse into operands (skip constants and load results — loaded
+  // values are dynamic and shouldn't be traced for static pattern matching)
   for (auto operand : defOp->getOperands()) {
-    if (operand.getDefiningOp<arith::ConstantOp>())
+    auto *opDef = operand.getDefiningOp();
+    if (!opDef || isa<arith::ConstantOp>(opDef))
+      continue;
+    // Stop at load ops: the loaded value is runtime data, not a static
+    // div/rem computation.  Tracing through loads causes all loads in
+    // a paged attention kernel to be marked as block_table_lookup.
+    if (opDef->getName().getStringRef() == "tt.load")
       continue;
     if (hasDivOrRemByConst(operand, divisor, checkDiv, checkRem, maxDepth - 1))
       return true;

@@ -55,32 +55,37 @@ struct PACTResourceHintsPass
     int numPagedLoads = 0;
     int estimatedIterations = 0;
 
-    mod.walk([&](triton::LoadOp loadOp) {
-      if (!loadOp->hasAttr("pact.paged_load"))
+    mod.walk([&](Operation *op) {
+      // Use P4 hints to detect paged loads (works in TTGIR)
+      if (!op->hasAttr("pact.hint.tile_bytes"))
         return WalkResult::advance();
 
       numPagedLoads++;
 
-      if (auto attr = loadOp->getAttrOfType<mlir::IntegerAttr>(
+      if (auto attr = op->getAttrOfType<mlir::IntegerAttr>(
               "pact.hint.tile_bytes")) {
         totalTileBytes += attr.getInt();
       }
-      if (auto attr = loadOp->getAttrOfType<mlir::IntegerAttr>(
+      if (auto attr = op->getAttrOfType<mlir::IntegerAttr>(
               "pact.hint.suggested_num_stages")) {
         maxStages = std::max(maxStages, (int)attr.getInt());
       }
-      if (auto attr = loadOp->getAttrOfType<mlir::IntegerAttr>(
+      if (auto attr = op->getAttrOfType<mlir::IntegerAttr>(
               "pact.hint.estimated_iterations")) {
         estimatedIterations = std::max(estimatedIterations,
                                         (int)attr.getInt());
       }
 
       int64_t elements = 1;
-      auto resultTy = cast<RankedTensorType>(loadOp.getResult().getType());
-      for (auto dim : resultTy.getShape()) elements *= dim;
-      totalRegs += elements / 4; // rough: ~4 f16 elements/reg
+      for (unsigned i = 0; i < op->getNumResults(); i++) {
+        if (auto ty = dyn_cast<mlir::RankedTensorType>(op->getResult(i).getType())) {
+          for (auto dim : ty.getShape()) elements *= dim;
+          break;
+        }
+      }
+      totalRegs += elements / 4;
 
-      if (auto attr = loadOp->getAttrOfType<mlir::IntegerAttr>(
+      if (auto attr = op->getAttrOfType<mlir::IntegerAttr>(
               "pact.hint.safe_async_copy_width")) {
         if (attr.getInt() >= 4) hasAsyncCopy = true;
       }

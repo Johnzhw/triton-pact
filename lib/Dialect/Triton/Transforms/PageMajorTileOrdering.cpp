@@ -52,27 +52,24 @@ struct PageMajorTileOrderingPass
     int numTransformed = 0;
 
     mod.walk([&](scf::ForOp forOp) {
-      // Get page_size
+      // Get page_size from module-level attribute
       int64_t pageSize = 0;
-      auto *parent = forOp->getParentOp();
-      while (parent) {
-        if (auto attr = parent->getAttrOfType<mlir::IntegerAttr>(
-                "pact.page_size")) {
-          pageSize = attr.getInt();
-          break;
-        }
-        parent = parent->getParentOp();
-      }
+      if (auto attr = mod->getAttrOfType<mlir::IntegerAttr>("pact.page_size"))
+        pageSize = attr.getInt();
       if (pageSize <= 0)
         return WalkResult::advance();
 
-      // Get tile_tokens
+      // Get tile_tokens — use minimum across all paged loads
+      // (K/V loads may have different tensor shapes due to Triton's work
+      // distribution, so min gives the actual tile size)
       int64_t tileTokens = 0;
       forOp.walk([&](triton::LoadOp loadOp) {
-        if (loadOp->hasAttr("pact.paged_load") && tileTokens == 0) {
+        if (loadOp->hasAttr("pact.paged_load")) {
           if (auto attr = loadOp->getAttrOfType<mlir::IntegerAttr>(
                   "pact.tile_tokens")) {
-            tileTokens = attr.getInt();
+            int64_t t = attr.getInt();
+            if (tileTokens == 0 || t < tileTokens)
+              tileTokens = t;
           }
         }
       });
@@ -80,18 +77,25 @@ struct PageMajorTileOrderingPass
         tileTokens = 16;
 
       // Only beneficial when page_size >= 2 * tile_size
-      if (pageSize < tileTokens * 2)
+      if (pageSize < tileTokens * 2) {
+        llvm::errs() << "[PACT P7 DEBUG] pageSize=" << pageSize
+                     << " < 2*tile=" << (tileTokens*2) << "\n";
         return WalkResult::advance();
+      }
 
       int64_t tilesPerPage = pageSize / tileTokens;
-      if (tilesPerPage < 2)
+      if (tilesPerPage < 2) {
+        llvm::errs() << "[PACT P7 DEBUG] tilesPerPage=" << tilesPerPage << " < 2\n";
         return WalkResult::advance();
+      }
 
       // Get upper bound
       auto upperConst =
           forOp.getUpperBound().getDefiningOp<arith::ConstantOp>();
-      if (!upperConst)
+      if (!upperConst) {
+        llvm::errs() << "[PACT P7 DEBUG] upper bound is not constant\n";
         return WalkResult::advance();
+      }
       int64_t numTiles =
           mlir::cast<mlir::IntegerAttr>(upperConst.getValue()).getInt();
 

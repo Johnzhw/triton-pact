@@ -508,7 +508,8 @@ class CompiledKernel:
         self._run = None
 
     def __del__(self):
-
+        if not hasattr(self, 'module'):
+            return
         if self.module is not None:
             if knobs.runtime.kernel_unload_hook is not None:
                 knobs.runtime.kernel_unload_hook(self.module, self.function, self.name, self.metadata_group, self.hash)

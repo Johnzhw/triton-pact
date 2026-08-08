@@ -1,4 +1,5 @@
 #include "triton/Analysis/AxisInfo.h"
+#include "triton/Support/PactSMDetect.h"
 #include "mlir/Analysis/DataFlowFramework.h"
 #include "mlir/Dialect/UB/IR/UBOps.h"
 #include "triton/Dialect/Gluon/IR/Dialect.h"
@@ -141,8 +142,93 @@ static bool reachesPagedLoad(Value val, int maxDepth) {
   return false;
 }
 
+// P0 variant: return the found LoadOp instead of just a bool.
+// This enables the P0→P3 integrated path: penetrate to find the load,
+// then route through P3's architecture-adaptive strategy.
+static triton::LoadOp reachesPagedLoadReturnOp(Value val, int maxDepth) {
+  if (maxDepth <= 0)
+    return nullptr;
+
+  for (auto *user : val.getUsers()) {
+    // Case 1: direct hit on LoadOp
+    if (auto loadOp = dyn_cast<triton::LoadOp>(user)) {
+      if (loadOp->hasAttr("pact.paged_load") &&
+          isPactAxisInfoOverrideEnabled())
+        return loadOp;
+      continue;
+    }
+
+    // Case 2: penetrate passthrough ops
+    if (isPassthroughOp(user) && isPactPassBEnabled()) {
+      for (auto result : user->getResults()) {
+        if (result == val)
+          continue;
+        if (auto found = reachesPagedLoadReturnOp(result, maxDepth - 1))
+          return found;
+      }
+      continue;
+    }
+
+    // Case 3: penetrate arith.addi on the non-constant side
+    if (user->getName().getStringRef() == "arith.addi" &&
+        user->getNumOperands() == 2 && isPactPassBEnabled()) {
+      Value lhs = user->getOperand(0);
+      Value rhs = user->getOperand(1);
+      bool lhsConst = lhs.getDefiningOp<arith::ConstantOp>() != nullptr;
+      bool rhsConst = rhs.getDefiningOp<arith::ConstantOp>() != nullptr;
+
+      if (lhsConst && !rhsConst) {
+        if (auto found = reachesPagedLoadReturnOp(rhs, maxDepth - 1))
+          return found;
+      }
+      if (!lhsConst && rhsConst) {
+        if (auto found = reachesPagedLoadReturnOp(lhs, maxDepth - 1))
+          return found;
+      }
+      continue;
+    }
+
+    // Case 4: penetrate arith.muli on the non-constant side
+    if (user->getName().getStringRef() == "arith.muli" &&
+        user->getNumOperands() == 2 && isPactPassBEnabled()) {
+      Value lhs = user->getOperand(0);
+      Value rhs = user->getOperand(1);
+      bool lhsConst = lhs.getDefiningOp<arith::ConstantOp>() != nullptr;
+      bool rhsConst = rhs.getDefiningOp<arith::ConstantOp>() != nullptr;
+
+      if (lhsConst && !rhsConst) {
+        if (auto found = reachesPagedLoadReturnOp(rhs, maxDepth - 1))
+          return found;
+      }
+      if (!lhsConst && rhsConst) {
+        if (auto found = reachesPagedLoadReturnOp(lhs, maxDepth - 1))
+          return found;
+      }
+      continue;
+    }
+  }
+  return nullptr;
+}
+
 // ═══════════════════════════════════════════════════════════════
-// P3: Guarded AxisInfo Override — three-strategy decision
+// P3: Architecture-Adaptive AxisInfo Override — Dual-Track Contiguity
+// ═══════════════════════════════════════════════════════════════
+//
+// Core insight: Triton's AxisInfo infers contiguity from IR shapes.
+// For paged attention, the runtime strides break this inference chain.
+// P3 restores contiguity, but the safe value depends on the GPU architecture:
+//
+//   Logical Contiguity  = headDim (64 elements in head_dim dimension)
+//   Physical Contiguity = min(headDim, page_size, safe_vector_width, arch_cap)
+//
+// Ampere (SM 80-89): Physical contiguity ≤ 16 (128-bit vectors)
+//   → Enables vectorized ld.global (4-8×f16) WITHOUT triggering cp.async
+//   → cp.async requires ≥16 byte width AND ≥128 byte total → cap≤16 avoids it
+//
+// Hopper (SM 90+):   Physical contiguity = headSize (full width)
+//   → Enables TMA + cp.async pipeline for maximum throughput
+//
+// Volta/Turing:      Physical contiguity ≤ 4 (64-bit, minimal vectorization)
 // ═══════════════════════════════════════════════════════════════
 
 enum class OverrideStrategy {
@@ -159,8 +245,41 @@ static bool isPactGuardedOverrideEnabled() {
   return !env || std::string(env) != "0";
 }
 
-// Core P3 decision function: determine the override strategy and safe
-// contiguity value by consulting P2's page-local analysis results.
+// Read the Ampere contiguity cap from environment.
+// Controls the maximum contiguity value on Ampere to prevent
+// triggering cp.async pipeline when bar.sync overhead > benefit.
+//   Cap=4:  2×f16 vectors (32-bit) — safest, minimal vectorization
+//   Cap=8:  4×f16 vectors (64-bit) — conservative
+//   Cap=16: 8×f16 vectors (128-bit) — recommended default
+//   Cap=32: 16×f16 vectors (256-bit) — may trigger cp.async
+//   Cap=64: Phase1 legacy — full headSize, will trigger cp.async
+static int64_t getAmpereContiguityCap() {
+  const char *env = std::getenv("PACT_AMPERE_CONTIGUITY_CAP");
+  if (env) {
+    int64_t cap = std::atoi(env);
+    // Clamp to sensible range
+    if (cap < 4) cap = 4;
+    if (cap > 64) cap = 64;
+    return cap;
+  }
+  return 16; // default: safe for Ampere, no cp.async trigger
+}
+
+// Read the P3 override strategy knob:
+//   "auto": use SMDetector to auto-select (default)
+//   "ampere_adaptive": force Ampere conservative
+//   "hopper_aggressive": force Hopper aggressive
+//   "phase1_legacy": unconditional headSize (for regression testing)
+static std::string getAxisInfoOverrideStrategy() {
+  const char *env = std::getenv("PACT_AXISINFO_OVERRIDE_STRATEGY");
+  if (env)
+    return std::string(env);
+  return "auto";
+}
+
+// Core P3 decision function: compute architecture-adaptive contiguity override.
+// Returns the Physical Contiguity — the maximum value hardware can safely
+// use for vectorization without triggering harmful cp.async on Ampere.
 static OverrideStrategy getOverrideStrategy(triton::LoadOp loadOp, int dim,
                                             int64_t &safeContiguity) {
   // Guard 1: must have pact.paged_load
@@ -171,13 +290,22 @@ static OverrideStrategy getOverrideStrategy(triton::LoadOp loadOp, int dim,
   if (!isPactAxisInfoOverrideEnabled())
     return OverrideStrategy::NoOverride;
 
-  // Guard 3: get headSize from result tensor shape or P1 attribute
+  // Guard 3: get headSize (logical contiguity) from P1 attribute
   auto resultTy = cast<RankedTensorType>(loadOp.getResult().getType());
   int64_t headSize = 64;
   if (auto attr = loadOp->getAttrOfType<IntegerAttr>("pact.head_dim_size")) {
     headSize = attr.getInt();
   } else if (dim < (int64_t)resultTy.getShape().size()) {
     headSize = resultTy.getShape()[dim];
+  }
+
+  // Phase1 legacy mode: unconditional headSize (for regression testing)
+  std::string strategy = getAxisInfoOverrideStrategy();
+  if (strategy == "phase1_legacy") {
+    safeContiguity = headSize;
+    LDBG("PACT P3(phase1_legacy): unconditional override contiguity["
+         << dim << "]=" << headSize);
+    return OverrideStrategy::StaticOverride;
   }
 
   // If guarded override is disabled → revert to v1 unconditional behavior
@@ -201,32 +329,106 @@ static OverrideStrategy getOverrideStrategy(triton::LoadOp loadOp, int dim,
     pageLocalContiguity = attr.getInt();
   }
 
-  bool requiresGuard = false;
-  if (auto attr = loadOp->getAttrOfType<BoolAttr>(
-          "pact.pagelocal.requires_guard")) {
-    requiresGuard = attr.getValue();
+  // Read page size for architecture-aware constraints
+  int64_t pageSize = 16;
+  if (auto attr = loadOp->getAttrOfType<IntegerAttr>("pact.page_size")) {
+    pageSize = attr.getInt();
   }
 
-  // === Three-strategy decision ===
+  // ═══════════════════════════════════════════════════════════
+  // Architecture-aware physical contiguity computation
+  // ═══════════════════════════════════════════════════════════
 
-  if (staticallySafe && pageLocalContiguity > 1) {
-    safeContiguity = headSize;
-    llvm::errs() << "[PACT P3] StaticOverride: contiguity[" << dim
-                 << "]=" << headSize << " (staticSafe=1, pageLocalCntg="
-                 << pageLocalContiguity << ")\n";
-    return OverrideStrategy::StaticOverride;
-  }
+  // Determine effective SM version and architecture
+  int smVersion = pact::SMDetector::detect();
+  bool forceAmpere = (strategy == "ampere_adaptive");
+  bool forceHopper = (strategy == "hopper_aggressive");
 
-  if (pageLocalContiguity > 1) {
-    safeContiguity = pageLocalContiguity;
-    llvm::errs() << "[PACT P3] ConservativeOverride: contiguity[" << dim
-                 << "]=" << pageLocalContiguity << " (headSize=" << headSize
-                 << ", requiresGuard=" << requiresGuard << ")\n";
-    return OverrideStrategy::ConservativeOverride;
+  if (smVersion >= 90 || forceHopper) {
+    // ═══════════════════════════════════════════════════════
+    // Hopper: Aggressive — use full headSize for TMA + cp.async
+    // ═══════════════════════════════════════════════════════
+    if (staticallySafe && pageLocalContiguity > 1) {
+      safeContiguity = headSize;
+      llvm::errs() << "[PACT P3] StaticOverride(Hopper): contiguity[" << dim
+                   << "]=" << headSize
+                   << " (TMA-enabled, staticSafe=" << staticallySafe << ")\n";
+      return OverrideStrategy::StaticOverride;
+    }
+    if (pageLocalContiguity > 1) {
+      safeContiguity = std::min(pageLocalContiguity, (int64_t)32);
+      llvm::errs() << "[PACT P3] ConservativeOverride(Hopper): contiguity["
+                   << dim << "]=" << safeContiguity
+                   << " (pageLocalCntg=" << pageLocalContiguity << ")\n";
+      return OverrideStrategy::ConservativeOverride;
+    }
+  } else if (smVersion >= 80 || forceAmpere) {
+    // ═══════════════════════════════════════════════════════
+    // Ampere: Conservative — cap contiguity to avoid cp.async
+    //
+    // Key insight: On Ampere, cp.async's bar.sync overhead almost
+    // always exceeds the benefit for paged attention.
+    // But vectorized ld.global IS beneficial.
+    //
+    // Strategy: Return a contiguity value large enough for
+    // vectorized loads (4-8×f16 = 64-128 bit) but small enough
+    // to NOT trigger cp.async pipeline.
+    //
+    // cp.async trigger conditions:
+    //   - copyVecBytes >= 4 (always true for f16)
+    //   - totalBytes >= 128
+    //   - vecWidth >= 16 bytes (8 elements for f16)
+    // With cap=16 (8 f16 elements), vecWidth stays at 128 bits
+    // and totalBytes typically stays below the 128B threshold.
+    // ═══════════════════════════════════════════════════════
+    int64_t ampereCap = getAmpereContiguityCap();
+
+    if (staticallySafe && pageLocalContiguity >= 4) {
+      // Static safe → use ampereCap as the contiguity ceiling
+      // cap=16: 8×f16 vectorized ld.global, no cp.async
+      safeContiguity = std::min({headSize, pageLocalContiguity, ampereCap});
+      llvm::errs() << "[PACT P3] ConservativeOverride(Ampere): contiguity["
+                   << dim << "]=" << safeContiguity
+                   << " (headSize=" << headSize
+                   << ", cap=" << ampereCap
+                   << ", staticSafe=" << staticallySafe
+                   << ", " << pact::SMDetector::getGPUName() << ")\n";
+      return OverrideStrategy::ConservativeOverride;
+    }
+    if (pageLocalContiguity >= 4) {
+      // Not statically safe → more conservative: cap/2
+      int64_t conservativeCap = std::max((int64_t)4, ampereCap / 2);
+      safeContiguity = std::min(pageLocalContiguity, conservativeCap);
+      llvm::errs() << "[PACT P3] ConservativeOverride(Ampere): contiguity["
+                   << dim << "]=" << safeContiguity
+                   << " (conservative, cap/2=" << conservativeCap
+                   << ", pageLocalCntg=" << pageLocalContiguity << ")\n";
+      return OverrideStrategy::ConservativeOverride;
+    }
+    if (pageLocalContiguity > 1) {
+      // Minimal vectorization: 2×f16 = 32-bit
+      safeContiguity = std::min(pageLocalContiguity, (int64_t)2);
+      llvm::errs() << "[PACT P3] MinimalOverride(Ampere): contiguity["
+                   << dim << "]=" << safeContiguity
+                   << " (2-element vector, pageLocalCntg="
+                   << pageLocalContiguity << ")\n";
+      return OverrideStrategy::ConservativeOverride;
+    }
+  } else {
+    // ═══════════════════════════════════════════════════════
+    // Volta/Turing: Minimal vectorization only
+    // ═══════════════════════════════════════════════════════
+    if (pageLocalContiguity > 1) {
+      safeContiguity = std::min(pageLocalContiguity, (int64_t)4);
+      llvm::errs() << "[PACT P3] ConservativeOverride(Pre-Ampere): contiguity["
+                   << dim << "]=" << safeContiguity << "\n";
+      return OverrideStrategy::ConservativeOverride;
+    }
   }
 
   llvm::errs() << "[PACT P3] NoOverride: pageLocalCntg="
-               << pageLocalContiguity << "\n";
+               << pageLocalContiguity
+               << " (" << pact::SMDetector::getGPUName() << ")\n";
   return OverrideStrategy::NoOverride;
 }
 
@@ -509,12 +711,22 @@ private:
         // P0 (Pass B): fallback — penetrate intermediate ops.
         if (isPactPassBEnabled() && isPactAxisInfoOverrideEnabled()) {
           int depth = getPassBMaxDepth();
-          if (reachesPagedLoad(op.getResult(), depth)) {
-            auto ptrTy = cast<RankedTensorType>(op.getResult().getType());
-            int64_t headSize = ptrTy.getShape()[dim];
-            llvm::errs() << "[PACT P0] penetration SUCCESS: contiguity[" << dim
-                         << "]=" << headSize << " (depth=" << depth << ")\n";
-            return headSize;
+          // Find the paged load through penetration
+          triton::LoadOp foundLoad = reachesPagedLoadReturnOp(op.getResult(), depth);
+          if (foundLoad) {
+            // Route through P3 strategy instead of bypassing it
+            int64_t safeContiguity = 0;
+            auto strategy = getOverrideStrategy(foundLoad, dim, safeContiguity);
+            if (strategy == OverrideStrategy::StaticOverride ||
+                strategy == OverrideStrategy::ConservativeOverride) {
+              llvm::errs() << "[PACT P0+P3] penetration SUCCESS: contiguity["
+                           << dim << "]=" << safeContiguity
+                           << " (depth=" << depth
+                           << ", " << pact::SMDetector::getGPUName() << ")\n";
+              return safeContiguity;
+            }
+            llvm::errs() << "[PACT P0] penetration found load but P3 said "
+                            "NoOverride (depth=" << depth << ")\n";
           }
         }
       }

@@ -498,7 +498,7 @@ scf::ForOp lowerLoads(scf::ForOp forOp, CoarseSchedule &schedule,
                 "pact.hint.prefer_async")) {
           pactPreferAsync = (hint.getInt() != 0);
         }
-        // P5: static profitability check
+        // P5: Pipeline Guardian — only block when DefinitelyUnprofitable
         if (canUseAsyncCp && isPactStaticProfitabilityEnabled()) {
           auto chkLoad = cast<tt::LoadOp>(op);
           int estIters = 128;
@@ -507,14 +507,30 @@ scf::ForOp lowerLoads(scf::ForOp forOp, CoarseSchedule &schedule,
             estIters = hint.getInt();
           auto profit = isPipelineProfitable(chkLoad, axisInfoAnalysis,
                                                /*numStages*/3, estIters);
-          if (profit == PipelineProfitability::NotProfitable) {
+          // Read block threshold knob
+          std::string threshold = "definitely_unprofitable";
+          if (const char *env = std::getenv("PACT_P5_BLOCK_THRESHOLD"))
+            threshold = std::string(env);
+
+          bool shouldBlock = false;
+          if (threshold == "none") {
+            shouldBlock = false; // advisory only, never block
+          } else if (threshold == "likely_unprofitable") {
+            shouldBlock = (profit == PipelineProfitability::DefinitelyUnprofitable ||
+                          profit == PipelineProfitability::LikelyUnprofitable);
+          } else {
+            // default: "definitely_unprofitable" — only block when certain
+            shouldBlock = (profit == PipelineProfitability::DefinitelyUnprofitable);
+          }
+
+          if (shouldBlock) {
             // P4 override: if PACT says prefer_async, ignore P5 block
             if (pactPreferAsync) {
               llvm::errs() << "[PACT P4→Pipeline] force cp.async per P4 hint"
-                           << " (P5 said not profitable)\n";
+                           << " (P5 said block)\n";
             } else {
               canUseAsyncCp = false;
-              llvm::errs() << "[PACT P5] SKIPPED: not profitable\n";
+              llvm::errs() << "[PACT P5] BLOCKED: definitely unprofitable\n";
             }
           }
         } else if (canUseAsyncCp && pactPreferAsync) {

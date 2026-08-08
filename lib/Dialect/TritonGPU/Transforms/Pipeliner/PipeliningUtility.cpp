@@ -320,8 +320,14 @@ bool mlir::triton::canBeConvertedToAsyncLoad(
 }
 
 // ═══════════════════════════════════════════════════════════════
-// P5: Static Pipeline Profitability Model
+// P5: Pipeline Guardian — Architecture-Aware Profitability Model
+//
+// Core philosophy: PACT should only block pipeline when it's CERTAIN
+// to be harmful. In all other cases, trust Triton's native pipeline
+// decision. This replaces the v1 "Pipeline Killer" approach.
 // ═══════════════════════════════════════════════════════════════
+
+#include "triton/Support/PactSMDetect.h"
 
 namespace {
 
@@ -330,11 +336,15 @@ static bool isPactStaticProfitabilityEnabled() {
   return !env || std::string(env) != "0";
 }
 
-static double getProfitabilityThreshold() {
-  const char *env = std::getenv("PACT_PROFITABILITY_THRESHOLD");
+// Read PACT_P5_BLOCK_THRESHOLD:
+//   "definitely_unprofitable" — only block when harm is certain (default)
+//   "likely_unprofitable" — block when harm is likely (more conservative)
+//   "none" — never block, advisory only
+static std::string getP5BlockThreshold() {
+  const char *env = std::getenv("PACT_P5_BLOCK_THRESHOLD");
   if (env)
-    return std::atof(env);
-  return 0.05;
+    return std::string(env);
+  return "definitely_unprofitable";
 }
 
 } // namespace
@@ -342,12 +352,14 @@ static double getProfitabilityThreshold() {
 mlir::triton::PipelineProfitability mlir::triton::isPipelineProfitable(
     tt::LoadOp loadOp, tt::ModuleAxisInfoAnalysis &axisInfoAnalysis,
     int numStages, int estimatedIterations) {
+
   if (!isPactStaticProfitabilityEnabled())
     return PipelineProfitability::LikelyProfitable;
 
+  // === Extract load characteristics ===
   auto tensorTy = dyn_cast<RankedTensorType>(loadOp.getResult().getType());
   if (!tensorTy)
-    return PipelineProfitability::Uncertain;
+    return PipelineProfitability::Neutral;
 
   int64_t totalElements = 1;
   for (auto dim : tensorTy.getShape())
@@ -367,55 +379,105 @@ mlir::triton::PipelineProfitability mlir::triton::isPipelineProfitable(
     estimatedIterations = hintIters.getInt();
   }
 
-  // Rule 1: Too few iterations — pipeline fill/drain dominates
-  // Relaxed: only block when iterations < numStages (vs numStages*2 before)
-  if (estimatedIterations < numStages) {
-    llvm::errs() << "[PACT P5] NOT profitable: too few iters ("
-                 << estimatedIterations << " < " << numStages << ")\n";
-    return PipelineProfitability::NotProfitable;
-  }
-  if (estimatedIterations < 16) {
-    llvm::errs() << "[PACT P5] UNCERTAIN: low iter count ("
-                 << estimatedIterations << " < 16)\n";
-    return PipelineProfitability::Uncertain;
+  // === Architecture-aware checks using SMDetector ===
+  auto sm = pact::SMDetector::getResources();
+
+  // Extract page-attention attributes
+  bool isPaged = loadOp->hasAttr("pact.paged_load");
+  int64_t pageSize = 16;
+  int64_t tileTokens = 16;
+  if (isPaged) {
+    if (auto attr = loadOp->getAttrOfType<mlir::IntegerAttr>("pact.page_size"))
+      pageSize = attr.getInt();
+    if (auto attr = loadOp->getAttrOfType<mlir::IntegerAttr>("pact.tile_tokens"))
+      tileTokens = attr.getInt();
   }
 
-  // Rule 2: Too small tile
-  if (vec < 4 && totalBytes < 128) {
-    llvm::errs() << "[PACT P5] NOT profitable: tile too small (vec="
-                 << vec << ", bytes=" << totalBytes << ")\n";
-    return PipelineProfitability::NotProfitable;
+  int64_t smemPerStage = totalBytes;
+  int64_t estTotalSMEM = smemPerStage * numStages;
+
+  // ═══════════════════════════════════════════════════════════
+  // Rule 1 (DefinitelyUnprofitable): Deterministic SMEM overflow
+  //   Pipeline would cause occupancy collapse — block regardless
+  // ═══════════════════════════════════════════════════════════
+  if (sm.smVersion < 90 && estTotalSMEM > sm.effectiveSmemPerBlock * 1.2) {
+    llvm::errs() << "[PACT P5] BLOCKED: SMEM overflow ("
+                 << estTotalSMEM / 1024 << "KB > "
+                 << sm.effectiveSmemPerBlock / 1024 << "KB effective)\n";
+    return PipelineProfitability::DefinitelyUnprofitable;
   }
 
-  // Rule 3: High SMEM pressure — use GPU-specific SMEM limit
-  // RTX 3080 (SM86) has ~96KB usable SMEM, A100 has 163KB, H100 has 227KB
-  int64_t smemLimit = 98304;  // 96KB for RTX 3080
-  int64_t estTotalSMEM = totalBytes * numStages;
-  if (estTotalSMEM > smemLimit * 6 / 10) {
-    llvm::errs() << "[PACT P5] UNCERTAIN: high SMEM ("
-                 << estTotalSMEM << "B for " << numStages << " stages)\n";
-    return PipelineProfitability::Uncertain;
+  // ═══════════════════════════════════════════════════════════
+  // Rule 2 (DefinitelyUnprofitable): Extremely short sequence
+  //   Pipeline fill/drain overhead dominates compute
+  // ═══════════════════════════════════════════════════════════
+  if (estimatedIterations <= numStages * 2 && totalBytes < 128) {
+    llvm::errs() << "[PACT P5] BLOCKED: too few iters ("
+                 << estimatedIterations << " <= " << numStages * 2
+                 << ") with tiny tile (" << totalBytes << "B)\n";
+    return PipelineProfitability::DefinitelyUnprofitable;
   }
 
-  // Rule 4: Large tile + long sequence
+  // ═══════════════════════════════════════════════════════════
+  // Rule 3 (DefinitelyProfitable): Paged attention best case
+  //   High page locality + sufficient iterations + safe vector width
+  // ═══════════════════════════════════════════════════════════
+  int tilesPerPage = (tileTokens > 0 && tileTokens <= pageSize)
+                        ? pageSize / tileTokens : 1;
+  if (isPaged && tilesPerPage >= 4 && estimatedIterations >= numStages * 4 &&
+      vec >= 8 && estTotalSMEM < sm.effectiveSmemPerBlock / 2) {
+    llvm::errs() << "[PACT P5] STRONGLY PROFITABLE: high page locality ("
+                 << tilesPerPage << " tiles/page, "
+                 << estimatedIterations << " iters, "
+                 << pact::SMDetector::getGPUName() << ")\n";
+    return PipelineProfitability::DefinitelyProfitable;
+  }
+
+  // ═══════════════════════════════════════════════════════════
+  // Rule 4 (LikelyUnprofitable): Ampere + narrow vectors
+  //   cp.async requires wider vectors to justify bar.sync cost
+  //   WARN but don't block — let Triton's native logic decide
+  // ═══════════════════════════════════════════════════════════
+  if (sm.smVersion < 90 && vec < (unsigned)sm.asyncCopyMinWidth / 2) {
+    llvm::errs() << "[PACT P5] LIKELY UNPROFITABLE on " << pact::SMDetector::getGPUName()
+                 << ": vecWidth=" << vec
+                 << " < min=" << (sm.asyncCopyMinWidth / 2)
+                 << " (pipeline may still be attempted by Triton)\n";
+    return PipelineProfitability::LikelyUnprofitable;
+  }
+
+  // ═══════════════════════════════════════════════════════════
+  // Rule 5 (Ampere default): Conservative on Ampere
+  //   Ampere bar.sync overhead > benefit for typical paged attention
+  //   But still only "LikelyUnprofitable" — don't force block
+  // ═══════════════════════════════════════════════════════════
+  if (sm.smVersion < 90 && !isPaged && estTotalSMEM > sm.effectiveSmemPerBlock / 2) {
+    llvm::errs() << "[PACT P5] LIKELY UNPROFITABLE on " << pact::SMDetector::getGPUName()
+                 << ": high SMEM pressure ("
+                 << estTotalSMEM / 1024 << "KB)\n";
+    return PipelineProfitability::LikelyUnprofitable;
+  }
+
+  // ═══════════════════════════════════════════════════════════
+  // Rule 6 (Large tile + long sequence): Likely profitable
+  // ═══════════════════════════════════════════════════════════
   if (vec >= 8 && estimatedIterations >= 32 &&
-      estTotalSMEM < smemLimit * 3 / 10) {
+      estTotalSMEM < sm.effectiveSmemPerBlock * 4 / 10) {
     llvm::errs() << "[PACT P5] PROFITABLE: vec=" << vec
                  << " iters=" << estimatedIterations
-                 << " smem=" << estTotalSMEM << "\n";
-    return PipelineProfitability::Profitable;
+                 << " smem=" << estTotalSMEM / 1024 << "KB"
+                 << " (" << pact::SMDetector::getGPUName() << ")\n";
+    return PipelineProfitability::DefinitelyProfitable;
   }
 
-  // Rule 5: Medium case — relaxed for 2D tiles
-  if (vec >= 4 && estimatedIterations >= 8) {
-    llvm::errs() << "[PACT P5] LIKELY profitable: vec=" << vec
-                 << " iters=" << estimatedIterations << "\n";
-    return PipelineProfitability::LikelyProfitable;
-  }
-
-  llvm::errs() << "[PACT P5] UNCERTAIN: vec=" << vec
-               << " iters=" << estimatedIterations << "\n";
-  return PipelineProfitability::Uncertain;
+  // ═══════════════════════════════════════════════════════════
+  // Default: Neutral — let Triton's native pipeline decide
+  // ═══════════════════════════════════════════════════════════
+  llvm::errs() << "[PACT P5] NEUTRAL: vec=" << vec
+               << " iters=" << estimatedIterations
+               << " smem=" << estTotalSMEM / 1024 << "KB"
+               << " (" << pact::SMDetector::getGPUName() << ")\n";
+  return PipelineProfitability::Neutral;
 }
 
 void mlir::triton::serializeLatencies(ModuleOp module,

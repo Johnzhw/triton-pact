@@ -14,6 +14,7 @@ add_triton_library(TritonAnalysis
   TritonGPUOpInterfacesIncGen
 
   LINK_LIBS PUBLIC
+  TritonSupport
   MLIRAnalysis
   MLIRLLVMDialect
   TritonIR

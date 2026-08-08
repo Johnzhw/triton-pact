@@ -31,5 +31,6 @@ add_triton_library(TritonTransforms
   MLIRTransformUtils
   MLIRTransforms
   MLIRSCFToControlFlow
+  TritonSupport
   TritonIR
 )

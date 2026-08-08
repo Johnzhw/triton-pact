@@ -576,6 +576,7 @@ class pact_knobs(base_knobs):
     """
     enable: env_bool = env_bool("PACT_ENABLE", False)
     enable_page_transform: env_bool = env_bool("PACT_ENABLE_PAGE_TRANSFORM", True)
+    enable_dot_promotion: env_bool = env_bool("PACT_ENABLE_DOT_PROMOTION", True)
     enable_pattern_specialize: env_bool = env_bool("PACT_ENABLE_PATTERN_SPECIALIZE", True)
     enable_prefetch_insert: env_bool = env_bool("PACT_ENABLE_PREFETCH_INSERT", False)
     enable_layout_remap: env_bool = env_bool("PACT_ENABLE_LAYOUT_REMAP", False)
@@ -598,6 +599,7 @@ class pact_knobs(base_knobs):
     enable_static_profitability: env_bool = env_bool("PACT_ENABLE_STATIC_PROFITABILITY", True)
     # P6: Auto num_stages selection (page-aware heuristic)
     enable_auto_num_stages: env_bool = env_bool("PACT_ENABLE_AUTO_NUM_STAGES", True)
+    enable_auto_num_warps: env_bool = env_bool("PACT_ENABLE_AUTO_NUM_WARPS", False)
     max_pipeline_stages: env_int = env_int("PACT_MAX_PIPELINE_STAGES", 4)
     # P7: Page-major tile ordering (default OFF — changes computation order)
     enable_page_major_tile: env_bool = env_bool("PACT_ENABLE_PAGE_MAJOR_TILE", False)
@@ -613,6 +615,20 @@ class pact_knobs(base_knobs):
     proton_profile_db_path: env_str = env_str("PACT_PROTON_PROFILE_DB_PATH", "")
     dump_ir: env_bool = env_bool("PACT_DUMP_IR", False)
     verbose: env_bool = env_bool("PACT_VERBOSE", False)
+    # === Phase 0/1: Architecture-adaptive optimization ===
+    arch_adaptive: env_bool = env_bool("PACT_ARCH_ADAPTIVE", True)
+    # P3: Ampere contiguity cap (f16 elements, max vector width before cp.async triggers)
+    ampere_contiguity_cap: env_int = env_int("PACT_AMPERE_CONTIGUITY_CAP", 16)
+    # P5: Pipeline block threshold
+    #   "definitely_unprofitable" (default): only block when harm is certain
+    #   "likely_unprofitable": block when harm is likely (more conservative)
+    #   "none": never block pipeline (most permissive)
+    p5_block_threshold: env_str = env_str("PACT_P5_BLOCK_THRESHOLD", "definitely_unprofitable")
+    # P3: AxisInfo override strategy
+    #   "auto": auto-detect from SM version (recommended)
+    #   "ampere_adaptive": force Ampere conservative profile
+    #   "hopper_aggressive": force Hopper aggressive profile
+    axisinfo_override_strategy: env_str = env_str("PACT_AXISINFO_OVERRIDE_STRATEGY", "auto")
 
 
 build = build_knobs()

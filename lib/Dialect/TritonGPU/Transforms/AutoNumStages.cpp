@@ -43,9 +43,9 @@ static int getMaxPipelineStages() {
   const char *env = std::getenv("PACT_MAX_PIPELINE_STAGES");
   if (env) {
     int val = std::atoi(env);
-    return std::max(2, std::min(val, 6));
+    return std::max(2, std::min(val, 8));
   }
-  return 4;
+  return 6;  // Increased from 4: higher num_stages → higher load latency → scheduler more likely to pipeline
 }
 
 // Calculate the optimal number of pipeline stages for a given page/tile config.
@@ -70,13 +70,17 @@ static int computeOptimalNumStages(int64_t tileBytes, int estIterations,
   if (upperBound <= minStages)
     return minStages;
 
-  // Page-aware heuristic
-  int tilesPerPage = (tileTokens > 0) ? pageSize / tileTokens : 1;
+  // Page-aware heuristic — fix tilesPerPage=0 bug
+  int tilesPerPage = 1;
+  if (tileTokens > 0 && tileTokens <= pageSize)
+    tilesPerPage = pageSize / tileTokens;
+  else if (tileTokens > pageSize)
+    tilesPerPage = 1; // tile spans multiple pages, no locality advantage
 
   if (tilesPerPage >= 4)
-    return std::max(minStages, upperBound - 1); // high L2 locality
+    return std::max(minStages, upperBound - 1); // high L2 locality — fewer stages suffice
   if (tilesPerPage <= 1)
-    return upperBound; // low locality
+    return upperBound; // low locality — more stages to hide latency
   return std::max(minStages, upperBound - 1); // medium
 }
 
@@ -127,10 +131,19 @@ struct PACTAutoNumStagesPass
                                             pageSize, tileTokens,
                                             defaultStages);
 
-      // Set as loop attribute so pipeline pass picks it up
-      forOp->setAttr("ttg.num_stages",
-                     mlir::IntegerAttr::get(
-                         mlir::IntegerType::get(&getContext(), 32), optimal));
+      // Set as loop attribute so pipeline pass picks it up.
+      // "tt.num_stages" is checked by AssignLoadLatencies for pipelineWithoutDot
+      // (line 66: forOp->hasAttr(kNumStagesAttrName) where kNumStagesAttrName="tt.num_stages")
+      // Also set "ttg.num_stages" for getNumStagesOrDefault (NumStagesAttrHelper).
+      auto stagesAttr = mlir::IntegerAttr::get(
+          mlir::IntegerType::get(&getContext(), 32), optimal);
+      forOp->setAttr("tt.num_stages", stagesAttr);
+      forOp->setAttr("ttg.num_stages", stagesAttr);
+
+      // Also write to module attribute for compiler.py fallback
+      mod->setAttr("pact.optimal_num_stages",
+                   mlir::IntegerAttr::get(
+                       mlir::IntegerType::get(&getContext(), 32), optimal));
 
       llvm::errs() << "[PACT P6] num_stages: default=" << defaultStages
                    << " -> optimal=" << optimal
@@ -138,7 +151,8 @@ struct PACTAutoNumStagesPass
                    << ", iters=" << estIterations
                    << ", pageSize=" << pageSize
                    << ", tilesPerPage="
-                   << (tileTokens > 0 ? pageSize / tileTokens : 0) << ")\n";
+                   << (tileTokens > 0 && tileTokens <= pageSize
+                       ? pageSize / tileTokens : 1) << ")\n";
       return WalkResult::advance();
     });
   }

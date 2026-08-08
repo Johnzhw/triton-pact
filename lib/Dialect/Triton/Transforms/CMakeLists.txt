@@ -9,6 +9,8 @@ add_triton_library(TritonTransforms
   LoopPeeling.cpp
   LoopUnroll.cpp
   PageTransform.cpp
+  DotPromotion.cpp
+  AutoNumWarps.cpp
   PageLocalAnalysis.cpp
   PageMajorTileOrdering.cpp
   RunCoalescing.cpp

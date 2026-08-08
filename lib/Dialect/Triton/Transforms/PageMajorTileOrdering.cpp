@@ -78,9 +78,10 @@ struct PageMajorTileOrderingPass
         tileTokens = 16;
 
       // Only beneficial when page_size >= 2 * tile_size
-      if (pageSize < tileTokens * 2) {
+      // Relaxed: trigger for any multi-tile page (was pageSize < tileTokens*2)
+      if (pageSize <= tileTokens) {
         llvm::errs() << "[PACT P7 DEBUG] pageSize=" << pageSize
-                     << " < 2*tile=" << (tileTokens*2) << "\n";
+                     << " <= tile=" << tileTokens << " — not enough tiles/page\n";
         return WalkResult::advance();
       }
 

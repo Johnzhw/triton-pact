@@ -129,6 +129,21 @@ def TritonPatternSpecialize : Pass<"triton-pattern-specialize", "mlir::ModuleOp"
   let dependentDialects = ["mlir::triton::TritonDialect", "mlir::arith::ArithDialect"];
 }
 
+def PACTDotPromotion : Pass<"triton-pact-dot-promotion", "mlir::ModuleOp"> {
+  let summary = "Promote tl.sum(q*k) to tl.dot for tensor core (MMA) acceleration";
+  let description = [{
+    Detects element-wise sum(mul(q, k)) patterns in 2D tensors and promotes
+    them to tt.dot operations.  This replaces FMA (CUDA core) instructions
+    with MMA (tensor core) instructions, achieving 2-4x speedup for the
+    attention score computation.
+
+    Transform: arith.mulf + tt.reduce(sum axis=1) → tt.dot
+    Only activates for f16/bf16 element types with MMA-friendly K dimensions
+    (16, 32, 64, 128).  Default ON.
+  }];
+  let dependentDialects = ["mlir::triton::TritonDialect", "mlir::arith::ArithDialect"];
+}
+
 def PACTPageLocalAnalysis : Pass<"triton-pact-page-local-analysis", "mlir::ModuleOp"> {
   let summary = "Analyze page-local memory contiguity for paged KV loads";
   let description = [{
@@ -153,6 +168,16 @@ def PACTPageMajorTile : Pass<"triton-pact-page-major-tile", "mlir::ModuleOp"> {
     physical page.  Default OFF — changes FP16 accumulation order.
   }];
   let dependentDialects = ["mlir::triton::TritonDialect", "mlir::arith::ArithDialect"];
+}
+
+def PACTAutoNumWarps : Pass<"triton-pact-auto-num-warps", "mlir::ModuleOp"> {
+  let summary = "Recommend optimal num_warps based on kernel structure analysis";
+  let description = [{
+    Analyzes kernel structure (number of paged loads, tile sizes, MMA presence)
+    and writes pact.optimal_num_warps module attribute.  compiler.py reads this
+    before make_ttgir to adjust opt.num_warps.  Default OFF.
+  }];
+  let dependentDialects = ["mlir::triton::TritonDialect"];
 }
 
 def PACTRunCoalescing : Pass<"triton-pact-run-coalescing", "mlir::ModuleOp"> {

@@ -241,6 +241,10 @@ class CUDABackend(BaseBackend):
 
     @staticmethod
     def make_ttir(mod, metadata, opt, capability):
+        # PACT Phase 0: propagate SM version to C++ passes
+        if knobs.pact.enable:
+            os.environ.setdefault("PACT_SM_VERSION", str(capability))
+
         pm = ir.pass_manager(mod.context)
         pm.enable_debug()
         passes.common.add_inliner(pm)
@@ -252,6 +256,8 @@ class CUDABackend(BaseBackend):
         # PACT: Page-aware compilation passes (TTIR level)
         if knobs.pact.enable and knobs.pact.enable_page_transform:
             passes.ttir.add_page_transform(pm)
+        if knobs.pact.enable and knobs.pact.enable_dot_promotion:
+            passes.ttir.add_pact_dot_promotion(pm)
         if knobs.pact.enable and knobs.pact.enable_pattern_specialize:
             passes.ttir.add_pattern_specialize(pm)
         if knobs.pact.enable and knobs.pact.enable_bt_prefetch:
@@ -260,6 +266,8 @@ class CUDABackend(BaseBackend):
             passes.ttir.add_block_table_scalarize(pm)
         if knobs.pact.enable and knobs.pact.enable_page_local_analysis:
             passes.ttir.add_pact_page_local_analysis(pm)
+        if knobs.pact.enable and knobs.pact.enable_auto_num_warps:
+            passes.ttir.add_pact_auto_num_warps(pm)
         if knobs.pact.enable and knobs.pact.enable_page_major_tile:
             passes.ttir.add_pact_page_major_tile(pm)
         if knobs.pact.enable and knobs.pact.enable_run_coalesce:
@@ -272,6 +280,19 @@ class CUDABackend(BaseBackend):
 
     @staticmethod
     def make_ttgir(mod, metadata, opt, capability):
+        # P11: read pact.optimal_num_warps before TTIR→TTGIR conversion
+        if knobs.pact.enable and knobs.pact.enable_auto_num_warps:
+            try:
+                op = mod.get_operation()
+                if hasattr(op, 'attributes'):
+                    pact_warp = op.attributes.get("pact.optimal_num_warps")
+                    if pact_warp is not None:
+                        pw = int(pact_warp.value)
+                        if pw != opt.num_warps:
+                            print(f"[PACT P11→compiler] num_warps: {opt.num_warps} -> {pw}")
+                            opt.num_warps = pw
+            except Exception:
+                pass
         # Set maxnreg on all kernels, if it was provided.
         if opt.maxnreg is not None:
             mod.set_attr("ttg.maxnreg", ir.builder(mod.context).get_int32_attr(opt.maxnreg))
@@ -311,6 +332,19 @@ class CUDABackend(BaseBackend):
             passes.ttir.add_triton_licm(pm)
             passes.common.add_canonicalizer(pm)
             passes.ttgpuir.add_combine_tensor_select_and_if(pm)
+            # P6 AutoNumStages may have set pact.optimal_num_stages on the module
+            if knobs.pact.enable and knobs.pact.enable_auto_num_stages:
+                try:
+                    op = mod.get_operation()
+                    if hasattr(op, 'attributes'):
+                        pact_attr = op.attributes.get("pact.optimal_num_stages")
+                        if pact_attr is not None:
+                            optimal_ns = int(pact_attr.value)
+                            if optimal_ns > opt.num_stages:
+                                opt.num_stages = optimal_ns
+                                print(f"[PACT P6→Pipeline] num_stages overridden: {optimal_ns}")
+                except Exception:
+                    pass  # P6→Pipeline link: loop attribute is primary mechanism
             nvidia.passes.hopper.add_hopper_warpspec(pm, opt.num_stages, dump_enabled)
             passes.ttgpuir.add_assign_latencies(pm, opt.num_stages)
             passes.ttgpuir.add_schedule_loops(pm)

@@ -368,9 +368,10 @@ mlir::triton::PipelineProfitability mlir::triton::isPipelineProfitable(
   }
 
   // Rule 1: Too few iterations — pipeline fill/drain dominates
-  if (estimatedIterations <= numStages * 2) {
+  // Relaxed: only block when iterations < numStages (vs numStages*2 before)
+  if (estimatedIterations < numStages) {
     llvm::errs() << "[PACT P5] NOT profitable: too few iters ("
-                 << estimatedIterations << " <= " << numStages * 2 << ")\n";
+                 << estimatedIterations << " < " << numStages << ")\n";
     return PipelineProfitability::NotProfitable;
   }
   if (estimatedIterations < 16) {
@@ -386,8 +387,9 @@ mlir::triton::PipelineProfitability mlir::triton::isPipelineProfitable(
     return PipelineProfitability::NotProfitable;
   }
 
-  // Rule 3: High SMEM pressure
-  int64_t smemLimit = 102400;
+  // Rule 3: High SMEM pressure — use GPU-specific SMEM limit
+  // RTX 3080 (SM86) has ~96KB usable SMEM, A100 has 163KB, H100 has 227KB
+  int64_t smemLimit = 98304;  // 96KB for RTX 3080
   int64_t estTotalSMEM = totalBytes * numStages;
   if (estTotalSMEM > smemLimit * 6 / 10) {
     llvm::errs() << "[PACT P5] UNCERTAIN: high SMEM ("
@@ -404,8 +406,8 @@ mlir::triton::PipelineProfitability mlir::triton::isPipelineProfitable(
     return PipelineProfitability::Profitable;
   }
 
-  // Rule 5: Medium case
-  if (vec >= 4 && estimatedIterations >= 16) {
+  // Rule 5: Medium case — relaxed for 2D tiles
+  if (vec >= 4 && estimatedIterations >= 8) {
     llvm::errs() << "[PACT P5] LIKELY profitable: vec=" << vec
                  << " iters=" << estimatedIterations << "\n";
     return PipelineProfitability::LikelyProfitable;

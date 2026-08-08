@@ -371,8 +371,106 @@ struct PageTransformPass
     return bestPageSize;
   }
 
+  //===----------------------------------------------------------------===//
+  // Kernel classification: prefill vs decode paged attention
+  // Uses three signals for joint decision:
+  //   Signal A: divsi(PAGE_SIZE) + remsi(PAGE_SIZE) patterns
+  //   Signal B: block_table parameter name
+  //   Signal C: 2D K/V load shapes (decode characteristic)
+  //===----------------------------------------------------------------===//
+  enum class KernelType {
+    Unknown,
+    DecodePagedAttention,  // confirmed decode paged attention kernel
+    PrefillAttention,      // prefill kernel — skip PACT optimization
+    MixedPagedAccess       // has paged access but uncertain type
+  };
+
+  static KernelType classifyKernel(ModuleOp mod) {
+    bool hasDivsiPattern = false;
+    bool hasBlockTableParam = false;
+    bool has2DKVLoad = false;
+
+    // Signal A: check for divsi(PAGE_SIZE) patterns
+    mod.walk([&](arith::DivSIOp divOp) {
+      if (auto constOp = divOp.getRhs().getDefiningOp<arith::ConstantIntOp>()) {
+        int64_t divisor = constOp.value();
+        // PAGE_SIZE is typically 16, 32, 64, 128
+        if (divisor == 16 || divisor == 32 || divisor == 64 || divisor == 128) {
+          // Verify: divsi result used for block_table indexing
+          for (auto *user : divOp->getUsers()) {
+            if (isa<arith::AddIOp, arith::MulIOp>(user)) {
+              hasDivsiPattern = true;
+              return WalkResult::interrupt();
+            }
+          }
+        }
+      }
+      return WalkResult::advance();
+    });
+
+    // Signal B: check for block_table parameter
+    for (auto funcOp : mod.getOps<triton::FuncOp>()) {
+      for (unsigned i = 0; i < funcOp.getNumArguments(); i++) {
+        auto arg = funcOp.getArgument(i);
+        if (auto nameAttr =
+                funcOp.getArgAttrOfType<StringAttr>(i, "tt.param_name")) {
+          StringRef name = nameAttr.getValue();
+          if (name.contains("block_table") || name.contains("BLOCK_TABLE")) {
+            hasBlockTableParam = true;
+            break;
+          }
+        }
+      }
+    }
+
+    // Signal C: check for 2D K/V loads (decode characteristic)
+    mod.walk([&](triton::LoadOp loadOp) {
+      auto ty = dyn_cast<RankedTensorType>(loadOp.getResult().getType());
+      if (ty && ty.getShape().size() == 2) {
+        int64_t dim0 = ty.getShape()[0];
+        int64_t dim1 = ty.getShape()[1];
+        // 2D tile with head_dim > 32 (not a small mask tensor)
+        if (dim0 >= 8 && dim1 >= 32) {
+          has2DKVLoad = true;
+          return WalkResult::interrupt();
+        }
+      }
+      return WalkResult::advance();
+    });
+
+    // Joint decision
+    if (hasDivsiPattern && hasBlockTableParam)
+      return KernelType::DecodePagedAttention;
+    if (hasDivsiPattern && !hasBlockTableParam)
+      return KernelType::MixedPagedAccess;
+    if (!hasDivsiPattern)
+      return KernelType::PrefillAttention;
+
+    return KernelType::Unknown;
+  }
+
   void runOnOperation() override {
     ModuleOp mod = getOperation();
+
+    // === Phase 0: Kernel Classification ===
+    KernelType ktype = classifyKernel(mod);
+
+    if (ktype == KernelType::PrefillAttention) {
+      mod->setAttr("pact.kernel_type",
+                   StringAttr::get(mod.getContext(), "prefill"));
+      llvm::errs() << "[PACT P1] Prefill kernel detected, skipping PACT "
+                      "annotation (no paged access patterns found).\n";
+      return;
+    }
+
+    if (ktype == KernelType::DecodePagedAttention) {
+      mod->setAttr("pact.kernel_type",
+                   StringAttr::get(mod.getContext(), "decode_paged"));
+      llvm::errs() << "[PACT P1] Decode paged attention kernel identified.\n";
+    } else {
+      mod->setAttr("pact.kernel_type",
+                   StringAttr::get(mod.getContext(), "unknown"));
+    }
 
     // Check module-level and function-level pact.paged attributes.
     // These serve as hints.  If not present, we auto-detect.

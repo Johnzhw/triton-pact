@@ -137,103 +137,84 @@ struct PACTPipelineHintsPass
                 "pact.pagelocal.requires_guard"))
           requiresGuard = attr.getValue();
 
-        // === Compute 13 hint values ===
+        // === Compute 8 hint values (simplified from 14 — each has a consumer) ===
+        //
+        // Group A: Page semantics (4 hints — P5, P6 consumers)
+        // Group B: Pipeline enhancement (4 hints — Pipeline pass consumers)
 
-        // Hint 1: pageSize
+        // Hint 1: pageSize (P5, P6 consumer)
         int64_t hint_pageSize = pageSize;
 
-        // Hint 2: headDimAlignment
-        int64_t hint_headDimAlignment = std::min(headSize, int64_t(8));
+        // Hint 2: tileTokens (P5, P6 consumer)
+        int64_t hint_tileTokens = tileTokens;
 
-        // Hint 3: safeAsyncCopyWidth (bytes)
-        int64_t hint_safeAsyncCopyWidth = 4;
-        if (boundarySafe && pageLocalContiguity >= 8)
-          hint_safeAsyncCopyWidth = 16; // 8×f16 = 128-bit
-        else if (pageLocalContiguity >= 4)
-          hint_safeAsyncCopyWidth = 8;  // 4×f16 = 64-bit
-        else if (pageLocalContiguity >= 2)
-          hint_safeAsyncCopyWidth = 4;  // 2×f16 = 32-bit
-
-        // Hint 4: pageLocalContiguity
-        int64_t hint_pageLocalContiguity = pageLocalContiguity;
-
-        // Hint 5: isPageCrossing
-        bool hint_isPageCrossing = !boundarySafe;
-
-        // Hint 6: fullPageTile
-        bool hint_fullPageTile = (tileTokens == pageSize);
-
-        // Hint 7: estimatedIterations
-        int64_t hint_estimatedIterations = estIterations;
-
-        // Hint 8: tileBytes
+        // Hint 3: tileBytes (P5, P6, P10 consumer)
         int64_t hint_tileBytes = totalBytes;
 
-        // Hint 9: preferAsync
+        // Hint 4: estimatedIterations (P5, P6 consumer)
+        int64_t hint_estimatedIterations = estIterations;
+
+        // Hint 5: pageLocalContiguity (P3, P9 consumer)
+        int64_t hint_pageLocalContiguity = pageLocalContiguity;
+
+        // Hint 6: isPageCrossing (P3, P7 consumer)
+        bool hint_isPageCrossing = !boundarySafe;
+
+        // Hint 7: preferAsync (Pipeline pass — LowerLoops consumer)
+        // Paged attention heuristic: prefer async copy for large tiles with
+        // sufficient iterations and multi-tile pages (page locality).
+        int tilesPerPage = (pageSize > 0 && tileTokens > 0)
+                              ? pageSize / tileTokens : 1;
         bool hint_preferAsync =
             (totalBytes >= 128) && (estIterations >= 16) &&
-            (estIterations >= 32 || totalBytes >= 256);
+            (tilesPerPage >= 2 || totalBytes >= 512);
 
-        // Hint 10: suggestedNumStages (page-aware heuristic)
-        int tilesPerPage = (pageSize > 0) ? pageSize / tileTokens : 1;
+        // Hint 8: suggestedNumStages (Pipeline pass — ScheduleLoops consumer)
+        // Simple page-aware heuristic; P6 AutoNumStages is the primary decision maker.
         int hint_suggestedNumStages;
-        if (estIterations < 16) {
-          hint_suggestedNumStages = 2;
-        } else if (tilesPerPage >= 4) {
-          hint_suggestedNumStages = 2; // high L2 locality
+        if (tilesPerPage >= 4) {
+          hint_suggestedNumStages = 2; // high L2 locality → fewer stages
         } else if (tilesPerPage <= 1) {
-          hint_suggestedNumStages = 3; // low locality
+          hint_suggestedNumStages = 4; // low locality → more stages
         } else {
-          hint_suggestedNumStages = (totalBytes > 256) ? 3 : 2;
+          hint_suggestedNumStages = 3; // medium
         }
+        if (estIterations < 16)
+          hint_suggestedNumStages = std::min(hint_suggestedNumStages, 2);
 
-        // Hint 11: suggestedPrefetchDistance
-        int hint_suggestedPrefetchDistance =
-            (tilesPerPage >= 4) ? 1 : 2;
+        // === Removed 6 redundant hints (v2 simplification) ===
+        // - safe_async_copy_width: via AxisInfo contiguity
+        // - head_dim_alignment: via AxisInfo divisibility
+        // - full_page_tile: derivable from page_size/tile_tokens
+        // - suggested_prefetch_distance: no consumer
+        // - vector_width: via AxisInfo contiguity
+        // - divisibility_boost: via AxisInfo divisibility
 
-        // Hint 12: vectorWidth (for getVectorSize)
-        int64_t hint_vectorWidth = std::min(safeVecWidth, int64_t(8));
-
-        // Hint 13: divisibilityBoost (bytes)
-        int hint_divisibilityBoost = boundarySafe ? 16 : 4;
-
-        // === Attach hints to loadOp ===
+        // === Attach 8 hints to loadOp ===
         auto ctx = &getContext();
         auto i64Ty = IntegerType::get(ctx, 64);
         loadOp->setAttr("pact.hint.page_size",
             mlir::IntegerAttr::get(i64Ty, hint_pageSize));
-        loadOp->setAttr("pact.hint.head_dim_alignment",
-            mlir::IntegerAttr::get(i64Ty, hint_headDimAlignment));
-        loadOp->setAttr("pact.hint.safe_async_copy_width",
-            mlir::IntegerAttr::get(i64Ty, hint_safeAsyncCopyWidth));
+        loadOp->setAttr("pact.hint.tile_tokens",
+            mlir::IntegerAttr::get(i64Ty, hint_tileTokens));
+        loadOp->setAttr("pact.hint.tile_bytes",
+            mlir::IntegerAttr::get(i64Ty, hint_tileBytes));
+        loadOp->setAttr("pact.hint.estimated_iterations",
+            mlir::IntegerAttr::get(i64Ty, hint_estimatedIterations));
         loadOp->setAttr("pact.hint.page_local_contiguity",
             mlir::IntegerAttr::get(i64Ty, hint_pageLocalContiguity));
         loadOp->setAttr("pact.hint.is_page_crossing",
             mlir::BoolAttr::get(ctx, hint_isPageCrossing));
-        loadOp->setAttr("pact.hint.full_page_tile",
-            mlir::BoolAttr::get(ctx, hint_fullPageTile));
-        loadOp->setAttr("pact.hint.estimated_iterations",
-            mlir::IntegerAttr::get(i64Ty, hint_estimatedIterations));
-        loadOp->setAttr("pact.hint.tile_bytes",
-            mlir::IntegerAttr::get(i64Ty, hint_tileBytes));
-        loadOp->setAttr("pact.hint.tile_tokens",
-            mlir::IntegerAttr::get(i64Ty, tileTokens));
         loadOp->setAttr("pact.hint.prefer_async",
             mlir::BoolAttr::get(ctx, hint_preferAsync));
         loadOp->setAttr("pact.hint.suggested_num_stages",
             mlir::IntegerAttr::get(i64Ty, hint_suggestedNumStages));
-        loadOp->setAttr("pact.hint.suggested_prefetch_distance",
-            mlir::IntegerAttr::get(i64Ty, hint_suggestedPrefetchDistance));
-        loadOp->setAttr("pact.hint.vector_width",
-            mlir::IntegerAttr::get(i64Ty, hint_vectorWidth));
-        loadOp->setAttr("pact.hint.divisibility_boost",
-            mlir::IntegerAttr::get(i64Ty, hint_divisibilityBoost));
 
         numHintsAttached++;
         LDBG("PACT P4: hints for load: bytes=" << totalBytes
-             << ", safeCpWidth=" << hint_safeAsyncCopyWidth
              << ", preferAsync=" << hint_preferAsync
-             << ", numStages=" << hint_suggestedNumStages);
+             << ", numStages=" << hint_suggestedNumStages
+             << ", tilesPerPage=" << tilesPerPage);
       }
 
       return WalkResult::advance();

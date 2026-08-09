@@ -121,6 +121,33 @@ struct PACTGuardFusionPass
     if (!isEnabled())
       return;
 
+    ModuleOp mod = getOperation();
+
+    // === P8 v2: Early exit — pre-scan for AND-of-CMP pattern ===
+    // GuardFusion only applies when there are paged loads with
+    // AND(cmp(seq_mask), cmp(page_mask)) patterns.
+    // If no such pattern exists, skip the expensive greedy rewrite.
+    bool hasAndCmpPattern = false;
+    mod.walk([&](arith::AndIOp andOp) {
+      if (andOp.getLhs().getDefiningOp<arith::CmpIOp>() &&
+          andOp.getRhs().getDefiningOp<arith::CmpIOp>()) {
+        // Check if either operand is for a paged load
+        for (auto *user : andOp->getUsers()) {
+          if (user->hasAttr("pact.paged_load")) {
+            hasAndCmpPattern = true;
+            return WalkResult::interrupt();
+          }
+        }
+      }
+      return WalkResult::advance();
+    });
+
+    if (!hasAndCmpPattern) {
+      llvm::errs() << "[PACT P8] No AND-of-CMP guard pattern found, "
+                      "pass skipped (v2 early exit).\n";
+      return;
+    }
+
     MLIRContext *ctx = &getContext();
     RewritePatternSet patterns(ctx);
     patterns.add<FuseGuardPattern>(ctx);

@@ -17,6 +17,7 @@
 #include "mlir/IR/IRMapping.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/Triton/Transforms/Passes.h"
+#include "triton/Support/PactSMDetect.h"
 
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/Support/Debug.h"
@@ -77,17 +78,37 @@ struct PageMajorTileOrderingPass
       if (tileTokens <= 0)
         tileTokens = 16;
 
-      // Only beneficial when page_size >= 2 * tile_size
-      // Relaxed: trigger for any multi-tile page (was pageSize < tileTokens*2)
+      // === P7 v2: Architecture guard ===
+      // Ampere: nested loops break Triton Pipeline pattern → skip
+      // Hopper: TMA 2D copies are compatible with nested loops → allow
+      if (pact::SMDetector::isAmpere()) {
+        // Check if this kernel has pipeline candidates
+        // If yes, reordering would break the pipeline pattern
+        bool hasPipelineCandidate = false;
+        forOp.walk([&](triton::LoadOp l) {
+          if (l->hasAttr("pact.paged_load")) {
+            auto ty = dyn_cast<RankedTensorType>(l.getResult().getType());
+            if (ty) {
+              int64_t total = 1;
+              for (auto d : ty.getShape()) total *= d;
+              if (total * 2 >= 128) hasPipelineCandidate = true; // ≥128 bytes
+            }
+          }
+        });
+        if (hasPipelineCandidate) {
+          llvm::errs() << "[PACT P7] Skipping on " << pact::SMDetector::getGPUName()
+                       << ": reordering would break pipeline pattern\n";
+          return WalkResult::advance();
+        }
+      }
+
+      // Only beneficial when page has multiple tiles
       if (pageSize <= tileTokens) {
-        llvm::errs() << "[PACT P7 DEBUG] pageSize=" << pageSize
-                     << " <= tile=" << tileTokens << " — not enough tiles/page\n";
         return WalkResult::advance();
       }
 
       int64_t tilesPerPage = pageSize / tileTokens;
       if (tilesPerPage < 2) {
-        llvm::errs() << "[PACT P7 DEBUG] tilesPerPage=" << tilesPerPage << " < 2\n";
         return WalkResult::advance();
       }
 

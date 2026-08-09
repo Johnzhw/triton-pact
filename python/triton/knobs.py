@@ -618,7 +618,7 @@ class pact_knobs(base_knobs):
     # === Phase 0/1: Architecture-adaptive optimization ===
     arch_adaptive: env_bool = env_bool("PACT_ARCH_ADAPTIVE", True)
     # P3: Ampere contiguity cap (f16 elements, max vector width before cp.async triggers)
-    ampere_contiguity_cap: env_int = env_int("PACT_AMPERE_CONTIGUITY_CAP", 16)
+    ampere_contiguity_cap: env_int = env_int("PACT_AMPERE_CONTIGUITY_CAP", 8)
     # P5: Pipeline block threshold
     #   "definitely_unprofitable" (default): only block when harm is certain
     #   "likely_unprofitable": block when harm is likely (more conservative)

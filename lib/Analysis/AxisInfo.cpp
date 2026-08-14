@@ -246,13 +246,17 @@ static bool isPactGuardedOverrideEnabled() {
 }
 
 // Read the Ampere contiguity cap from environment.
-// Controls the maximum contiguity value on Ampere to prevent
-// triggering cp.async pipeline when bar.sync overhead > benefit.
-//   Cap=4:  2×f16 vectors (32-bit) — safest, minimal vectorization
-//   Cap=8:  4×f16 vectors (64-bit) — conservative
-//   Cap=16: 8×f16 vectors (128-bit) — recommended default
-//   Cap=32: 16×f16 vectors (256-bit) — may trigger cp.async
-//   Cap=64: Phase1 legacy — full headSize, will trigger cp.async
+// Controls the maximum contiguity value on Ampere to prevent triggering
+// cp.async pipeline (whose bar.sync overhead exceeds the benefit for paged
+// attention).  cap is a *contiguity* (element count); the actual vector width
+// is vec = min(128/bitWidth, contiguity) = min(8, cap) for f16.
+//   Cap=4:  contiguity=4  → 4×f16 = 64-bit   (most conservative)
+//   Cap=8:  contiguity=8  → 8×f16 = 128-bit  (default; empirical optimum
+//           ~1.88× — Bug11: was mislabeled "4×f16/64-bit")
+//   Cap=16: contiguity=16 → vec still min(8,16)=8 (128-bit), but the higher
+//           contiguity can trigger cp.async → measured ~1.30× regression
+//           (do NOT revert the default to 16)
+//   Cap=64: Phase1 legacy → full headSize, will trigger cp.async
 static int64_t getAmpereContiguityCap() {
   const char *env = std::getenv("PACT_AMPERE_CONTIGUITY_CAP");
   if (env) {
@@ -262,7 +266,7 @@ static int64_t getAmpereContiguityCap() {
     if (cap > 64) cap = 64;
     return cap;
   }
-  return 8; // default: optimal for Ampere (4×f16=64-bit vectors, ~1.9× speedup)
+  return 8; // default: contiguity=8 → 8×f16 = 128-bit vectorization
 }
 
 // Read the P3 override strategy knob:

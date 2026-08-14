@@ -250,10 +250,20 @@ struct PageLocalAnalysisPass
       // M9: compute this exactly from the page-internal memory layout expressed
       // as an F₂-linear layout, instead of the semantic staticallySafe branch.
       int64_t pageLocalContiguity = headSize; // fallback (non-power-of-2)
+      int64_t tokenContiguity = 1;            // token is page-strided (stride headDim)
       if (isPowerOf2(headSize) && isPowerOf2(pageSize)) {
-        pageLocalContiguity =
-            buildPagedMemoryLayout(headSize, pageSize, &getContext())
-                .getNumConsecutiveInOut();
+        LinearLayout pagedMem =
+            buildPagedMemoryLayout(headSize, pageSize, &getContext());
+        // head_idx basis is stride 1 → contiguous (headDim).
+        pageLocalContiguity = pagedMem.getNumConsecutiveInOut();
+        // token_in_page basis is stride headDim → NOT contiguous.  Transpose so
+        // token is the most-minor input dim and getNumConsecutiveInOut() returns
+        // the exact token-dimension contiguity (= 1).  This is the principled
+        // F₂ evidence that only head_idx should be vectorization-overridden.
+        auto headIdx = StringAttr::get(&getContext(), "head_idx");
+        auto tokenInPage = StringAttr::get(&getContext(), "token_in_page");
+        tokenContiguity = pagedMem.transposeIns({tokenInPage, headIdx})
+                              .getNumConsecutiveInOut();
       }
 
       // === Step 4: compute max safe vector width ===
@@ -280,6 +290,8 @@ struct PageLocalAnalysisPass
       auto i64Ty = IntegerType::get(ctx, 64);
       loadOp->setAttr("pact.pagelocal.contiguity",
           IntegerAttr::get(i64Ty, pageLocalContiguity));
+      loadOp->setAttr("pact.pagelocal.token_contiguity",
+          IntegerAttr::get(i64Ty, tokenContiguity));
       loadOp->setAttr("pact.pagelocal.safe_vector_width",
           IntegerAttr::get(i64Ty, maxSafeVectorWidth));
       loadOp->setAttr("pact.pagelocal.statically_safe",

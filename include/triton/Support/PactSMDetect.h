@@ -15,6 +15,16 @@
 namespace mlir::triton::pact {
 
 // ============================================================================
+// TargetBackend: target hardware backend abstraction (M0d — AMD migration hook)
+//
+// NVIDIA uses a numeric SM version (70-120); AMD uses a gfx arch string
+// (gfx942/gfx950/gfx1250).  This enum lets SMDetector distinguish backends
+// without hardcoding NVIDIA-only semantics.  AMD resource tables are filled in
+// at migration time (see PactSMDetect.cpp resourcesForAMD).
+// ============================================================================
+enum class TargetBackend { NVIDIA, AMD, Unknown };
+
+// ============================================================================
 // SMResources: hardware resource limits + PACT-specific derived parameters
 // ============================================================================
 struct SMResources {
@@ -55,18 +65,25 @@ struct PipelineBudget {
 // ============================================================================
 class SMDetector {
   static int version;
+  static TargetBackend backend;
+  static std::string gfxArch;   // AMD gfx arch string (e.g. "gfx942"); empty for NVIDIA
   static SMResources resources;
   static bool initialized;
 
 public:
   // Detect SM version and populate resources.
-  // Reads PACT_SM_VERSION env var, or defaults to 86 (Ampere).
+  // Reads PACT_SM_VERSION (NVIDIA) or PACT_AMD_ARCH (AMD gfx string).
+  // If neither is set, logs a warning and falls back to a conservative
+  // unknown backend (no silent RTX-3080 assumption).
   static int detect();
 
+  // Which target backend was detected (NVIDIA / AMD / Unknown).
+  static TargetBackend getBackend();
+
   // Convenience queries
-  static bool isAmpere();     // SM 80-89
-  static bool isHopper();     // SM >= 90
-  static bool isVolta();      // SM 70-79
+  static bool isAmpere();     // SM 80-89 (NVIDIA)
+  static bool isHopper();     // SM >= 90 (NVIDIA)
+  static bool isVolta();      // SM 70-79 (NVIDIA)
 
   // Get resource limits
   static const SMResources &getResources();
@@ -77,9 +94,11 @@ public:
       int pageSize, int tileTokens,
       int defaultStages);
 
-  // Estimate occupancy given num_stages and per-block resource usage
+  // Estimate occupancy given num_stages, per-block SMEM usage, registers per
+  // thread, and num_warps per CTA.  num_warps defaults to 4 for backward
+  // compatibility; callers that select num_warps (e.g. P11) should pass it.
   static double estimateOccupancy(int numStages, int64_t smemPerBlock,
-                                  int regsPerThread);
+                                  int regsPerThread, int numWarps = 4);
 
   // Get human-readable GPU name for logging
   static std::string getGPUName();

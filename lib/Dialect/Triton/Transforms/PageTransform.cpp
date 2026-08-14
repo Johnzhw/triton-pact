@@ -396,9 +396,12 @@ struct PageTransformPass
         int64_t divisor = constOp.value();
         // PAGE_SIZE is typically 16, 32, 64, 128
         if (divisor == 16 || divisor == 32 || divisor == 64 || divisor == 128) {
-          // Verify: divsi result used for block_table indexing
+          // Verify: divsi result used for block_table indexing.
+          // M7a fix: prefill kernels feed page_idx directly into tt.addptr
+          // (block_table_ptr + page_idx) rather than through arith.addi/muli
+          // (which decode kernels use for bt_offset = token_idx*max_blocks + page_idx).
           for (auto *user : divOp->getUsers()) {
-            if (isa<arith::AddIOp, arith::MulIOp>(user)) {
+            if (isa<arith::AddIOp, arith::MulIOp, triton::AddPtrOp>(user)) {
               hasDivsiPattern = true;
               return WalkResult::interrupt();
             }

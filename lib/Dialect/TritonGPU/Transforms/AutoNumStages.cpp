@@ -195,8 +195,10 @@ struct PACTAutoNumStagesPass
     if (sm.smVersion >= 90)
       defaultStages = sm.optimalNumStages; // 5 on Hopper
 
-    // Check for existing attribute
-    if (auto attr = mod->getAttrOfType<mlir::IntegerAttr>("ttg.num-stages"))
+    // Bug9 fix: read the canonical num_stages attribute name.  kNumStagesAttrName
+    // is "tt.num_stages" (PipeliningUtility.h); "ttg.num-stages" (hyphen) never
+    // existed, so this read always fell back to the hardcoded defaultStages=3.
+    if (auto attr = mod->getAttrOfType<mlir::IntegerAttr>("tt.num_stages"))
       defaultStages = attr.getInt();
 
     mod.walk([&](scf::ForOp forOp) {
@@ -239,11 +241,12 @@ struct PACTAutoNumStagesPass
         return WalkResult::advance();
       }
 
-      // Set as loop attribute so pipeline pass picks it up.
+      // Set as loop attribute so pipeline pass picks it up.  Bug9: Triton only
+      // consumes "tt.num_stages" (kNumStagesAttrName); "ttg.num_stages" was a
+      // redundant write that no consumer reads, so drop it.
       auto stagesAttr = mlir::IntegerAttr::get(
           mlir::IntegerType::get(&getContext(), 32), optimal);
       forOp->setAttr("tt.num_stages", stagesAttr);
-      forOp->setAttr("ttg.num_stages", stagesAttr);
 
       // Also write to module attribute for compiler.py fallback
       mod->setAttr("pact.optimal_num_stages",

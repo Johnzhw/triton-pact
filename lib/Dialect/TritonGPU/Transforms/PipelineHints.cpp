@@ -55,7 +55,12 @@ static int64_t estimateTripCount(scf::ForOp forOp) {
     if (step > 0)
       return (upperVal - lowerVal) / step;
   }
-  return 128; // conservative default
+  // Bug5 fix: runtime-bound loops (num_tiles = cdiv(seq_len, TILE_SIZE)) cannot
+  // be statically resolved.  The old hardcoded 128 always classified these as
+  // "long sequence", defeating P6's short/medium/long heuristic.  Return a
+  // "medium" default so P6 keeps the default num_stages instead of
+  // over-committing to a pipeline that a short decode sequence cannot amortize.
+  return 64; // medium-sequence default (was 128 = always "long")
 }
 
 // Get total elements in a ranked tensor
@@ -87,14 +92,18 @@ struct PACTPipelineHintsPass
       if (pagedLoads.empty())
         return WalkResult::advance();
 
-      // Get page_size
+      // Bug2 fix: P1 writes pact.page_size on the load op (and module), NOT on
+      // the scf.for's parent (the function op).  Read it from the first paged
+      // load first (always correct), then fall back to the module.
       int64_t pageSize = 16;
-      if (auto attr = forOp->getParentOp()->getAttrOfType<mlir::IntegerAttr>(
-              "pact.page_size")) {
-        pageSize = attr.getInt();
-      }
-      if (pageSize <= 0 && !pagedLoads.empty()) {
+      if (!pagedLoads.empty()) {
         if (auto attr = pagedLoads[0]->getAttrOfType<mlir::IntegerAttr>(
+                "pact.page_size")) {
+          pageSize = attr.getInt();
+        }
+      }
+      if (pageSize <= 0) {
+        if (auto attr = forOp->getParentOp()->getAttrOfType<mlir::IntegerAttr>(
                 "pact.page_size")) {
           pageSize = attr.getInt();
         }

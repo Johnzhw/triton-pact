@@ -21,7 +21,9 @@
 #include "mlir/IR/BuiltinTypes.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
+#include "triton/Dialect/TritonGPU/IR/LinearLayoutConversions.h"
 #include "triton/Dialect/TritonGPU/Transforms/Passes.h"
+#include "triton/Dialect/TritonGPU/Transforms/PipeliningUtility.h"
 #include "triton/Support/PactSMDetect.h"
 
 #include "llvm/Support/Debug.h"
@@ -204,6 +206,7 @@ struct PACTAutoNumStagesPass
     mod.walk([&](scf::ForOp forOp) {
       // Check if this loop has paged loads (via P4 hints)
       int64_t tileBytes = 0;
+      int64_t exactSMEMBytes = 0; // M9c: swizzled shared footprint (with padding)
       int estIterations = 128;
       int pageSize = 16;
       int tileTokens = 16;
@@ -214,6 +217,19 @@ struct PACTAutoNumStagesPass
                 "pact.hint.tile_bytes")) {
           hasPagedLoad = true;
           tileBytes = std::max(tileBytes, hint.getInt());
+          // M9c: compute the exact shared-memory footprint (including swizzle
+          // padding) from the swizzled shared encoding that the Pipeline pass
+          // will use for this load (dot operands → swizzled, else {1,1,1}).
+          if (auto loadOp = dyn_cast<triton::LoadOp>(op)) {
+            auto ty = dyn_cast<RankedTensorType>(loadOp.getResult().getType());
+            if (ty && ty.getEncoding()) {
+              auto sharedEnc = mlir::triton::getSharedEncoding(loadOp);
+              auto ll = triton::gpu::toLinearLayout(ty.getShape(), sharedEnc);
+              int64_t footprint =
+                  ll.getTotalInDimSize() * (ty.getElementTypeBitWidth() / 8);
+              exactSMEMBytes = std::max(exactSMEMBytes, footprint);
+            }
+          }
         }
         if (auto hint = op->getAttrOfType<mlir::IntegerAttr>(
                 "pact.hint.estimated_iterations"))
@@ -228,6 +244,17 @@ struct PACTAutoNumStagesPass
 
       if (!hasPagedLoad)
         return WalkResult::advance();
+
+      // M9c: prefer the exact swizzled footprint (with padding) over the raw
+      // tileBytes estimate; fall back to tileBytes when the layout is unknown.
+      int64_t rawTileBytes = tileBytes;
+      if (exactSMEMBytes > 0) {
+        tileBytes = exactSMEMBytes;
+        llvm::errs() << "[PACT P6 M9c] SMEM footprint: raw tileBytes="
+                     << rawTileBytes << "B → exact swizzled=" << exactSMEMBytes
+                     << "B (padding=" << (exactSMEMBytes - rawTileBytes)
+                     << "B)\n";
+      }
 
       int optimal = computeOptimalNumStages(tileBytes, estIterations,
                                             pageSize, tileTokens,

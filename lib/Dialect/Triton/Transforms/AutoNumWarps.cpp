@@ -12,6 +12,7 @@
 #include "mlir/IR/BuiltinTypes.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/Triton/Transforms/Passes.h"
+#include "triton/Support/PactSMDetect.h"
 
 #include "llvm/Support/Debug.h"
 #include "llvm/Support/raw_ostream.h"
@@ -64,11 +65,22 @@ struct PACTAutoNumWarpsPass
         hasDot = true;
     });
 
-    // Conservative heuristic: keep 4 warps unless strong reason
+    // M5c: occupancy-aware warp selection via SMDetector (was a hardcoded
+    // `numPagedLoads >= 4 → 2 warps` heuristic).  Use estimateOccupancy with the
+    // numWarps parameter (M0c) to compare warps=2 vs warps=4.  Only drop to 2
+    // warps when occupancy improves substantially AND there is warp contention
+    // (many paged loads), so register/warp pressure is the binding constraint.
     int optimalWarps = 4;
-    if (numPagedLoads >= 4) {
-      // Many paged loads → reduce warp contention
-      optimalWarps = 2;
+    if (numPagedLoads >= 4 && maxTileBytes > 0) {
+      double occ4 =
+          pact::SMDetector::estimateOccupancy(/*numStages=*/3, maxTileBytes,
+                                              /*regsPerThread=*/64, /*numWarps=*/4);
+      double occ2 =
+          pact::SMDetector::estimateOccupancy(/*numStages=*/3, maxTileBytes,
+                                              /*regsPerThread=*/64, /*numWarps=*/2);
+      if (occ2 > occ4 * 1.3) {
+        optimalWarps = 2; // occupancy gain >30% → worth reducing warps
+      }
     }
 
     // Write recommendation to module attribute

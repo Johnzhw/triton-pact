@@ -2,6 +2,7 @@
 #include "triton/Support/PactSMDetect.h"
 #include "mlir/Analysis/DataFlowFramework.h"
 #include "mlir/Dialect/UB/IR/UBOps.h"
+#include "mlir/IR/BuiltinOps.h"
 #include "triton/Dialect/Gluon/IR/Dialect.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/Triton/IR/Utility.h"
@@ -397,6 +398,15 @@ static OverrideStrategy getOverrideStrategy(triton::LoadOp loadOp, int dim,
     // and totalBytes typically stays below the 128B threshold.
     // ═══════════════════════════════════════════════════════
     int64_t ampereCap = getAmpereContiguityCap();
+    // M7b: prefill (chunked prefill) is compute-bound, so cp.async overhead is
+    // amortized by the matmul compute — allow a larger contiguity cap (2×, up to
+    // 64) to expose wider vectorization.  Decode stays conservative (cap).
+    if (auto mod = loadOp->getParentOfType<ModuleOp>()) {
+      if (auto ktype = mod->getAttrOfType<StringAttr>("pact.kernel_type")) {
+        if (ktype.getValue() == "prefill_paged")
+          ampereCap = std::min(ampereCap * 2, (int64_t)64);
+      }
+    }
 
     if (staticallySafe && pageLocalContiguity >= 4) {
       // Static safe → use ampereCap as the contiguity ceiling

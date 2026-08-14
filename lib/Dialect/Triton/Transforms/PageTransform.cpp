@@ -381,12 +381,14 @@ struct PageTransformPass
   enum class KernelType {
     Unknown,
     DecodePagedAttention,  // confirmed decode paged attention kernel
-    PrefillAttention,      // prefill kernel — skip PACT optimization
+    PrefillPagedAttention, // prefill kernel that also uses block_table (chunked prefill)
+    PrefillAttention,      // prefill kernel without paged access — skip PACT
     MixedPagedAccess       // has paged access but uncertain type
   };
 
   static KernelType classifyKernel(ModuleOp mod) {
     bool hasDivsiPattern = false;
+    bool hasAddptrPageIndex = false; // page_idx feeds tt.addptr directly (prefill)
     bool hasBlockTableParam = false;
     bool has2DKVLoad = false;
 
@@ -400,7 +402,10 @@ struct PageTransformPass
           // M7a fix: prefill kernels feed page_idx directly into tt.addptr
           // (block_table_ptr + page_idx) rather than through arith.addi/muli
           // (which decode kernels use for bt_offset = token_idx*max_blocks + page_idx).
+          // M7b: direct addptr indexing is the prefill signal.
           for (auto *user : divOp->getUsers()) {
+            if (isa<triton::AddPtrOp>(user))
+              hasAddptrPageIndex = true;
             if (isa<arith::AddIOp, arith::MulIOp, triton::AddPtrOp>(user)) {
               hasDivsiPattern = true;
               return WalkResult::interrupt();
@@ -442,6 +447,12 @@ struct PageTransformPass
     });
 
     // Joint decision
+    // M7b: prefill paged attention feeds page_idx directly into tt.addptr
+    // (block_table_ptr + page_idx), unlike decode which computes bt_offset via
+    // arith.addi first.  Classify it as PrefillPagedAttention so P3 can apply
+    // prefill-specific (larger) contiguity caps.
+    if (hasDivsiPattern && hasAddptrPageIndex)
+      return KernelType::PrefillPagedAttention;
     if (hasDivsiPattern && hasBlockTableParam)
       return KernelType::DecodePagedAttention;
     if (hasDivsiPattern && !hasBlockTableParam)
@@ -466,7 +477,12 @@ struct PageTransformPass
       return;
     }
 
-    if (ktype == KernelType::DecodePagedAttention) {
+    if (ktype == KernelType::PrefillPagedAttention) {
+      mod->setAttr("pact.kernel_type",
+                   StringAttr::get(mod.getContext(), "prefill_paged"));
+      llvm::errs() << "[PACT P1] Prefill paged attention kernel identified "
+                      "(chunked prefill with block_table).\n";
+    } else if (ktype == KernelType::DecodePagedAttention) {
       mod->setAttr("pact.kernel_type",
                    StringAttr::get(mod.getContext(), "decode_paged"));
       llvm::errs() << "[PACT P1] Decode paged attention kernel identified.\n";

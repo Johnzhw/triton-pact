@@ -14,6 +14,7 @@
 #include "mlir/IR/Value.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/Triton/Transforms/Passes.h"
+#include "triton/Tools/LinearLayout.h"
 
 #include "llvm/Support/Debug.h"
 #include "llvm/Support/raw_ostream.h"
@@ -38,6 +39,43 @@ namespace {
 static bool isEnabled() {
   const char *env = std::getenv("PACT_ENABLE_PAGE_LOCAL_ANALYSIS");
   return !env || std::string(env) != "0";
+}
+
+static bool isPowerOf2(int64_t n) { return n > 0 && (n & (n - 1)) == 0; }
+
+// M9: construct the *page-internal memory layout* as an F₂-linear layout.
+//
+// A paged KV cache page stores [pageSize tokens × headDim elements] contiguously
+// in memory:  offset(token_in_page, head_idx) = token_in_page * headDim + head_idx.
+// This is a *memory* layout (address computation), NOT a register layout — it
+// does not depend on the TTGIR register encoding, so it is constructible at the
+// TTIR layer.  In F₂ terms:
+//   - head_idx basis i  → offset = i          (stride 1: contiguous)
+//   - token_in_page basis j → offset = j*headDim (stride headDim: not contiguous)
+// getNumConsecutiveInOut() then returns the exact page-bounded memory contiguity
+// along head_idx (= headDim), independent of whether the tile crosses a page
+// boundary (which only concerns the token dimension).
+//
+// This replaces PACT's semantic heuristic for pageLocalContiguity with an exact
+// F₂-linear computation.  headDim/pageSize must be powers of two (LinearLayout
+// requirement); callers guard with isPowerOf2 and fall back otherwise.
+static LinearLayout buildPagedMemoryLayout(int64_t headDim, int64_t pageSize,
+                                           MLIRContext *ctx) {
+  auto headIdx = StringAttr::get(ctx, "head_idx");
+  auto tokenInPage = StringAttr::get(ctx, "token_in_page");
+  auto offset = StringAttr::get(ctx, "offset");
+
+  std::vector<std::vector<int32_t>> headBases;
+  for (int32_t i = 1; i < headDim; i *= 2)
+    headBases.push_back({i}); // stride 1
+
+  std::vector<std::vector<int32_t>> tokenBases;
+  for (int32_t j = 1; j < pageSize; j *= 2)
+    tokenBases.push_back({(int32_t)(j * headDim)}); // stride headDim
+
+  std::vector<std::pair<StringAttr, std::vector<std::vector<int32_t>>>> bases = {
+      {headIdx, headBases}, {tokenInPage, tokenBases}};
+  return LinearLayout(bases, {offset});
 }
 
 // Bug1 fix: deep-trace an offset value back to remsi(PAGE_SIZE), penetrating
@@ -134,10 +172,6 @@ struct PageLocalAnalysisPass
       if (auto attr = loadOp->getAttrOfType<IntegerAttr>("pact.tile_tokens"))
         tileTokens = attr.getInt();
 
-      int64_t headDimIdx = 1;
-      if (auto attr = loadOp->getAttrOfType<IntegerAttr>("pact.head_dim_idx"))
-        headDimIdx = attr.getInt();
-
       int64_t headSize = 64;
       if (auto attr = loadOp->getAttrOfType<IntegerAttr>("pact.head_dim_size"))
         headSize = attr.getInt();
@@ -205,27 +239,21 @@ struct PageLocalAnalysisPass
         // Additional check: tileTokens % pageSize == 0 is the old heuristic
       }
 
-      // === Step 3: compute pageLocalContiguity ===
-      auto resultTy = cast<RankedTensorType>(loadOp.getResult().getType());
-      int64_t headDimElements = 1;
-      if (headDimIdx < (int64_t)resultTy.getShape().size())
-        headDimElements = resultTy.getShape()[headDimIdx];
-
-      int64_t pageLocalContiguity = 1;
-
-      if (staticallySafe) {
-        // Static proof: tile does not cross page boundary
-        // All head_dim elements within a tile are physically contiguous
-        pageLocalContiguity = headSize;
-      } else {
-        // Conservative: head_dim elements are contiguous within a page,
-        // but cannot guarantee full tile coverage
-        pageLocalContiguity = std::min(headSize, headDimElements);
-        // Further constrain: if pageSize < tileTokens, page boundary may
-        // cut within the tile
-        if (pageSize > 0 && pageSize < tileTokens) {
-          pageLocalContiguity = std::min(pageLocalContiguity, pageSize);
-        }
+      // === Step 3: compute pageLocalContiguity (M9: exact via Paged Linear Layout) ===
+      // The head_idx dimension within a page is always stride-1 (contiguous),
+      // so its memory contiguity is exactly headSize — independent of whether
+      // the tile crosses a page boundary (which only concerns the *token*
+      // dimension).  The old code capped pageLocalContiguity at pageSize when
+      // pageSize < tileTokens, wrongly applying a token-dimension bound to the
+      // head_dim contiguity.
+      //
+      // M9: compute this exactly from the page-internal memory layout expressed
+      // as an F₂-linear layout, instead of the semantic staticallySafe branch.
+      int64_t pageLocalContiguity = headSize; // fallback (non-power-of-2)
+      if (isPowerOf2(headSize) && isPowerOf2(pageSize)) {
+        pageLocalContiguity =
+            buildPagedMemoryLayout(headSize, pageSize, &getContext())
+                .getNumConsecutiveInOut();
       }
 
       // === Step 4: compute max safe vector width ===

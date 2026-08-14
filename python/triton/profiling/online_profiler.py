@@ -22,12 +22,19 @@ from typing import Callable, Dict, List, Optional, Tuple
 
 import torch
 
-# Try Proton API (lightweight CUPTI-based profiling)
+# Try Proton API (lightweight CUPTI-based profiling).
+# M8a: triton.profiler has no Proton *class* (it exports a functional API), so
+# use ProtonAdapter to bridge functional -> OOP.  Fall back to the raw import if
+# ProtonAdapter is unavailable.
 try:
-    from triton.profiler import Proton
+    from triton.profiling.proton_adapter import ProtonAdapter as Proton
     HAS_PROTON = True
 except ImportError:
-    HAS_PROTON = False
+    try:
+        from triton.profiler import Proton
+        HAS_PROTON = True
+    except ImportError:
+        HAS_PROTON = False
 
 
 @dataclass
@@ -106,11 +113,17 @@ class OnlineProfiler:
         self._start_background_analysis()
 
     def _init_proton(self):
-        """Initialize Proton CUPTI profiler."""
+        """Initialize Proton CUPTI profiler (via ProtonAdapter)."""
         try:
             self._proton = Proton()
+            if not self._proton.available:
+                print("[PACT OnlineProfiler] Proton adapter not available, "
+                      "using CUDA event fallback.")
+                self.enable_cupti = False
+                return
             self._proton.start()
-            print("[PACT OnlineProfiler] Proton CUPTI profiler initialized.")
+            print("[PACT OnlineProfiler] Proton CUPTI profiler initialized "
+                  "(shadow mode, adapter).")
         except Exception as e:
             print(f"[PACT OnlineProfiler] Proton init failed: {e}")
             self.enable_cupti = False

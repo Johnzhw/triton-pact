@@ -633,9 +633,16 @@ struct PageTransformPass
         loadOp->setAttr("pact.seq_dim_idx",
             IntegerAttr::get(i64Ty, seqDim));
 
-        // page_boundary_safe: static proof that tile doesn't cross page boundary
-        // True when tile size is an exact multiple of page size
-        if (tileTokens > 0 && pageSize > 0 && tileTokens % pageSize == 0) {
+        // Bug6 fix: page_boundary_safe is a *conservative fallback* used only
+        // when P2 cannot trace the remsi offset.  The tile is guaranteed not to
+        // cross a page boundary iff it is page-aligned: pageSize % tileTokens
+        // == 0 (block_offset = token_start % pageSize is a multiple of
+        // tileTokens, since token_start = tile_idx * tileTokens) OR
+        // tileTokens % pageSize == 0 (block_offset ≡ 0).  The old
+        // `tileTokens % pageSize == 0` missed the pageSize%tileTokens==0 case
+        // (P=64: 16%64 != 0 → wrongly unsafe).
+        if (tileTokens > 0 && pageSize > 0 &&
+            (pageSize % tileTokens == 0 || tileTokens % pageSize == 0)) {
           loadOp->setAttr("pact.page_boundary_safe",
               BoolAttr::get(&getContext(), true));
         }

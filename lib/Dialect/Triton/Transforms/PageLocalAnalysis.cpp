@@ -40,6 +40,67 @@ static bool isEnabled() {
   return !env || std::string(env) != "0";
 }
 
+// Bug1 fix: deep-trace an offset value back to remsi(PAGE_SIZE), penetrating
+// the intermediate arithmetic/type-cast/broadcast ops that sit between the
+// addptr offset and the remsi in real paged-attention IR.
+//   block_offset = remsi(token_start, PAGE_SIZE)
+//                 → extsi → addi/muli → splat/broadcast/expand_dims → addptr
+// The old code only inspected the *direct* offset operand of addptr, so it
+// never found the remsi and always fell back to P1's page_boundary_safe.
+static bool traceToRemSIOp(Value val, int64_t pageSize, int maxDepth) {
+  if (maxDepth <= 0)
+    return false;
+
+  auto *defOp = val.getDefiningOp();
+  if (!defOp)
+    return false;
+
+  // Direct hit: remsi(_, PAGE_SIZE)
+  if (auto remOp = dyn_cast<arith::RemSIOp>(defOp)) {
+    if (auto constOp =
+            remOp.getRhs().template getDefiningOp<arith::ConstantIntOp>()) {
+      if (constOp.value() == pageSize)
+        return true;
+    }
+  }
+
+  auto name = defOp->getName().getStringRef();
+
+  // Penetrate integer casts: extsi/extui/trunci → operand 0
+  if (name == "arith.extsi" || name == "arith.extui" ||
+      name == "arith.trunci") {
+    if (defOp->getNumOperands() >= 1)
+      return traceToRemSIOp(defOp->getOperand(0), pageSize, maxDepth - 1);
+    return false;
+  }
+
+  // Penetrate addi/muli on the non-constant side
+  if ((name == "arith.addi" || name == "arith.muli") &&
+      defOp->getNumOperands() == 2) {
+    bool lhsConst =
+        defOp->getOperand(0).template getDefiningOp<arith::ConstantOp>() !=
+        nullptr;
+    bool rhsConst =
+        defOp->getOperand(1).template getDefiningOp<arith::ConstantOp>() !=
+        nullptr;
+    if (lhsConst && !rhsConst)
+      return traceToRemSIOp(defOp->getOperand(1), pageSize, maxDepth - 1);
+    if (!lhsConst && rhsConst)
+      return traceToRemSIOp(defOp->getOperand(0), pageSize, maxDepth - 1);
+    return false;
+  }
+
+  // Penetrate splat/broadcast/expand_dims → operand 0
+  if (name == "tt.splat" || name == "tt.broadcast" ||
+      name == "tt.expand_dims") {
+    if (defOp->getNumOperands() >= 1)
+      return traceToRemSIOp(defOp->getOperand(0), pageSize, maxDepth - 1);
+    return false;
+  }
+
+  return false;
+}
+
 struct PageLocalAnalysisPass
     : public impl::PACTPageLocalAnalysisBase<PageLocalAnalysisPass> {
 
@@ -96,20 +157,21 @@ struct PageLocalAnalysisPass
         auto name = defOp->getName().getStringRef();
         if (name == "tt.addptr") {
           Value offset = defOp->getOperand(1);
-          // Check if offset comes from remsi(PAGE_SIZE)
+          // Bug1 fix: check the direct remsi(PAGE_SIZE) operand first, then
+          // deep-trace through extsi/addi/muli/splat/broadcast/expand_dims.
+          bool directRem = false;
           if (auto remOp = offset.getDefiningOp<arith::RemSIOp>()) {
             if (auto constOp = remOp.getRhs()
                     .template getDefiningOp<arith::ConstantIntOp>()) {
               if (constOp.value() == pageSize) {
-                // Found block_offset = token_start % PAGE_SIZE
-                // Try to get the lhs (token_start) to determine actual offset
-                Value tokenStart = remOp.getLhs();
-                // For now, mark that we found the pattern
-                // block_offset is runtime but we know it's in [0, pageSize)
-                foundBlockOffset = true;
-                break;
+                directRem = true;
               }
             }
+          }
+          if (directRem || traceToRemSIOp(offset, pageSize, /*maxDepth=*/6)) {
+            // block_offset = token_start % PAGE_SIZE ∈ [0, pageSize)
+            foundBlockOffset = true;
+            break;
           }
           // Continue tracing the base pointer
           ptr = defOp->getOperand(0);
@@ -126,17 +188,14 @@ struct PageLocalAnalysisPass
       }
 
       if (foundBlockOffset) {
-        // We know the tile starts at some offset within [0, pageSize)
-        // but the exact offset is runtime. Conservatively:
-        // staticallySafe only if tile fits in page regardless of offset.
-        // That means: pageSize - (max possible offset) >= tileTokens
-        // Worst case: offset = pageSize - 1 → never safe
-        // Best case: offset = 0 → safe if tileTokens <= pageSize
-        //
-        // Practical heuristic: if tileTokens <= pageSize/2, the tile
-        // is very likely to fit entirely within a page for most offsets.
-        // We mark it statically safe only if it CAN'T cross a boundary:
-        staticallySafe = (tileTokens <= pageSize / 2);
+        // Tile starts at token_start = tile_idx * tileTokens, so block_offset =
+        // token_start % pageSize is tile-aligned.  The tile is guaranteed not to
+        // cross a page boundary iff it is page-aligned:
+        //   pageSize % tileTokens == 0  → block_offset ∈ {0, TILE, 2·TILE, …},
+        //     tile ends exactly at the page boundary.
+        //   tileTokens % pageSize == 0  → block_offset ≡ 0 (tile ≡ page).
+        staticallySafe =
+            (pageSize % tileTokens == 0 || tileTokens % pageSize == 0);
       } else {
         // Fallback: use P1's page_boundary_safe attribute
         if (auto attr = loadOp->getAttrOfType<BoolAttr>(

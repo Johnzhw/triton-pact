@@ -286,6 +286,17 @@ static OverrideStrategy getOverrideStrategy(triton::LoadOp loadOp, int dim,
   if (!loadOp->hasAttr("pact.paged_load"))
     return OverrideStrategy::NoOverride;
 
+  // Guard 1.5 (Bug8 fix): only override the head_dim dimension.  The token/seq
+  // dimension is page-strided (stride=head_dim, block_table indirection), NOT
+  // memory-contiguous, so it must keep AxisInfo's original inference
+  // (contiguity=1).  Without this guard, P3 overrode both dims and Coalesce
+  // could wrongly vectorize across page-strided tokens.
+  int64_t headDimIdx = 1;
+  if (auto hd = loadOp->getAttrOfType<IntegerAttr>("pact.head_dim_idx"))
+    headDimIdx = hd.getInt();
+  if (dim != headDimIdx)
+    return OverrideStrategy::NoOverride;
+
   // Guard 2: AxisInfo override global switch
   if (!isPactAxisInfoOverrideEnabled())
     return OverrideStrategy::NoOverride;

@@ -114,7 +114,11 @@ struct PACTPipelineHintsPass
       for (auto loadOp : pagedLoads) {
         auto resultTy = cast<RankedTensorType>(loadOp.getResult().getType());
         int64_t totalElements = getTotalElements(resultTy);
-        int64_t totalBytes = totalElements * 2; // f16
+        // M9c: derive element width from the tensor type instead of hardcoding
+        // the f16 width (2 bytes) — otherwise f32 (4B) paged loads would
+        // under-estimate SMEM by 2×.
+        int64_t totalBytes =
+            totalElements * (resultTy.getElementTypeBitWidth() / 8);
 
         int64_t tileTokens = 16;
         if (auto attr = loadOp->getAttrOfType<mlir::IntegerAttr>(

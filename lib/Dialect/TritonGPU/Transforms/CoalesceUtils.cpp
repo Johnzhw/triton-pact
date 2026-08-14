@@ -3,6 +3,7 @@
 #include "triton/Dialect/TritonGPU/Transforms/CoalesceUtils.h"
 #include "mlir/Support/LLVM.h"
 #include "triton/Analysis/AxisInfo.h"
+#include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/Triton/IR/Utility.h"
 #include "triton/Dialect/TritonGPU/Transforms/Utility.h"
 #include "triton/Tools/StrUtil.h"
@@ -75,6 +76,29 @@ buildCoalescedEncoding(ModuleAxisInfoAnalysis &axisInfoAnalysis, Operation *op,
 
   perThread = std::min<int>(perThread, std::max(numElems / numThreads, 1));
   LDBG("perThread: " << perThread);
+
+  // PACT M2: for paged loads, override perThread with P2's exact page-safe
+  // vector width.  AxisInfo's divisibility stays low because the block_table
+  // offset chain breaks divisibility inference, even though in-page head_dim
+  // elements are page-aligned and contiguous.  P2 (PageLocalAnalysis) computed
+  // the semantically-safe width (pact.pagelocal.safe_vector_width, ≤8 for f16).
+  // Only boost (never shrink) Coalesce's own decision, and re-clamp to the
+  // 128-bit hardware max and the per-CTA element budget.
+  if (auto loadOp = dyn_cast<triton::LoadOp>(op)) {
+    if (auto safeVec = loadOp->getAttrOfType<IntegerAttr>(
+            "pact.pagelocal.safe_vector_width")) {
+      int64_t safeVecWidth = safeVec.getInt();
+      if (safeVecWidth > (int64_t)perThread) {
+        perThread = (unsigned)safeVecWidth;
+        unsigned elemNumBits = getElementBitWidth(refTensorType);
+        perThread = std::min<unsigned>(perThread, 128 / elemNumBits);
+        perThread =
+            std::min<unsigned>(perThread, std::max(numElems / numThreads, 1));
+        LDBG("PACT M2: perThread override -> " << perThread
+             << " (safe_vector_width=" << safeVecWidth << ")");
+      }
+    }
+  }
 
   if (!dyn_cast<triton::LoadOp>(op)) {
     // For ops that can result in a global memory write, we should enforce

@@ -171,8 +171,14 @@ SMResources resourcesForAMD(const std::string &arch) {
     return amd(/*waveSize=*/64, /*ldsPerCU=*/64 * 1024);
   if (arch == "gfx950" || arch == "gfx1250")
     return amd(/*waveSize=*/32, /*ldsPerCU=*/64 * 1024);
-  if (arch == "gfx936")
+  if (arch == "gfx936") {
+    // Hygon DCU BW150 / DTK 25.04.04 (gfx936-class).  Official per-SKU
+    // capacity parameters (CU count, LDS size, VGPR/AGPR layout, matrix-core
+    // shapes) must be filled from Hygon DTK 25.04.04 documents and the real
+    // device properties; until then use the conservative wave64 table so the
+    // compiler never over-commits occupancy.
     return amd(/*waveSize=*/64, /*ldsPerCU=*/64 * 1024);
+  }
 
   llvm::errs() << "[PACT SMDetect] WARNING: AMD target '" << arch
                << "' has no resource table — using conservative fallback.\n";

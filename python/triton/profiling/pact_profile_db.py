@@ -43,6 +43,7 @@ class PactProfileDB:
 
     def put(self, key: str, facts: Dict[str, Any]) -> None:
         with self._lock:
+            self.db_dir.mkdir(parents=True, exist_ok=True)
             data = self._read()
             entry = dict(data.get(key, {}))
             entry.update(facts)

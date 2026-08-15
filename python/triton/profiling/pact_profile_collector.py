@@ -129,7 +129,8 @@ from triton.profiler import start, finalize
 from triton.profiler import mode
 from kernels.pact_optimization_target import run_pact_target
 s = start({str(trace_path.with_suffix(''))!r}, data='trace', backend='instrumentation',
-          mode=mode.Default(optimizations='clock32,time_shift'))
+          mode=mode.Default(optimizations='clock32,time_shift',
+                            buffer_type='global', buffer_size=65536))
 torch.cuda.synchronize()
 start_ev = torch.cuda.Event(enable_timing=True); end_ev = torch.cuda.Event(enable_timing=True)
 start_ev.record()

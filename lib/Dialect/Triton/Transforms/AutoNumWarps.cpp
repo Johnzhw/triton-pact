@@ -80,9 +80,9 @@ struct PACTAutoNumWarpsPass
             mod->getAttrOfType<IntegerAttr>("pact.pgo.regs_per_thread"))
       pgoRegsPerThread = attr.getInt();
     double pgoActiveWarpRatio = -1.0;
-    if (auto attr =
-            mod->getAttrOfType<FloatAttr>("pact.pgo.active_warp_ratio"))
-      pgoActiveWarpRatio = attr.getValueAsDouble();
+    if (auto attr = mod->getAttrOfType<IntegerAttr>(
+            "pact.pgo.active_warp_ratio_permille"))
+      pgoActiveWarpRatio = attr.getInt() / 1000.0;
 
     int optimalWarps = 4;
     if (numPagedLoads >= 4 && maxTileBytes > 0) {

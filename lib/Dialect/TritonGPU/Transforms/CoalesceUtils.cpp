@@ -1,11 +1,14 @@
 
 
 #include "triton/Dialect/TritonGPU/Transforms/CoalesceUtils.h"
+#include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/Support/LLVM.h"
 #include "triton/Analysis/AxisInfo.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/Triton/IR/Utility.h"
+#include "triton/Dialect/TritonGPU/IR/LinearLayoutConversions.h"
 #include "triton/Dialect/TritonGPU/Transforms/Utility.h"
+#include "triton/Tools/LinearLayout.h"
 #include "triton/Tools/StrUtil.h"
 #include "llvm/Support/Debug.h"
 
@@ -77,25 +80,63 @@ buildCoalescedEncoding(ModuleAxisInfoAnalysis &axisInfoAnalysis, Operation *op,
   perThread = std::min<int>(perThread, std::max(numElems / numThreads, 1));
   LDBG("perThread: " << perThread);
 
-  // PACT M2: for paged loads, override perThread with P2's exact page-safe
-  // vector width.  AxisInfo's divisibility stays low because the block_table
-  // offset chain breaks divisibility inference, even though in-page head_dim
-  // elements are page-aligned and contiguous.  P2 (PageLocalAnalysis) computed
-  // the semantically-safe width (pact.pagelocal.safe_vector_width, ≤8 for f16).
-  // Only boost (never shrink) Coalesce's own decision, and re-clamp to the
-  // 128-bit hardware max and the per-CTA element budget.
+  // PACT M2/B1: for paged loads compute the exact sound vectorization width
+  //   V = min(mem_contig, reg_contig)
+  // mem_contig comes from P2's F₂ page-internal memory layout; reg_contig comes
+  // from the register layout LinearLayout with head_dim made the most-minor
+  // output dimension.  V is clamped to the 128-bit hardware maximum and the
+  // per-CTA element budget.
   if (auto loadOp = dyn_cast<triton::LoadOp>(op)) {
-    if (auto safeVec = loadOp->getAttrOfType<IntegerAttr>(
-            "pact.pagelocal.safe_vector_width")) {
-      int64_t safeVecWidth = safeVec.getInt();
-      if (safeVecWidth > (int64_t)perThread) {
-        perThread = (unsigned)safeVecWidth;
+    if (loadOp->hasAttr("pact.paged_load")) {
+      int64_t headDimIdx = 1;
+      if (auto hd = loadOp->getAttrOfType<IntegerAttr>(
+              "pact.head_dim_idx"))
+        headDimIdx = hd.getInt();
+
+      int64_t memContig = 1;
+      if (auto attr = loadOp->getAttrOfType<DenseI64ArrayAttr>(
+              "pact.pagelocal.dim_contiguity")) {
+        if (headDimIdx >= 0 && headDimIdx < (int)attr.size())
+          memContig = attr[headDimIdx];
+      }
+
+      if (memContig > 1) {
         unsigned elemNumBits = getElementBitWidth(refTensorType);
-        perThread = std::min<unsigned>(perThread, 128 / elemNumBits);
-        perThread =
-            std::min<unsigned>(perThread, std::max(numElems / numThreads, 1));
-        LDBG("PACT M2: perThread override -> " << perThread
-             << " (safe_vector_width=" << safeVecWidth << ")");
+        int64_t memCap =
+            std::min(memContig, (int64_t)(128 / elemNumBits));
+        memCap = std::min(memCap, std::max<int64_t>(numElems / numThreads, 1));
+
+        // Build the *candidate* blocked layout that Coalesce is about to emit
+        // and compute its register-side contiguity with head_dim made the
+        // most-minor output dimension.  Using the pre-Coalesce encoding is
+        // wrong: its sizePerThread is the input layout's, not the vectorized
+        // candidate's.
+        SmallVector<unsigned> candidateSizePerThread(refTensorType.getRank(),
+                                                     1);
+        candidateSizePerThread[order[0]] = (unsigned)memCap;
+        auto candidateEnc = BlockedEncodingAttr::get(
+            op->getContext(), refTensorType.getShape(), candidateSizePerThread,
+            order, numWarps, threadsPerWarp, cgaLayout);
+        auto regLL = triton::gpu::toLinearLayout(refTensorType.getShape(),
+                                                 candidateEnc);
+        auto outNames = llvm::to_vector(regLL.getOutDimNames());
+        int64_t regContig = 1;
+        if (headDimIdx >= 0 && headDimIdx < (int)outNames.size()) {
+          SmallVector<StringAttr> headFirstOrder;
+          headFirstOrder.push_back(outNames[headDimIdx]);
+          for (int i = 0; i < (int)outNames.size(); ++i)
+            if (i != headDimIdx)
+              headFirstOrder.push_back(outNames[i]);
+          auto headFirst = regLL.transposeOuts(headFirstOrder).flattenOuts();
+          regContig = headFirst.getNumConsecutiveInOut();
+        }
+
+        int64_t exactV = std::min(memCap, regContig);
+        perThread = (unsigned)std::max<int64_t>(exactV, 1);
+        LDBG("PACT M2 exact V: perThread -> " << perThread
+             << " (memContig=" << memContig
+             << ", memCap=" << memCap
+             << ", regContig=" << regContig << ")");
       }
     }
   }

@@ -266,30 +266,18 @@ struct PageLocalAnalysisPass
                               .getNumConsecutiveInOut();
       }
 
-      // === Step 4: compute max safe vector width (transitional until M2/B1
-      // computes the exact V = min(mem_contig, reg_contig) in TTGIR) ===
-      auto resultTy = cast<RankedTensorType>(loadOp.getResult().getType());
-      int elementBitWidth = resultTy.getElementTypeBitWidth();
-      int maxVecElements = std::max(1, 128 / elementBitWidth);
-      int64_t maxSafeVectorWidth =
-          std::min((int64_t)maxVecElements, pageLocalContiguity);
-
-      // === Step 5: output analysis as IR attributes (schema v2) ===
+      // === Step 4: output analysis as IR attributes (schema v2) ===
       auto ctx = &getContext();
-      auto i64Ty = IntegerType::get(ctx, 64);
       SmallVector<int64_t, 2> dimContiguity{tokenContiguity,
                                             pageLocalContiguity};
       loadOp->setAttr("pact.pagelocal.dim_contiguity",
           DenseI64ArrayAttr::get(ctx, dimContiguity));
-      loadOp->setAttr("pact.pagelocal.safe_vector_width",
-          IntegerAttr::get(i64Ty, maxSafeVectorWidth));
       loadOp->setAttr("pact.pagelocal.statically_safe",
           BoolAttr::get(ctx, staticallySafe));
 
       numAnalyzed++;
       LDBG("PACT P2: load analyzed: dimContiguity=[" << tokenContiguity << ","
            << pageLocalContiguity << "]"
-           << ", vecWidth=" << maxSafeVectorWidth
            << ", staticSafe=" << staticallySafe
            << ", foundBlockOffset=" << foundBlockOffset);
 

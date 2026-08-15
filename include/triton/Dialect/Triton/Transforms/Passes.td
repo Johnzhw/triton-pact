@@ -98,9 +98,9 @@ def PACTPageLocalAnalysis : Pass<"triton-pact-page-local-analysis", "mlir::Modul
     page-local memory properties via an F₂-linear page-internal memory layout:
     per-dimension memory contiguity and page-boundary safety.
 
-    Outputs pact.pagelocal.dim_contiguity, pact.pagelocal.safe_vector_width
-    (transitional), and pact.pagelocal.statically_safe. Does not modify IR
-    structure or AxisInfo — purely an analysis pass.
+    Outputs pact.pagelocal.dim_contiguity and
+    pact.pagelocal.statically_safe. Does not modify IR structure or AxisInfo —
+    purely an analysis pass.
   }];
   let dependentDialects = ["mlir::triton::TritonDialect", "mlir::arith::ArithDialect"];
 }

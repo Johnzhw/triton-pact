@@ -83,10 +83,9 @@ def TritonPageTransform : Pass<"triton-page-transform", "mlir::ModuleOp"> {
   let summary = "Recognize and canonicalize paged KV cache access patterns";
   let description = [{
     Detects block-table-driven paged attention patterns where loads access KV
-    caches through block_tables (tt.load from block_tables_ptr indexed by
-    seq_offset // BLOCK_SIZE). Annotates matching loads with pact.* attributes
-    and performs safe canonicalization (div→shift, mod→and for power-of-2
-    PAGE_SIZE, conservative block_table load hoisting).
+    caches through block_tables. Annotates matching loads with pact.* semantic
+    attributes and classifies the kernel as decode_paged or prefill_paged
+    (unknown falls back to conservative handling).
   }];
   let dependentDialects = ["mlir::triton::TritonDialect", "mlir::arith::ArithDialect"];
 }
@@ -96,12 +95,12 @@ def PACTPageLocalAnalysis : Pass<"triton-pact-page-local-analysis", "mlir::Modul
   let description = [{
     Reads PACT semantic attributes (pact.page_size, pact.tile_tokens, etc.)
     from tt.load ops annotated with pact.paged_load, and computes verifiable
-    page-local memory properties: contiguity, safe vector width, static safety,
-    runtime guard requirement, and bytes until page boundary.
+    page-local memory properties via an F₂-linear page-internal memory layout:
+    per-dimension memory contiguity and page-boundary safety.
 
-    Outputs 5 pact.pagelocal.* attributes consumed by P3 (Guarded Override),
-    P4 (Pipeline Hints), and P8 (Guard Fusion).  Does not modify IR structure
-    or AxisInfo — purely an analysis pass.
+    Outputs pact.pagelocal.dim_contiguity, pact.pagelocal.safe_vector_width
+    (transitional), and pact.pagelocal.statically_safe. Does not modify IR
+    structure or AxisInfo — purely an analysis pass.
   }];
   let dependentDialects = ["mlir::triton::TritonDialect", "mlir::arith::ArithDialect"];
 }

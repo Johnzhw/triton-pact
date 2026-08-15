@@ -2,6 +2,7 @@
 #include "triton/Support/PactSMDetect.h"
 #include "mlir/Analysis/DataFlowFramework.h"
 #include "mlir/Dialect/UB/IR/UBOps.h"
+#include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "triton/Dialect/Gluon/IR/Dialect.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
@@ -340,9 +341,10 @@ static OverrideStrategy getOverrideStrategy(triton::LoadOp loadOp, int dim,
   }
 
   int64_t pageLocalContiguity = 1;
-  if (auto attr = loadOp->getAttrOfType<IntegerAttr>(
-          "pact.pagelocal.contiguity")) {
-    pageLocalContiguity = attr.getInt();
+  if (auto attr = loadOp->getAttrOfType<DenseI64ArrayAttr>(
+          "pact.pagelocal.dim_contiguity")) {
+    if (dim >= 0 && dim < (int)attr.size())
+      pageLocalContiguity = attr[dim];
   }
 
   // Read page size for architecture-aware constraints

@@ -266,46 +266,31 @@ struct PageLocalAnalysisPass
                               .getNumConsecutiveInOut();
       }
 
-      // === Step 4: compute max safe vector width ===
-      // NVIDIA: max 128-bit per load = 8 × f16 elements
-      int elementBitWidth = 16; // f16
-      int maxVecElements = 128 / elementBitWidth; // = 8
-      int64_t maxSafeVectorWidth = std::min((int64_t)maxVecElements,
-                                             pageLocalContiguity);
+      // === Step 4: compute max safe vector width (transitional until M2/B1
+      // computes the exact V = min(mem_contig, reg_contig) in TTGIR) ===
+      auto resultTy = cast<RankedTensorType>(loadOp.getResult().getType());
+      int elementBitWidth = resultTy.getElementTypeBitWidth();
+      int maxVecElements = std::max(1, 128 / elementBitWidth);
+      int64_t maxSafeVectorWidth =
+          std::min((int64_t)maxVecElements, pageLocalContiguity);
 
-      // === Step 5: determine if runtime guard is needed ===
-      bool requiresRuntimeGuard = !staticallySafe && pageLocalContiguity > 1;
-
-      // === Step 6: estimate bytes until page boundary ===
-      int64_t bytesUntilPageBoundary = 0;
-      if (staticallySafe) {
-        bytesUntilPageBoundary = pageSize * elementBitWidth / 8;
-      } else {
-        // Dynamic: conservative estimate
-        bytesUntilPageBoundary = pageSize * elementBitWidth / 8;
-      }
-
-      // === Step 7: output analysis as IR attributes ===
+      // === Step 5: output analysis as IR attributes (schema v2) ===
       auto ctx = &getContext();
       auto i64Ty = IntegerType::get(ctx, 64);
-      loadOp->setAttr("pact.pagelocal.contiguity",
-          IntegerAttr::get(i64Ty, pageLocalContiguity));
-      loadOp->setAttr("pact.pagelocal.token_contiguity",
-          IntegerAttr::get(i64Ty, tokenContiguity));
+      SmallVector<int64_t, 2> dimContiguity{tokenContiguity,
+                                            pageLocalContiguity};
+      loadOp->setAttr("pact.pagelocal.dim_contiguity",
+          DenseI64ArrayAttr::get(ctx, dimContiguity));
       loadOp->setAttr("pact.pagelocal.safe_vector_width",
           IntegerAttr::get(i64Ty, maxSafeVectorWidth));
       loadOp->setAttr("pact.pagelocal.statically_safe",
           BoolAttr::get(ctx, staticallySafe));
-      loadOp->setAttr("pact.pagelocal.requires_guard",
-          BoolAttr::get(ctx, requiresRuntimeGuard));
-      loadOp->setAttr("pact.pagelocal.bytes_until_boundary",
-          IntegerAttr::get(i64Ty, bytesUntilPageBoundary));
 
       numAnalyzed++;
-      LDBG("PACT P2: load analyzed: contiguity=" << pageLocalContiguity
+      LDBG("PACT P2: load analyzed: dimContiguity=[" << tokenContiguity << ","
+           << pageLocalContiguity << "]"
            << ", vecWidth=" << maxSafeVectorWidth
            << ", staticSafe=" << staticallySafe
-           << ", needsGuard=" << requiresRuntimeGuard
            << ", foundBlockOffset=" << foundBlockOffset);
 
       return WalkResult::advance();

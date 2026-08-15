@@ -11,6 +11,7 @@
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/IR/BuiltinTypes.h"
+#include "mlir/IR/Location.h"
 #include "mlir/IR/Value.h"
 #include "mlir/Interfaces/FunctionInterfaces.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
@@ -372,25 +373,42 @@ struct PageTransformPass
   }
 
   //===----------------------------------------------------------------===//
-  // Kernel classification: prefill vs decode paged attention
-  // Uses three signals for joint decision:
-  //   Signal A: divsi(PAGE_SIZE) + remsi(PAGE_SIZE) patterns
-  //   Signal B: block_table parameter name
-  //   Signal C: 2D K/V load shapes (decode characteristic)
+  // Kernel classification: decode_paged vs prefill_paged.
+  //   Signal A: divsi(PAGE_SIZE) result used for block_table indexing.
+  //     - direct tt.addptr user -> prefill indexing style
+  //     - arith.addi/muli user   -> decode indexing style
+  //   Signal B: function argument whose location or tt.param_name mentions
+  //     block_table (covers kernels without divsi but with block tables).
+  // Downstream annotation still verifies actual paged loads; a conservative
+  // classification here never changes semantics.
   //===----------------------------------------------------------------===//
   enum class KernelType {
     Unknown,
-    DecodePagedAttention,  // confirmed decode paged attention kernel
-    PrefillPagedAttention, // prefill kernel that also uses block_table (chunked prefill)
-    PrefillAttention,      // prefill kernel without paged access — skip PACT
-    MixedPagedAccess       // has paged access but uncertain type
+    DecodePagedAttention,  // decode paged attention kernel
+    PrefillPagedAttention, // chunked prefill kernel that also uses block_table
+    PrefillAttention       // no paged access pattern found — skip PACT
   };
+
+  static bool isBlockTableArg(triton::FuncOp funcOp, unsigned i) {
+    BlockArgument arg = funcOp.getArgument(i);
+    if (auto nameLoc = dyn_cast<NameLoc>(arg.getLoc())) {
+      StringRef name = nameLoc.getName().getValue();
+      if (name.contains("block_table") || name.contains("BLOCK_TABLE"))
+        return true;
+    }
+    if (auto nameAttr =
+            funcOp.getArgAttrOfType<StringAttr>(i, "tt.param_name")) {
+      StringRef name = nameAttr.getValue();
+      if (name.contains("block_table") || name.contains("BLOCK_TABLE"))
+        return true;
+    }
+    return false;
+  }
 
   static KernelType classifyKernel(ModuleOp mod) {
     bool hasDivsiPattern = false;
     bool hasAddptrPageIndex = false; // page_idx feeds tt.addptr directly (prefill)
     bool hasBlockTableParam = false;
-    bool has2DKVLoad = false;
 
     // Signal A: check for divsi(PAGE_SIZE) patterns
     mod.walk([&](arith::DivSIOp divOp) {
@@ -398,11 +416,9 @@ struct PageTransformPass
         int64_t divisor = constOp.value();
         // PAGE_SIZE is typically 16, 32, 64, 128
         if (divisor == 16 || divisor == 32 || divisor == 64 || divisor == 128) {
-          // Verify: divsi result used for block_table indexing.
-          // M7a fix: prefill kernels feed page_idx directly into tt.addptr
+          // prefill kernels feed page_idx directly into tt.addptr
           // (block_table_ptr + page_idx) rather than through arith.addi/muli
           // (which decode kernels use for bt_offset = token_idx*max_blocks + page_idx).
-          // M7b: direct addptr indexing is the prefill signal.
           for (auto *user : divOp->getUsers()) {
             if (isa<triton::AddPtrOp>(user))
               hasAddptrPageIndex = true;
@@ -416,51 +432,24 @@ struct PageTransformPass
       return WalkResult::advance();
     });
 
-    // Signal B: check for block_table parameter
+    // Signal B: block_table argument (by location name, then tt.param_name)
     for (auto funcOp : mod.getOps<triton::FuncOp>()) {
       for (unsigned i = 0; i < funcOp.getNumArguments(); i++) {
-        auto arg = funcOp.getArgument(i);
-        if (auto nameAttr =
-                funcOp.getArgAttrOfType<StringAttr>(i, "tt.param_name")) {
-          StringRef name = nameAttr.getValue();
-          if (name.contains("block_table") || name.contains("BLOCK_TABLE")) {
-            hasBlockTableParam = true;
-            break;
-          }
+        if (isBlockTableArg(funcOp, i)) {
+          hasBlockTableParam = true;
+          break;
         }
       }
     }
 
-    // Signal C: check for 2D K/V loads (decode characteristic)
-    mod.walk([&](triton::LoadOp loadOp) {
-      auto ty = dyn_cast<RankedTensorType>(loadOp.getResult().getType());
-      if (ty && ty.getShape().size() == 2) {
-        int64_t dim0 = ty.getShape()[0];
-        int64_t dim1 = ty.getShape()[1];
-        // 2D tile with head_dim > 32 (not a small mask tensor)
-        if (dim0 >= 8 && dim1 >= 32) {
-          has2DKVLoad = true;
-          return WalkResult::interrupt();
-        }
-      }
-      return WalkResult::advance();
-    });
-
-    // Joint decision
-    // M7b: prefill paged attention feeds page_idx directly into tt.addptr
-    // (block_table_ptr + page_idx), unlike decode which computes bt_offset via
-    // arith.addi first.  Classify it as PrefillPagedAttention so P3 can apply
-    // prefill-specific (larger) contiguity caps.
+    // Joint decision: direct addptr indexing = prefill, otherwise decode.
     if (hasDivsiPattern && hasAddptrPageIndex)
       return KernelType::PrefillPagedAttention;
-    if (hasDivsiPattern && hasBlockTableParam)
+    if (hasDivsiPattern)
       return KernelType::DecodePagedAttention;
-    if (hasDivsiPattern && !hasBlockTableParam)
-      return KernelType::MixedPagedAccess;
-    if (!hasDivsiPattern)
-      return KernelType::PrefillAttention;
-
-    return KernelType::Unknown;
+    if (hasBlockTableParam)
+      return KernelType::PrefillPagedAttention;
+    return KernelType::PrefillAttention;
   }
 
   void runOnOperation() override {

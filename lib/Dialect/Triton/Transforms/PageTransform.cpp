@@ -585,11 +585,6 @@ struct PageTransformPass
       if (blockTableLoads.empty())
         return WalkResult::advance();
 
-      // Mark the function as having paged access
-      auto *pagedFuncOp = forOp->getParentOp();
-      pagedFuncOp->setAttr("pact.has_paged_access",
-                      UnitAttr::get(&getContext()));
-
       // Phase 2: Identify K/V loads.
       // Any tt.load (not already annotated) whose offset chain involves
       // arith.remsi by pageSize is a paged KV load.
@@ -638,8 +633,6 @@ struct PageTransformPass
             IntegerAttr::get(i64Ty, headDim));
         loadOp->setAttr("pact.head_dim_size",
             IntegerAttr::get(i64Ty, headSize));
-        loadOp->setAttr("pact.seq_dim_idx",
-            IntegerAttr::get(i64Ty, seqDim));
 
         // Bug6 fix: page_boundary_safe is a *conservative fallback* used only
         // when P2 cannot trace the remsi offset.  The tile is guaranteed not to

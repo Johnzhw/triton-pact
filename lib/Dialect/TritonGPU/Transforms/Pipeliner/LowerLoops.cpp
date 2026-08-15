@@ -154,15 +154,6 @@ static Value createAlloc(scf::ForOp &forOp, Operation *loadOp,
       loadOp->getLoc(), sharedEnc, distance);
 }
 
-namespace {
-
-static bool isPactStaticProfitabilityEnabled() {
-  const char *env = std::getenv("PACT_ENABLE_STATIC_PROFITABILITY");
-  return !env || std::string(env) != "0";
-}
-
-} // namespace
-
 void createAsyncCopy(scf::ForOp forOp, tt::LoadOp loadOp, Value alloc,
                      Value insertIdx, Value extractIdx, int contiguity,
                      CoarseSchedule &schedule) {

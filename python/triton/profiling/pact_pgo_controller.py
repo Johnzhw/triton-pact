@@ -50,7 +50,7 @@ class PactPgoController:
     def run(self, key: str, swapper: PactKernelSwapper, remaining_steps: int,
             measure_iters: int = 20, min_gain_percent: float = 5.0) -> Dict[str, Any]:
         """Collect facts, compile one candidate, measure, and swap if worth it."""
-        facts = self.collector.collect(steps=20)
+        facts = self.collector.collect(steps=1)
         self.db.put(key, facts)
         hints = facts_to_hints(facts)
         if not hints:

@@ -343,9 +343,11 @@ def TritonGPUCoalesceAsyncCopy: Pass<"tritongpu-coalesce-async-copy", "mlir::Mod
 def PACTAutoNumStages : Pass<"tritongpu-pact-auto-num-stages", "mlir::ModuleOp"> {
   let summary = "Set page-aware optimal num_stages on paged loops";
   let description = [{
-    Reads P4 pipeline hints and computes optimal num_stages based on
-    page-aware heuristics (tilesPerPage → L2 locality).  Sets ttg.num_stages
-    loop attribute so the pipeline pass picks up the overridden value.
+    Computes architecture-aware optimal num_stages for paged loops from exact
+    per-load tile bytes, swizzled shared-memory footprint, page geometry, and
+    either a static loop bound or pact.pgo.measured_iterations.  Without an
+    iteration estimate it keeps the native default.  Sets tt.num_stages on the
+    loop and pact.optimal_num_stages on the module.
     Controlled by PACT_ENABLE_AUTO_NUM_STAGES (default ON).
   }];
   let dependentDialects = ["mlir::triton::gpu::TritonGPUDialect",

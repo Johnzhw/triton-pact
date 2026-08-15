@@ -99,20 +99,6 @@ std::pair<Operation *, int64_t> getDefiningOpAndDistance(scf::ForOp forOp,
 int getCopyVecBytes(RankedTensorType registerTy,
                     gpu::SharedEncodingTrait sharedEnc);
 
-// P5: Static pipeline profitability model (Pipeline Guardian)
-// Five-level classification — only DefinitelyUnprofitable blocks pipeline.
-enum class PipelineProfitability {
-  DefinitelyProfitable,    // Strong evidence pipeline is beneficial
-  LikelyProfitable,        // Likely beneficial (default for most cases)
-  Neutral,                 // Uncertain — let Triton decide
-  LikelyUnprofitable,      // Likely harmful but not certain
-  DefinitelyUnprofitable,  // Definitely harmful — BLOCK pipeline
-};
-
-PipelineProfitability isPipelineProfitable(
-    triton::LoadOp loadOp, triton::ModuleAxisInfoAnalysis &axisInfoAnalysis,
-    int numStages, int estimatedIterations);
-
 bool canBeConvertedToAsyncLoad(
     triton::LoadOp loadOp, triton::ModuleAxisInfoAnalysis &axisInfoAnalysis);
 

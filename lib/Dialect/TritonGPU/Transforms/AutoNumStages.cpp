@@ -1,16 +1,15 @@
-//===- AutoNumStages.cpp - PACT P6 Occupancy-Aware num_stages --------------===//
+//===- AutoNumStages.cpp - PACT P6 Architecture-Aware num_stages -----------===//
 //
-// P6 v3: Occupancy-aware + page-locality joint optimization for num_stages.
+// P6: architecture-aware num_stages decision for paged attention loops.
 //
-// Core insight: num_stages has a fundamental tradeoff:
-//   num_stages ↑ → more preload → better latency hiding → POSITIVE
-//   num_stages ↑ → SMEM ↑ → occupancy ↓ → warps ↓ → bar.sync wait ↑ → NEGATIVE
+// Inputs (in priority order):
+//   1. pact.pgo.measured_iterations  (PGO branch; absent in the static base)
+//   2. statically-resolvable scf.for bounds
+//   3. no estimate -> keep the native/default num_stages (no override)
 //
-// Ampere strategy: Occupancy-First — don't increase num_stages unless
-//   the latency hiding benefit clearly outweighs the occupancy cost.
-//
-// Hopper strategy: Pipeline-First — larger SMEM enables more aggressive
-//   num_stages, and TMA handles 2D copies efficiently.
+// The SMEM footprint used by the occupancy model is computed exactly from the
+// shared encoding that Triton's pipeline pass would use, including swizzle
+// padding, via LinearLayout's "offset" input dimension.
 //
 //===----------------------------------------------------------------------===//
 
@@ -58,53 +57,72 @@ static int getMaxPipelineStages() {
   return 4;
 }
 
-// ═══════════════════════════════════════════════════════════════
-// P6 v3: Occupancy-Aware + Page-Locality Joint Optimization
-// ═══════════════════════════════════════════════════════════════
+static int64_t getTotalElements(RankedTensorType ty) {
+  int64_t total = 1;
+  for (auto dim : ty.getShape())
+    total *= dim;
+  return total;
+}
 
-static int computeOptimalNumStages(int64_t tileBytes, int estIterations,
-                                   int pageSize, int tileTokens,
-                                   int defaultStages) {
+// Static trip count, or -1 when the bounds are runtime values.
+static int64_t estimateTripCount(scf::ForOp forOp) {
+  auto upperConst =
+      forOp.getUpperBound().getDefiningOp<arith::ConstantOp>();
+  auto lowerConst =
+      forOp.getLowerBound().getDefiningOp<arith::ConstantOp>();
+  if (!upperConst || !lowerConst)
+    return -1;
+
+  int64_t upperVal =
+      mlir::cast<mlir::IntegerAttr>(upperConst.getValue()).getInt();
+  int64_t lowerVal =
+      mlir::cast<mlir::IntegerAttr>(lowerConst.getValue()).getInt();
+  int64_t step = 1;
+  if (auto stepOp = forOp.getStep().getDefiningOp<arith::ConstantOp>())
+    step = mlir::cast<mlir::IntegerAttr>(stepOp.getValue()).getInt();
+  if (step <= 0)
+    return -1;
+  return (upperVal - lowerVal) / step;
+}
+
+static int computeOptimalNumStages(int64_t tileBytes, int64_t estIterations,
+                                   bool haveIterationEstimate, int pageSize,
+                                   int tileTokens, int defaultStages) {
   auto sm = pact::SMDetector::getResources();
+
+  // Without a static or PGO-provided trip count, PACT must not override the
+  // native pipeline decision.
+  if (!haveIterationEstimate) {
+    llvm::errs() << "[PACT P6] " << pact::SMDetector::getGPUName()
+                 << ": no iteration estimate (static bound or PGO) — keeping "
+                    "num_stages="
+                 << defaultStages << "\n";
+    return defaultStages;
+  }
+
   auto budget = pact::SMDetector::computePipelineBudget(
       tileBytes, estIterations, pageSize, tileTokens, defaultStages);
 
   int tilesPerPage = (tileTokens > 0 && tileTokens <= pageSize)
-                        ? pageSize / tileTokens : 1;
+                         ? pageSize / tileTokens : 1;
 
-  // ═══════════════════════════════════════════════════════════
   // Ampere (SM 80-89): Occupancy-First Heuristic
-  //
-  // Key constraint: num_stages 3→4 drops occupancy sharply
-  // (1024→768 threads/SM on RTX 3080).
-  //
-  // Strategy: default to keeping defaultStages. Only increase
-  // when there's clear evidence that latency hiding benefit
-  // outweighs the occupancy cost.
-  // ═══════════════════════════════════════════════════════════
   if (sm.smVersion < 90) {
-    // === Short sequence (≤16 iters): minimize stages, maximize occupancy ===
     if (estIterations <= 16) {
-      llvm::errs() << "[PACT P6 v3] " << pact::SMDetector::getGPUName()
+      llvm::errs() << "[PACT P6] " << pact::SMDetector::getGPUName()
                    << ": short seq (" << estIterations
                    << " iters) → num_stages=2 (max occupancy)\n";
       return 2;
     }
 
-    // === Medium sequence (17-64 iters): keep default ===
     if (estIterations <= 64) {
-      llvm::errs() << "[PACT P6 v3] " << pact::SMDetector::getGPUName()
+      llvm::errs() << "[PACT P6] " << pact::SMDetector::getGPUName()
                    << ": medium seq (" << estIterations
                    << " iters) → num_stages=" << defaultStages
                    << " (keep default)\n";
       return defaultStages;
     }
 
-    // === Long sequence (65+ iters): evaluate pipeline benefit vs occupancy cost ===
-    // Only increase stages if ALL conditions met:
-    //   1. Large tile (≥2KB) — worth the SMEM cost
-    //   2. Low page locality (tilesPerPage ≤ 2) — need pipeline to hide latency
-    //   3. Occupancy loss < 20%
     bool largeTile = tileBytes >= 2048;
     bool lowLocality = tilesPerPage <= 2;
     double occCurrent = pact::SMDetector::estimateOccupancy(
@@ -116,7 +134,7 @@ static int computeOptimalNumStages(int64_t tileBytes, int estIterations,
 
     if (largeTile && lowLocality && occAcceptable && estIterations >= 128) {
       int optimal = std::min(defaultStages + 1, sm.optimalNumStages);
-      llvm::errs() << "[PACT P6 v3] " << pact::SMDetector::getGPUName()
+      llvm::errs() << "[PACT P6] " << pact::SMDetector::getGPUName()
                    << ": long seq + large tile + low locality"
                    << " → num_stages=" << optimal
                    << " (occ: " << (int)(occCurrent * 100) << "% → "
@@ -124,30 +142,25 @@ static int computeOptimalNumStages(int64_t tileBytes, int estIterations,
       return optimal;
     }
 
-    // For high page locality (tilesPerPage ≥ 4): fewer stages suffice
     if (tilesPerPage >= 4) {
-      llvm::errs() << "[PACT P6 v3] " << pact::SMDetector::getGPUName()
+      llvm::errs() << "[PACT P6] " << pact::SMDetector::getGPUName()
                    << ": high page locality (" << tilesPerPage
                    << " tiles/page) → num_stages=2 (L2 cache friendly)\n";
       return 2;
     }
 
-    llvm::errs() << "[PACT P6 v3] " << pact::SMDetector::getGPUName()
+    llvm::errs() << "[PACT P6] " << pact::SMDetector::getGPUName()
                  << ": keeping num_stages=" << defaultStages
                  << " (tile=" << tileBytes << "B, iters=" << estIterations
                  << ", TPP=" << tilesPerPage
                  << ", occLoss="
                  << (occCurrent > 0 ? (int)((occCurrent - occNext) / occCurrent * 100)
-                                   : 0) << "%)\n";
+                                    : 0)
+                 << "%)\n";
     return defaultStages;
   }
 
-  // ═══════════════════════════════════════════════════════════
   // Hopper (SM 90+): Pipeline-First Heuristic
-  //
-  // Larger SMEM (228KB) and TMA hardware enable more aggressive
-  // pipeline depths. Use computePipelineBudget for bounds.
-  // ═══════════════════════════════════════════════════════════
   int maxStages = getMaxPipelineStages();
   int candidate = std::min({sm.optimalNumStages + 2,
                              budget.maxStagesBySMEM,
@@ -155,18 +168,15 @@ static int computeOptimalNumStages(int64_t tileBytes, int estIterations,
                              budget.maxStagesByOccupancy,
                              maxStages});
 
-  // Page-locality adjustment (Hopper: TMA 2D copies benefit from page locality)
   if (tilesPerPage >= 4) {
-    // High L2 locality → TMA 2D copy is efficient → fewer stages needed
     candidate = std::min(candidate, sm.optimalNumStages - 1);
   } else if (tilesPerPage <= 1) {
-    // Low locality → need more stages to hide latency
     candidate = std::min(candidate, sm.optimalNumStages + 2);
   }
 
   candidate = std::clamp(candidate, 2, 7);
 
-  llvm::errs() << "[PACT P6 v3] " << pact::SMDetector::getGPUName()
+  llvm::errs() << "[PACT P6] " << pact::SMDetector::getGPUName()
                << ": num_stages=" << candidate
                << " (tile=" << tileBytes << "B, iters=" << estIterations
                << ", TPP=" << tilesPerPage
@@ -183,7 +193,8 @@ struct PACTAutoNumStagesPass
 
     ModuleOp mod = getOperation();
 
-    // Skip prefill kernels (tagged by P1 PageTransform)
+    // Pure prefill (no paged access pattern) was skipped by P1; keep P6
+    // consistent with that skip decision.
     if (auto ktype = mod->getAttrOfType<StringAttr>("pact.kernel_type")) {
       if (ktype.getValue() == "prefill") {
         llvm::errs() << "[PACT P6] Prefill kernel detected, skipping.\n";
@@ -197,70 +208,76 @@ struct PACTAutoNumStagesPass
     if (sm.smVersion >= 90)
       defaultStages = sm.optimalNumStages; // 5 on Hopper
 
-    // Bug9 fix: read the canonical num_stages attribute name.  kNumStagesAttrName
-    // is "tt.num_stages" (PipeliningUtility.h); "ttg.num-stages" (hyphen) never
-    // existed, so this read always fell back to the hardcoded defaultStages=3.
     if (auto attr = mod->getAttrOfType<mlir::IntegerAttr>("tt.num_stages"))
       defaultStages = attr.getInt();
 
+    // Optional PGO-provided measured trip count (injected by the PGO branch).
+    int64_t pgoIterations = -1;
+    if (auto attr = mod->getAttrOfType<mlir::IntegerAttr>(
+            "pact.pgo.measured_iterations"))
+      pgoIterations = attr.getInt();
+
     mod.walk([&](scf::ForOp forOp) {
-      // Check if this loop has paged loads (via P4 hints)
       int64_t tileBytes = 0;
-      int64_t exactSMEMBytes = 0; // M9c: swizzled shared footprint (with padding)
-      int estIterations = 128;
+      int64_t exactSMEMBytes = 0;
       int pageSize = 16;
       int tileTokens = 16;
       bool hasPagedLoad = false;
+      int64_t estIterations = estimateTripCount(forOp);
+      bool haveIterationEstimate = estIterations > 0;
+      if (pgoIterations > 0) {
+        estIterations = pgoIterations;
+        haveIterationEstimate = true;
+      }
 
-      forOp.walk([&](Operation *op) {
-        if (auto hint = op->getAttrOfType<mlir::IntegerAttr>(
-                "pact.hint.tile_bytes")) {
-          hasPagedLoad = true;
-          tileBytes = std::max(tileBytes, hint.getInt());
-          // M9c: compute the exact shared-memory footprint (including swizzle
-          // padding) from the swizzled shared encoding that the Pipeline pass
-          // will use for this load (dot operands → swizzled, else {1,1,1}).
-          if (auto loadOp = dyn_cast<triton::LoadOp>(op)) {
-            auto ty = dyn_cast<RankedTensorType>(loadOp.getResult().getType());
-            if (ty && ty.getEncoding()) {
-              auto sharedEnc = mlir::triton::getSharedEncoding(loadOp);
-              auto ll = triton::gpu::toLinearLayout(ty.getShape(), sharedEnc);
-              int64_t footprint =
-                  ll.getTotalInDimSize() * (ty.getElementTypeBitWidth() / 8);
-              exactSMEMBytes = std::max(exactSMEMBytes, footprint);
-            }
-          }
-        }
-        if (auto hint = op->getAttrOfType<mlir::IntegerAttr>(
-                "pact.hint.estimated_iterations"))
-          estIterations = hint.getInt();
-        if (auto attr = op->getAttrOfType<mlir::IntegerAttr>(
-                "pact.hint.page_size"))
+      forOp.walk([&](triton::LoadOp loadOp) {
+        if (!loadOp->hasAttr("pact.paged_load"))
+          return WalkResult::advance();
+
+        hasPagedLoad = true;
+        auto ty = cast<RankedTensorType>(loadOp.getResult().getType());
+        int64_t elemBytes = std::max((int64_t)1, (int64_t)(ty.getElementTypeBitWidth() / 8));
+        int64_t totalBytes = getTotalElements(ty) * elemBytes;
+        tileBytes = std::max(tileBytes, totalBytes);
+
+        if (auto attr =
+                loadOp->getAttrOfType<mlir::IntegerAttr>("pact.page_size"))
           pageSize = attr.getInt();
-        if (auto attr = op->getAttrOfType<mlir::IntegerAttr>(
-                "pact.hint.tile_tokens"))
+        if (auto attr =
+                loadOp->getAttrOfType<mlir::IntegerAttr>("pact.tile_tokens"))
           tileTokens = attr.getInt();
+
+        // M9c: exact shared-memory footprint, including swizzle padding. The
+        // physical footprint is the size of the shared layout's "offset" input
+        // dimension — NOT getTotalInDimSize(), which would multiply by the CGA
+        // block dimension for num_ctas > 1.
+        if (ty.getEncoding()) {
+          auto sharedEnc = mlir::triton::getSharedEncoding(loadOp);
+          auto ll = triton::gpu::toLinearLayout(ty.getShape(), sharedEnc);
+          auto offsetName = StringAttr::get(&getContext(), "offset");
+          int64_t footprint = 0;
+          if (ll.hasInDim(offsetName))
+            footprint = ll.getInDimSize(offsetName) * elemBytes;
+          exactSMEMBytes = std::max(exactSMEMBytes, footprint);
+        }
+        return WalkResult::advance();
       });
 
       if (!hasPagedLoad)
         return WalkResult::advance();
 
-      // M9c: prefer the exact swizzled footprint (with padding) over the raw
-      // tileBytes estimate; fall back to tileBytes when the layout is unknown.
-      int64_t rawTileBytes = tileBytes;
-      if (exactSMEMBytes > 0) {
-        tileBytes = exactSMEMBytes;
+      if (exactSMEMBytes > 0 && exactSMEMBytes != tileBytes) {
         llvm::errs() << "[PACT P6 M9c] SMEM footprint: raw tileBytes="
-                     << rawTileBytes << "B → exact swizzled=" << exactSMEMBytes
-                     << "B (padding=" << (exactSMEMBytes - rawTileBytes)
+                     << tileBytes << "B → exact swizzled=" << exactSMEMBytes
+                     << "B (padding=" << (exactSMEMBytes - tileBytes)
                      << "B)\n";
+        tileBytes = exactSMEMBytes;
       }
 
-      int optimal = computeOptimalNumStages(tileBytes, estIterations,
-                                            pageSize, tileTokens,
-                                            defaultStages);
+      int optimal = computeOptimalNumStages(
+          tileBytes, estIterations, haveIterationEstimate, pageSize,
+          tileTokens, defaultStages);
 
-      // Only set attribute if different from default
       if (optimal == defaultStages) {
         llvm::errs() << "[PACT P6] Keeping default num_stages="
                      << defaultStages << " (optimal=" << optimal
@@ -268,26 +285,24 @@ struct PACTAutoNumStagesPass
         return WalkResult::advance();
       }
 
-      // Set as loop attribute so pipeline pass picks it up.  Bug9: Triton only
-      // consumes "tt.num_stages" (kNumStagesAttrName); "ttg.num_stages" was a
-      // redundant write that no consumer reads, so drop it.
+      // Set as loop attribute so the pipeline pass picks it up.
       auto stagesAttr = mlir::IntegerAttr::get(
           mlir::IntegerType::get(&getContext(), 32), optimal);
       forOp->setAttr("tt.num_stages", stagesAttr);
 
-      // Also write to module attribute for compiler.py fallback
+      // Also write the module attribute for compiler.py fallback.
       mod->setAttr("pact.optimal_num_stages",
                    mlir::IntegerAttr::get(
                        mlir::IntegerType::get(&getContext(), 32), optimal));
 
-      llvm::errs() << "[PACT P6 v3] " << pact::SMDetector::getGPUName()
+      llvm::errs() << "[PACT P6] " << pact::SMDetector::getGPUName()
                    << ": num_stages " << defaultStages << " → " << optimal
                    << " | tile=" << tileBytes << "B"
-                   << " | iters=" << estIterations
-                   << " | TPP="
+                   << " | iters=" << estIterations << " | TPP="
                    << (tileTokens > 0 && tileTokens <= pageSize
                            ? pageSize / tileTokens : 1)
-                   << " | SMEM=" << (tileBytes * optimal) / 1024 << "KB/block\n";
+                   << " | SMEM=" << (tileBytes * optimal) / 1024
+                   << "KB/block\n";
 
       return WalkResult::advance();
     });

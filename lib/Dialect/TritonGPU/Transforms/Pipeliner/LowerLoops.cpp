@@ -480,62 +480,7 @@ scf::ForOp lowerLoads(scf::ForOp forOp, CoarseSchedule &schedule,
         int copyVecBytes = getCopyVecBytes(
             cast<RankedTensorType>(op.getResultTypes()[0]), sharedEncoding);
 
-        // Debug: trace Pipeline decision
-        if (isa<tt::LoadOp>(op)) {
-          auto loadOp = cast<tt::LoadOp>(op);
-          bool hasPactHint = loadOp->hasAttr("pact.hint.prefer_async");
-          unsigned vec = axisInfoAnalysis.getContiguity(loadOp.getPtr());
-          llvm::errs() << "[PACT Pipeline] load: canAsync=" << canUseAsyncCp
-                       << " copyVecB=" << copyVecBytes
-                       << " contiguity=" << vec
-                       << " hasPactHint=" << hasPactHint << "\n";
-        }
-
         canUseAsyncCp &= copyVecBytes >= 4;
-        // P4: check pact.hint.prefer_async — if PACT recommends async, force enable
-        bool pactPreferAsync = false;
-        if (auto hint = op.getAttrOfType<mlir::IntegerAttr>(
-                "pact.hint.prefer_async")) {
-          pactPreferAsync = (hint.getInt() != 0);
-        }
-        // P5: Pipeline Guardian — only block when DefinitelyUnprofitable
-        if (canUseAsyncCp && isPactStaticProfitabilityEnabled()) {
-          auto chkLoad = cast<tt::LoadOp>(op);
-          int estIters = 128;
-          if (auto hint = chkLoad->getAttrOfType<mlir::IntegerAttr>(
-                  "pact.hint.estimated_iterations"))
-            estIters = hint.getInt();
-          auto profit = isPipelineProfitable(chkLoad, axisInfoAnalysis,
-                                               /*numStages*/3, estIters);
-          // Read block threshold knob
-          std::string threshold = "definitely_unprofitable";
-          if (const char *env = std::getenv("PACT_P5_BLOCK_THRESHOLD"))
-            threshold = std::string(env);
-
-          bool shouldBlock = false;
-          if (threshold == "none") {
-            shouldBlock = false; // advisory only, never block
-          } else if (threshold == "likely_unprofitable") {
-            shouldBlock = (profit == PipelineProfitability::DefinitelyUnprofitable ||
-                          profit == PipelineProfitability::LikelyUnprofitable);
-          } else {
-            // default: "definitely_unprofitable" — only block when certain
-            shouldBlock = (profit == PipelineProfitability::DefinitelyUnprofitable);
-          }
-
-          if (shouldBlock) {
-            // P4 override: if PACT says prefer_async, ignore P5 block
-            if (pactPreferAsync) {
-              llvm::errs() << "[PACT P4→Pipeline] force cp.async per P4 hint"
-                           << " (P5 said block)\n";
-            } else {
-              canUseAsyncCp = false;
-              llvm::errs() << "[PACT P5] BLOCKED: definitely unprofitable\n";
-            }
-          }
-        } else if (canUseAsyncCp && pactPreferAsync) {
-          llvm::errs() << "[PACT P4→Pipeline] cp.async enabled via P4 hint\n";
-        }
         if (canUseAsyncCp) {
           auto loadOp = cast<tt::LoadOp>(op);
           auto ptr = loadOp.getPtr();

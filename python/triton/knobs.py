@@ -577,8 +577,12 @@ class pact_knobs(base_knobs):
     enable: env_bool = env_bool("PACT_ENABLE", False)
     enable_page_transform: env_bool = env_bool("PACT_ENABLE_PAGE_TRANSFORM", True)
     enable_page_local_analysis: env_bool = env_bool("PACT_ENABLE_PAGE_LOCAL_ANALYSIS", True)
+    enable_axisinfo_override: env_bool = env_bool("PACT_ENABLE_AXISINFO_OVERRIDE", True)
+    enable_pass_b: env_bool = env_bool("PACT_ENABLE_PASS_B", True)
+    pass_b_max_depth: env_int = env_int("PACT_PASS_B_MAX_DEPTH", 4)
     enable_auto_num_stages: env_bool = env_bool("PACT_ENABLE_AUTO_NUM_STAGES", True)
     enable_auto_num_warps: env_bool = env_bool("PACT_ENABLE_AUTO_NUM_WARPS", False)
+    max_pipeline_stages: env_int = env_int("PACT_MAX_PIPELINE_STAGES", 4)
     dump_ir: env_bool = env_bool("PACT_DUMP_IR", False)
     verbose: env_bool = env_bool("PACT_VERBOSE", False)
 

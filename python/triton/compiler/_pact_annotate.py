@@ -9,8 +9,8 @@ def attach_pact_func_attrs(module, attrs):
     """Attach pact.* attributes to module and tt.func ops.
 
     Called after ast_to_ttir. Sets module-level and function-level
-    attributes so downstream C++ passes (PageTransform, PatternSpecialize,
-    PrefetchInsert) can read them.
+    attributes so the downstream C++ PageTransform pass can use them as
+    recognition hints.
     """
     if not attrs or "pact.paged" not in attrs:
         return

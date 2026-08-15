@@ -349,7 +349,6 @@ class CUDABackend(BaseBackend):
             passes.ttgpuir.add_prefetch(pm)
         passes.ttgpuir.add_optimize_dot_operands(pm, capability >= 80)
         passes.ttgpuir.add_coalesce_async_copy(pm)
-        # PACT PrefetchInsert moved to right after TTGIR conversion.
         nvidia.passes.ttnvgpuir.add_optimize_tmem_layouts(pm)
         if capability // 10 >= 9:
             nvidia.passes.ttnvgpuir.add_tma_lowering(pm)

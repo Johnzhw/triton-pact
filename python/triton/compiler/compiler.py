@@ -83,8 +83,7 @@ class ASTSource:
         Sets pact.paged and pact.page_size as HINTS when parameter names match
         known patterns.  The authoritative detection is done by the C++
         PageTransform pass via IR def-use chain analysis, which works even
-        without these hints.  MQA/GQA detection is entirely delegated to the
-        C++ PatternSpecialize pass.
+        without these hints.
         """
         try:
             from triton import knobs

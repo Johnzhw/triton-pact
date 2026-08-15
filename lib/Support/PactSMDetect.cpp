@@ -41,6 +41,8 @@ SMResources conservativeResources(int version) {
       /*maxRegsPerSM*/ 65536,
       /*maxWarpsPerSM*/ 32,
       /*maxThreadsPerSM*/ 1024,
+      /*waveSize*/ 32,
+      /*numCUs*/ 0,
       /*effectiveSmemPerBlock*/ 16 * 1024,
       /*pipelineThreshold*/ 256,
       /*occupancyCliffStages*/ 2,
@@ -61,6 +63,8 @@ SMResources resourcesFor(int sm) {
         /*maxRegsPerSM*/ 65536,
         /*maxWarpsPerSM*/ 64,
         /*maxThreadsPerSM*/ 2048,
+        /*waveSize*/ 32,
+        /*numCUs*/ 0,
         /*effectiveSmemPerBlock*/ 48 * 1024,
         /*pipelineThreshold*/ 64,
         /*occupancyCliffStages*/ 5,
@@ -77,6 +81,8 @@ SMResources resourcesFor(int sm) {
         /*maxRegsPerSM*/ 65536,
         /*maxWarpsPerSM*/ 64,
         /*maxThreadsPerSM*/ 2048,
+        /*waveSize*/ 32,
+        /*numCUs*/ 0,
         /*effectiveSmemPerBlock*/ 48 * 1024,
         /*pipelineThreshold*/ 64,
         /*occupancyCliffStages*/ 5,
@@ -93,6 +99,8 @@ SMResources resourcesFor(int sm) {
         /*maxRegsPerSM*/ 65536,
         /*maxWarpsPerSM*/ 64,
         /*maxThreadsPerSM*/ 1536,
+        /*waveSize*/ 32,
+        /*numCUs*/ 0,
         /*effectiveSmemPerBlock*/ 24 * 1024,
         /*pipelineThreshold*/ 128,
         /*occupancyCliffStages*/ 3,
@@ -110,6 +118,8 @@ SMResources resourcesFor(int sm) {
         /*maxRegsPerSM*/ 65536,
         /*maxWarpsPerSM*/ 48,
         /*maxThreadsPerSM*/ 1536,
+        /*waveSize*/ 32,
+        /*numCUs*/ 0,
         /*effectiveSmemPerBlock*/ 24 * 1024,
         /*pipelineThreshold*/ 128,
         /*occupancyCliffStages*/ 3,
@@ -127,6 +137,8 @@ SMResources resourcesFor(int sm) {
         /*maxRegsPerSM*/ 65536,
         /*maxWarpsPerSM*/ 64,
         /*maxThreadsPerSM*/ 2048,
+        /*waveSize*/ 32,
+        /*numCUs*/ 0,
         /*effectiveSmemPerBlock*/ 48 * 1024,
         /*pipelineThreshold*/ 128,
         /*occupancyCliffStages*/ 4,
@@ -139,16 +151,32 @@ SMResources resourcesFor(int sm) {
   return conservativeResources(sm);
 }
 
-// M0d: AMD resource tables are filled in at migration time.  Until then,
-// return conservative resources and warn.  gfx942 (CDNA3/MI300), gfx950 and
-// gfx1250 are the expected targets.
+// AMD capacity hints.  Until official per-SKU numbers are available these
+// values are conservative: wave64/32, 64KB LDS per CU, 16 waves per CU
+// accounted, no TMA.  numCUs=0 means device capacity is not modeled yet.
 SMResources resourcesForAMD(const std::string &arch) {
+  auto amd = [](int waveSize, int64_t ldsPerCU) {
+    SMResources r = conservativeResources(/*version=*/0);
+    r.waveSize = waveSize;
+    r.smemPerSM = (int)ldsPerCU;
+    r.maxWarpsPerSM = 16;      // conservative waves-per-CU accounting
+    r.maxThreadsPerSM = 16 * waveSize;
+    r.numCUs = 0;              // capacity unknown; occupancy stays conservative
+    r.hasTMA = false;
+    r.cpAsyncLatency = 40;
+    r.asyncCopyMinWidth = 16;
+    return r;
+  };
+  if (arch == "gfx942")
+    return amd(/*waveSize=*/64, /*ldsPerCU=*/64 * 1024);
+  if (arch == "gfx950" || arch == "gfx1250")
+    return amd(/*waveSize=*/32, /*ldsPerCU=*/64 * 1024);
+  if (arch == "gfx936")
+    return amd(/*waveSize=*/64, /*ldsPerCU=*/64 * 1024);
+
   llvm::errs() << "[PACT SMDetect] WARNING: AMD target '" << arch
-               << "' detected but resource table not yet populated — "
-               << "using conservative fallback.\n";
-  // TODO(AMD migration): map gfx942/gfx950/gfx1250 to real SMResources
-  // (wave size 64/32, LDS 64KB/CU, ds_read async copy semantics).
-  return conservativeResources(/*version=*/0);
+               << "' has no resource table — using conservative fallback.\n";
+  return amd(/*waveSize=*/64, /*ldsPerCU=*/64 * 1024);
 }
 
 } // anonymous namespace
@@ -286,13 +314,14 @@ double SMDetector::estimateOccupancy(int numStages, int64_t smemPerBlock,
   // It is retained in the signature for API compatibility and debug logging.
   (void)numStages;
 
-  int threadsPerBlock = numWarps * 32;
+  int waveSize = sm.waveSize > 0 ? sm.waveSize : 32;
+  int threadsPerBlock = numWarps * waveSize;
   int64_t smemTotal = smemPerBlock + 4 * 1024; // +fixed overhead
 
   // Blocks limited by SMEM
   int blocksBySMEM = sm.smemPerSM / std::max(smemTotal, (int64_t)1);
   // Blocks limited by registers
-  int regsPerWarp = regsPerThread * 32;
+  int regsPerWarp = regsPerThread * waveSize;
   int regsPerBlock = regsPerWarp * numWarps;
   int blocksByRegs = sm.maxRegsPerSM / std::max(regsPerBlock, 1);
   // Blocks limited by warps

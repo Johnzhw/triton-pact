@@ -218,6 +218,10 @@ class HIPBackend(BaseBackend):
 
     @staticmethod
     def make_ttir(mod, metadata, options):
+        # PACT Phase 0: propagate AMD gfx arch to C++ passes.
+        if knobs.pact.enable:
+            os.environ.setdefault("PACT_AMD_ARCH", options.arch)
+
         pm = ir.pass_manager(mod.context)
         pm.enable_debug()
         passes.common.add_inliner(pm)
@@ -226,6 +230,13 @@ class HIPBackend(BaseBackend):
         passes.common.add_canonicalizer(pm)
         passes.ttir.add_combine(pm)
         passes.ttir.add_reorder_broadcast(pm)
+        # PACT: Page-aware compilation passes (TTIR level).
+        if knobs.pact.enable and knobs.pact.enable_page_transform:
+            passes.ttir.add_page_transform(pm)
+        if knobs.pact.enable and knobs.pact.enable_page_local_analysis:
+            passes.ttir.add_pact_page_local_analysis(pm)
+        if knobs.pact.enable and knobs.pact.enable_auto_num_warps:
+            passes.ttir.add_pact_auto_num_warps(pm)
         passes.common.add_cse(pm)
         passes.ttir.add_triton_licm(pm)
         passes.common.add_symbol_dce(pm)
@@ -235,6 +246,21 @@ class HIPBackend(BaseBackend):
 
     @staticmethod
     def make_ttgir(mod, metadata, options):
+        # P11: read pact.optimal_num_warps before TTIR→TTGIR conversion.
+        if knobs.pact.enable and knobs.pact.enable_auto_num_warps:
+            try:
+                op = mod.get_operation()
+                if hasattr(op, 'attributes'):
+                    pact_warp = op.attributes.get("pact.optimal_num_warps")
+                    if pact_warp is not None:
+                        pw = int(pact_warp.value)
+                        if pw != options.num_warps:
+                            print(f"[PACT P11→compiler] num_warps: "
+                                  f"{options.num_warps} -> {pw}")
+                            options.num_warps = pw
+            except Exception:
+                pass
+
         pm = ir.pass_manager(mod.context)
         pm.enable_debug()
         passes.ttir.add_convert_to_ttgpuir(pm, f"hip:{options.arch}", options.num_warps, options.warp_size,
@@ -244,6 +270,8 @@ class HIPBackend(BaseBackend):
         pm.enable_debug()
         emuTF32 = False
         passes.ttgpuir.add_coalesce(pm)
+        if knobs.pact.enable and knobs.pact.enable_auto_num_stages:
+            passes.ttgpuir.add_pact_auto_num_stages(pm)
         passes.ttgpuir.add_f32_dot_tc(pm, emuTF32)
         passes.ttgpuir.add_remove_layout_conversions(pm)
         passes.ttgpuir.add_optimize_thread_locality(pm)

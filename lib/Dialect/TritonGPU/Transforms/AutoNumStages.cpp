@@ -106,8 +106,10 @@ static int computeOptimalNumStages(int64_t tileBytes, int64_t estIterations,
   int tilesPerPage = (tileTokens > 0 && tileTokens <= pageSize)
                          ? pageSize / tileTokens : 1;
 
+  bool isNvidia = pact::SMDetector::getBackend() ==
+                  pact::TargetBackend::NVIDIA;
   // Ampere (SM 80-89): Occupancy-First Heuristic
-  if (sm.smVersion < 90) {
+  if (isNvidia && sm.smVersion < 90) {
     if (estIterations <= 16) {
       llvm::errs() << "[PACT P6] " << pact::SMDetector::getGPUName()
                    << ": short seq (" << estIterations
@@ -157,6 +159,16 @@ static int computeOptimalNumStages(int64_t tileBytes, int64_t estIterations,
                  << (occCurrent > 0 ? (int)((occCurrent - occNext) / occCurrent * 100)
                                     : 0)
                  << "%)\n";
+    return defaultStages;
+  }
+
+  // AMD: keep the native default until a CDNA-specific occupancy model is
+  // validated on real hardware.  The page semantics and exact V still apply;
+  // only the stage heuristic is deferred.
+  if (!isNvidia) {
+    llvm::errs() << "[PACT P6] " << pact::SMDetector::getGPUName()
+                 << ": AMD target — keeping num_stages=" << defaultStages
+                 << " (CDNA stage model pending hardware validation)\n";
     return defaultStages;
   }
 

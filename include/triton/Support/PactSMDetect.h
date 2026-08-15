@@ -34,6 +34,8 @@ struct SMResources {
   int maxRegsPerSM;       // 65536 (both)
   int maxWarpsPerSM;      // 48 (RTX 3080), 64 (A100), 64 (H100)
   int maxThreadsPerSM;    // 1536 (Ampere), 2048 (Hopper)
+  int waveSize;           // 32 (NVIDIA), 64 (AMD CDNA3/gfx9-class)
+  int numCUs;             // device compute-unit count (AMD capacity hint)
 
   // === PACT derived parameters ===
   int effectiveSmemPerBlock; // usable SMEM considering block table overhead

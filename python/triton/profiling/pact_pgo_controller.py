@@ -26,9 +26,6 @@ def facts_to_hints(facts: Dict[str, Any]) -> Dict[str, int]:
             int(facts["active_warp_ratio_permille"])
     if facts.get("regs_per_thread", 0) > 0:
         hints["pact.pgo.regs_per_thread"] = int(facts["regs_per_thread"])
-    if facts.get("pipeline_overlap_benefit_permille") is not None:
-        hints["pact.pgo.pipeline_overlap_benefit_permille"] = \
-            int(facts["pipeline_overlap_benefit_permille"])
     return hints
 
 

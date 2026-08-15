@@ -258,8 +258,7 @@ class CUDABackend(BaseBackend):
                     builder = ir.builder(mod.context)
                     int_hints = ("pact.pgo.measured_iterations",
                                  "pact.pgo.regs_per_thread",
-                                 "pact.pgo.active_warp_ratio_permille",
-                                 "pact.pgo.pipeline_overlap_benefit_permille")
+                                 "pact.pgo.active_warp_ratio_permille")
                     for name in int_hints:
                         if name in hints:
                             mod.set_attr(name,

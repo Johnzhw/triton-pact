@@ -1061,10 +1061,10 @@ void lowerLoop(scf::ForOp forOp,
                triton::ModuleAxisInfoAnalysis &axisInfoAnalysis) {
   CoarseSchedule schedule;
   if (failed(schedule.deSerialize(forOp))) {
-    llvm::errs() << "[PACT Pipeline] lowerLoop SKIPPED: no schedule found\n";
+    llvm::errs() << "[Triton Pipeline] lowerLoop SKIPPED: no schedule found\n";
     return;
   }
-  llvm::errs() << "[PACT Pipeline] lowerLoop: schedule found, processing...\n";
+  llvm::errs() << "[Triton Pipeline] lowerLoop: schedule found, processing...\n";
   scf::ForOp newForOp = lowerMMAs(forOp, schedule);
   newForOp = lowerLoads(newForOp, schedule, axisInfoAnalysis);
   newForOp = lowerTMADescriptors(newForOp, schedule);

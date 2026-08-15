@@ -24,14 +24,7 @@ add_triton_library(TritonGPUTransforms
   Pipeliner/PipeliningUtility.cpp
   Pipeliner/Schedule.cpp
   AutoNumStages.cpp
-  PipelineHints.cpp
-  GuardFusion.cpp
-  ResourceHints.cpp
   Prefetch.cpp
-  PrefetchInsert.cpp
-  AddressStrengthReduce.cpp
-  BlockTableSMEMHoist.cpp
-  PactLayoutRemap.cpp
   RemoveLayoutConversions.cpp
   ReorderInstructions.cpp
   CoalesceAsyncCopy.cpp

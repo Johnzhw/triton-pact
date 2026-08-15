@@ -51,20 +51,10 @@ void init_triton_passes_ttir(py::module &&m) {
   ADD_PASS_WRAPPER_0("add_triton_licm", createTritonLoopInvariantCodeMotion);
   ADD_PASS_WRAPPER_0("add_loop_aware_cse", createTritonLoopAwareCSE);
   ADD_PASS_WRAPPER_0("add_page_transform", createTritonPageTransform);
-  ADD_PASS_WRAPPER_0("add_pact_prefetch", createTritonPactPrefetch);
-  ADD_PASS_WRAPPER_0("add_pattern_specialize", createTritonPatternSpecialize);
-  ADD_PASS_WRAPPER_0("add_block_table_scalarize",
-                     createTritonBlockTableScalarize);
-  ADD_PASS_WRAPPER_0("add_pact_dot_promotion",
-                     createPACTDotPromotion);
   ADD_PASS_WRAPPER_0("add_pact_page_local_analysis",
                      createPACTPageLocalAnalysis);
-  ADD_PASS_WRAPPER_0("add_pact_page_major_tile",
-                     createPACTPageMajorTile);
   ADD_PASS_WRAPPER_0("add_pact_auto_num_warps",
                      createPACTAutoNumWarps);
-  ADD_PASS_WRAPPER_0("add_pact_run_coalesce",
-                     createPACTRunCoalescing);
   ADD_PASS_OPTION_WRAPPER_4("add_convert_to_ttgpuir",
                             createConvertTritonToTritonGPU, const std::string &,
                             int, int, int);
@@ -108,16 +98,7 @@ void init_triton_passes_ttgpuir(py::module &&m) {
   ADD_PASS_WRAPPER_0("add_fuse_nested_loops", createTritonGPUFuseNestedLoops);
   ADD_PASS_WRAPPER_0("add_coalesce_async_copy",
                      createTritonGPUCoalesceAsyncCopy);
-  ADD_PASS_WRAPPER_0("add_prefetch_insert", createTritonGPUPrefetchInsert);
-  ADD_PASS_WRAPPER_0("add_pact_layout_remap", createTritonGPUPactLayoutRemap);
-  ADD_PASS_WRAPPER_0("add_pact_pipeline_hints", createPACTPipelineHints);
   ADD_PASS_WRAPPER_0("add_pact_auto_num_stages", createPACTAutoNumStages);
-  ADD_PASS_WRAPPER_0("add_pact_guard_fusion", createPACTGuardFusion);
-  ADD_PASS_WRAPPER_0("add_pact_resource_hints", createPACTResourceHints);
-  ADD_PASS_WRAPPER_0("add_address_strength_reduce",
-                     createTritonGPUAddressStrengthReduce);
-  ADD_PASS_WRAPPER_0("add_block_table_smem_hoist",
-                     createTritonGPUBlockTableSMEMHoist);
   ADD_PASS_WRAPPER_0("add_global_sanitizer",
                      createTritonInstrumentGlobalSanitizer);
   ADD_PASS_WRAPPER_0("add_concurrency_sanitizer",

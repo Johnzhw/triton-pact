@@ -340,86 +340,6 @@ def TritonGPUCoalesceAsyncCopy: Pass<"tritongpu-coalesce-async-copy", "mlir::Mod
                            "mlir::triton::TritonDialect"];
 }
 
-def TritonGPUPrefetchInsert : Pass<"tritongpu-prefetch-insert", "mlir::ModuleOp"> {
-  let summary = "Insert async copy + double-buffering for paged KV cache loads";
-  let description = [{
-    Converts annotated paged KV cache loads (tt.load with pact.paged_load
-    attribute) into asynchronous ttg.async_copy_global_to_local operations
-    with software double-buffering (prefetch distance = 1). Uses existing
-    ttg.async_commit_group / ttg.async_wait infrastructure. No-op fallback
-    if no paged loads are annotated or if hardware constraints are not met.
-  }];
-  let dependentDialects = ["mlir::triton::gpu::TritonGPUDialect",
-                           "mlir::triton::nvidia_gpu::TritonNvidiaGPUDialect",
-                           "mlir::scf::SCFDialect",
-                           "mlir::arith::ArithDialect"];
-}
-
-def TritonGPUAddressStrengthReduce : Pass<"tritongpu-address-strength-reduce", "mlir::ModuleOp"> {
-  let summary = "Address Strength Reduction for paged attention tile loops";
-  let description = [{
-    Hoists loop-invariant address computation terms out of paged attention
-    tile loops (scf.for with pact.prefetch_eligible).  When PAGE_SIZE is a
-    compile-time constant and matches TILE_SIZE, the page-offset and
-    head-dimension terms are loop-invariant and can be computed once before
-    the loop.  For PAGE_SIZE > TILE_SIZE, additionally rewrites same-page
-    address updates as simple IV recurrence (addr += TILE_SIZE * stride).
-    Falls back to no-op when the pattern is not recognized.
-  }];
-  let dependentDialects = ["mlir::triton::gpu::TritonGPUDialect",
-                           "mlir::triton::TritonDialect",
-                           "mlir::scf::SCFDialect",
-                           "mlir::arith::ArithDialect"];
-}
-
-def TritonGPUBlockTableSMEMHoist : Pass<"tritongpu-block-table-smem-hoist", "mlir::ModuleOp"> {
-  let summary = "Hoist block_table loads to SMEM before paged attention tile loop";
-  let description = [{
-    Hoists the block_table lookup (tt.load with pact.block_table_lookup) out
-    of the tile loop: allocates shared memory for the entire block_table row
-    (Nb × i32 entries), async-copies it from global memory before the loop,
-    and replaces the in-loop loads with local_load from SMEM.
-
-    This eliminates ~300-cycle global memory loads per tile iteration,
-    replacing them with ~20-cycle SMEM reads. Only applied when the SMEM
-    budget is sufficient (entries × 4 bytes < available SMEM) and the
-    sequence length is compile-time inferable.
-  }];
-  let dependentDialects = ["mlir::triton::gpu::TritonGPUDialect",
-                           "mlir::triton::TritonDialect",
-                           "mlir::scf::SCFDialect",
-                           "mlir::arith::ArithDialect"];
-}
-
-def TritonGPUPactLayoutRemap : Pass<"tritongpu-pact-layout-remap", "mlir::ModuleOp"> {
-  let summary = "Remap paged KV load layouts for cp.async eligibility";
-  let description = [{
-    Remaps tensor layouts of paged K/V loads (tt.load with pact.paged_load)
-    to make them cp.async-eligible.  For K loads, makes the head_dim axis
-    the contiguous dimension.  For V loads, converts per-element masks to
-    unconditional load + post-load arith.select.  No-op fallback if no
-    paged loads are annotated or if remapping is not possible.
-  }];
-  let dependentDialects = ["mlir::triton::gpu::TritonGPUDialect",
-                           "mlir::triton::TritonDialect",
-                           "mlir::arith::ArithDialect"];
-}
-
-def PACTPipelineHints : Pass<"tritongpu-pact-pipeline-hints", "mlir::ModuleOp"> {
-  let summary = "Compute pipeline hints for paged KV loads";
-  let description = [{
-    Reads PACT P1/P2 semantic attributes from tt.load ops annotated with
-    pact.paged_load, and computes 13 hint values covering page geometry,
-    safety margins, iteration estimates, and optimization suggestions.
-
-    Hints are consumed by: Coalesce (hints 1-2), Pipeline (hints 3-11),
-    and LLVM lowering (hints 12-13).  Controlled by PACT_ENABLE_PIPELINE_HINTS.
-  }];
-  let dependentDialects = ["mlir::triton::gpu::TritonGPUDialect",
-                           "mlir::triton::TritonDialect",
-                           "mlir::arith::ArithDialect"];
-}
-
 def PACTAutoNumStages : Pass<"tritongpu-pact-auto-num-stages", "mlir::ModuleOp"> {
   let summary = "Set page-aware optimal num_stages on paged loops";
   let description = [{
@@ -427,30 +347,6 @@ def PACTAutoNumStages : Pass<"tritongpu-pact-auto-num-stages", "mlir::ModuleOp">
     page-aware heuristics (tilesPerPage → L2 locality).  Sets ttg.num_stages
     loop attribute so the pipeline pass picks up the overridden value.
     Controlled by PACT_ENABLE_AUTO_NUM_STAGES (default ON).
-  }];
-  let dependentDialects = ["mlir::triton::gpu::TritonGPUDialect",
-                           "mlir::triton::TritonDialect",
-                           "mlir::arith::ArithDialect"];
-}
-
-def PACTGuardFusion : Pass<"tritongpu-pact-guard-fusion", "mlir::ModuleOp"> {
-  let summary = "Fuse seq boundary and page boundary masks into single comparison";
-  let description = [{
-    Fuses the dual mask pattern (cmp+and+cmp) on pact.paged_load ops into a
-    single min-based comparison.  Only activates when page_boundary_safe=false.
-    Default OFF.
-  }];
-  let dependentDialects = ["mlir::triton::gpu::TritonGPUDialect",
-                           "mlir::triton::TritonDialect",
-                           "mlir::arith::ArithDialect"];
-}
-
-def PACTResourceHints : Pass<"tritongpu-pact-resource-hints", "mlir::ModuleOp"> {
-  let summary = "Aggregate pipeline hints into kernel-level resource estimates";
-  let description = [{
-    Collects P4 pipeline hints across all pact.paged_load ops and outputs a
-    JSON-style module attribute with SMEM/reg/occupancy/memory-bound estimates
-    for NanoFlow-style scheduler consumption.  Default OFF.
   }];
   let dependentDialects = ["mlir::triton::gpu::TritonGPUDialect",
                            "mlir::triton::TritonDialect",

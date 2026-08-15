@@ -91,59 +91,6 @@ def TritonPageTransform : Pass<"triton-page-transform", "mlir::ModuleOp"> {
   let dependentDialects = ["mlir::triton::TritonDialect", "mlir::arith::ArithDialect"];
 }
 
-def TritonPactPrefetch : Pass<"triton-pact-prefetch", "mlir::ModuleOp"> {
-  let summary = "Software block-table prefetch restructuring for paged attention";
-  let description = [{
-    Restructures the main tile loop to prefetch the next iteration's
-    block_table lookup while computing the current iteration's attention.
-    Operates at TTIR level, before TTGIR conversion.
-  }];
-  let dependentDialects = ["mlir::triton::TritonDialect", "mlir::arith::ArithDialect"];
-}
-
-def TritonBlockTableScalarize : Pass<"triton-block-table-scalarize", "mlir::ModuleOp"> {
-  let summary = "Scalarize uniform block_table tensor loads to scalar+splat";
-  let description = [{
-    Converts block_table tensor gather loads (tt.load with
-    pact.block_table_lookup, loading tensor<16xi32> where all 16 lanes
-    carry the same value) into a scalar load + splat.  This eliminates
-    redundant lanes and simplifies downstream optimizations.
-
-    Only applied when uniformity can be proven: PAGE_SIZE and TILE_SIZE
-    are compile-time constants, TILE_SIZE <= PAGE_SIZE, and the page index
-    computation is divsi(j*TILE + offs_t, PAGE) which yields identical
-    values for all lanes when TILE divides PAGE.
-  }];
-  let dependentDialects = ["mlir::triton::TritonDialect", "mlir::arith::ArithDialect"];
-}
-
-def TritonPatternSpecialize : Pass<"triton-pattern-specialize", "mlir::ModuleOp"> {
-  let summary = "Specialize MQA/GQA head mapping for paged attention";
-  let description = [{
-    Reads pact.mqa / pact.gqa metadata from function attributes and performs
-    conservative KV head mapping canonicalization. For MQA, canonicalizes
-    kv_head_idx to 0. For GQA, ensures kv_head_idx = q_head_idx / group_size.
-    Records sharing metadata for downstream PrefetchInsert. No-op fallback
-    if metadata is missing or GQA group size is invalid.
-  }];
-  let dependentDialects = ["mlir::triton::TritonDialect", "mlir::arith::ArithDialect"];
-}
-
-def PACTDotPromotion : Pass<"triton-pact-dot-promotion", "mlir::ModuleOp"> {
-  let summary = "Promote tl.sum(q*k) to tl.dot for tensor core (MMA) acceleration";
-  let description = [{
-    Detects element-wise sum(mul(q, k)) patterns in 2D tensors and promotes
-    them to tt.dot operations.  This replaces FMA (CUDA core) instructions
-    with MMA (tensor core) instructions, achieving 2-4x speedup for the
-    attention score computation.
-
-    Transform: arith.mulf + tt.reduce(sum axis=1) → tt.dot
-    Only activates for f16/bf16 element types with MMA-friendly K dimensions
-    (16, 32, 64, 128).  Default ON.
-  }];
-  let dependentDialects = ["mlir::triton::TritonDialect", "mlir::arith::ArithDialect"];
-}
-
 def PACTPageLocalAnalysis : Pass<"triton-pact-page-local-analysis", "mlir::ModuleOp"> {
   let summary = "Analyze page-local memory contiguity for paged KV loads";
   let description = [{
@@ -159,17 +106,6 @@ def PACTPageLocalAnalysis : Pass<"triton-pact-page-local-analysis", "mlir::Modul
   let dependentDialects = ["mlir::triton::TritonDialect", "mlir::arith::ArithDialect"];
 }
 
-def PACTPageMajorTile : Pass<"triton-pact-page-major-tile", "mlir::ModuleOp"> {
-  let summary = "Reorder token-major loops to page-major for L2 locality";
-  let description = [{
-    Transforms single-level scf.for loops (token-major) into double-nested
-    page-major loops (page loop + tile-in-page loop) when page_size >= 2*tile_size.
-    Improves L2 cache locality by grouping consecutive tiles within the same
-    physical page.  Default OFF — changes FP16 accumulation order.
-  }];
-  let dependentDialects = ["mlir::triton::TritonDialect", "mlir::arith::ArithDialect"];
-}
-
 def PACTAutoNumWarps : Pass<"triton-pact-auto-num-warps", "mlir::ModuleOp"> {
   let summary = "Recommend optimal num_warps based on kernel structure analysis";
   let description = [{
@@ -178,16 +114,6 @@ def PACTAutoNumWarps : Pass<"triton-pact-auto-num-warps", "mlir::ModuleOp"> {
     before make_ttgir to adjust opt.num_warps.  Default OFF.
   }];
   let dependentDialects = ["mlir::triton::TritonDialect"];
-}
-
-def PACTRunCoalescing : Pass<"triton-pact-run-coalescing", "mlir::ModuleOp"> {
-  let summary = "Coalesce sparse token selections into page-aware contiguous runs";
-  let description = [{
-    Groups sparse token indices into page-local contiguous runs for efficient
-    cp.async DMA.  Isolated tokens fall back to scalar gather.  Requires
-    pact.token_mask attribute.  Default OFF.
-  }];
-  let dependentDialects = ["mlir::triton::TritonDialect", "mlir::arith::ArithDialect"];
 }
 
 #endif

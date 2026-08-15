@@ -256,22 +256,10 @@ class CUDABackend(BaseBackend):
         # PACT: Page-aware compilation passes (TTIR level)
         if knobs.pact.enable and knobs.pact.enable_page_transform:
             passes.ttir.add_page_transform(pm)
-        if knobs.pact.enable and knobs.pact.enable_dot_promotion:
-            passes.ttir.add_pact_dot_promotion(pm)
-        if knobs.pact.enable and knobs.pact.enable_pattern_specialize:
-            passes.ttir.add_pattern_specialize(pm)
-        if knobs.pact.enable and knobs.pact.enable_bt_prefetch:
-            passes.ttir.add_pact_prefetch(pm)
-        if knobs.pact.enable and knobs.pact.enable_bt_scalarize:
-            passes.ttir.add_block_table_scalarize(pm)
         if knobs.pact.enable and knobs.pact.enable_page_local_analysis:
             passes.ttir.add_pact_page_local_analysis(pm)
         if knobs.pact.enable and knobs.pact.enable_auto_num_warps:
             passes.ttir.add_pact_auto_num_warps(pm)
-        if knobs.pact.enable and knobs.pact.enable_page_major_tile:
-            passes.ttir.add_pact_page_major_tile(pm)
-        if knobs.pact.enable and knobs.pact.enable_run_coalesce:
-            passes.ttir.add_pact_run_coalesce(pm)
         passes.common.add_cse(pm)
         passes.common.add_symbol_dce(pm)
         passes.ttir.add_loop_unroll(pm)
@@ -309,20 +297,8 @@ class CUDABackend(BaseBackend):
         passes.ttgpuir.add_optimize_thread_locality(pm)
         passes.ttgpuir.add_accelerate_matmul(pm)
         passes.ttgpuir.add_remove_layout_conversions(pm)
-        if knobs.pact.enable and knobs.pact.enable_bt_smem_hoist:
-            passes.ttgpuir.add_block_table_smem_hoist(pm)
-        if knobs.pact.enable and knobs.pact.enable_layout_remap:
-            passes.ttgpuir.add_pact_layout_remap(pm)
-        if knobs.pact.enable and knobs.pact.enable_prefetch_insert \
-           and capability // 10 >= 8:
-            passes.ttgpuir.add_prefetch_insert(pm)
-        if knobs.pact.enable and knobs.pact.enable_pipeline_hints:
-            passes.ttgpuir.add_pact_pipeline_hints(pm)
         if knobs.pact.enable and knobs.pact.enable_auto_num_stages:
             passes.ttgpuir.add_pact_auto_num_stages(pm)
-        if knobs.pact.enable and knobs.pact.enable_guard_fusion:
-            passes.ttgpuir.add_pact_guard_fusion(pm)
-        # P10 merged into P4 (PipelineHints) — uses same knob
         passes.ttgpuir.add_optimize_dot_operands(pm, capability >= 80)
         nvidia.passes.ttnvgpuir.add_optimize_descriptor_encoding(pm)
         passes.ttir.add_loop_aware_cse(pm)

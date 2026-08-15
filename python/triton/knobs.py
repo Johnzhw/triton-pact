@@ -576,59 +576,11 @@ class pact_knobs(base_knobs):
     """
     enable: env_bool = env_bool("PACT_ENABLE", False)
     enable_page_transform: env_bool = env_bool("PACT_ENABLE_PAGE_TRANSFORM", True)
-    enable_dot_promotion: env_bool = env_bool("PACT_ENABLE_DOT_PROMOTION", True)
-    enable_pattern_specialize: env_bool = env_bool("PACT_ENABLE_PATTERN_SPECIALIZE", True)
-    enable_prefetch_insert: env_bool = env_bool("PACT_ENABLE_PREFETCH_INSERT", False)
-    enable_layout_remap: env_bool = env_bool("PACT_ENABLE_LAYOUT_REMAP", False)
-    enable_bt_prefetch: env_bool = env_bool("PACT_ENABLE_BT_PREFETCH", False)
-    enable_address_sr: env_bool = env_bool("PACT_ENABLE_ADDRESS_SR", False)
-    enable_bt_smem_hoist: env_bool = env_bool("PACT_ENABLE_BT_SMEM_HOIST", False)
-    enable_bt_scalarize: env_bool = env_bool("PACT_ENABLE_BT_SCALARIZE", False)
-    enable_axisinfo_override: env_bool = env_bool("PACT_ENABLE_AXISINFO_OVERRIDE", True)
-    # === Phase 2 knobs ===
-    # P0: AxisInfo penetration through intermediate ops (Pass B)
-    enable_pass_b: env_bool = env_bool("PACT_ENABLE_PASS_B", True)
-    pass_b_max_depth: env_int = env_int("PACT_PASS_B_MAX_DEPTH", 4)
-    # P2: Page-local memory analysis
     enable_page_local_analysis: env_bool = env_bool("PACT_ENABLE_PAGE_LOCAL_ANALYSIS", True)
-    # P3: Guarded AxisInfo override (three strategies)
-    enable_guarded_override: env_bool = env_bool("PACT_ENABLE_GUARDED_OVERRIDE", True)
-    # P4: Pipeline hints system (13 hints)
-    enable_pipeline_hints: env_bool = env_bool("PACT_ENABLE_PIPELINE_HINTS", True)
-    # P5: Static pipeline profitability model
-    enable_static_profitability: env_bool = env_bool("PACT_ENABLE_STATIC_PROFITABILITY", True)
-    # P6: Auto num_stages selection (page-aware heuristic)
     enable_auto_num_stages: env_bool = env_bool("PACT_ENABLE_AUTO_NUM_STAGES", True)
     enable_auto_num_warps: env_bool = env_bool("PACT_ENABLE_AUTO_NUM_WARPS", False)
-    max_pipeline_stages: env_int = env_int("PACT_MAX_PIPELINE_STAGES", 4)
-    # P7: Page-major tile ordering (default OFF — changes computation order)
-    enable_page_major_tile: env_bool = env_bool("PACT_ENABLE_PAGE_MAJOR_TILE", False)
-    # P8: Mask/page-boundary guard fusion (default OFF)
-    enable_guard_fusion: env_bool = env_bool("PACT_ENABLE_GUARD_FUSION", False)
-    # P9: Contiguous-run coalescing (default OFF)
-    enable_run_coalesce: env_bool = env_bool("PACT_ENABLE_RUN_COALESCE", False)
-    # P10: NanoFlow resource hints (default OFF)
-    enable_resource_hints: env_bool = env_bool("PACT_ENABLE_RESOURCE_HINTS", False)
-    # === Phase 2: Proton-powered profile feedback ===
-    enable_proton_feedback: env_bool = env_bool("PACT_ENABLE_PROTON_FEEDBACK", False)
-    proton_sample_interval: env_int = env_int("PACT_PROTON_SAMPLE_INTERVAL", 50)
-    proton_profile_db_path: env_str = env_str("PACT_PROTON_PROFILE_DB_PATH", "")
     dump_ir: env_bool = env_bool("PACT_DUMP_IR", False)
     verbose: env_bool = env_bool("PACT_VERBOSE", False)
-    # === Phase 0/1: Architecture-adaptive optimization ===
-    arch_adaptive: env_bool = env_bool("PACT_ARCH_ADAPTIVE", True)
-    # P3: Ampere contiguity cap (f16 elements, max vector width before cp.async triggers)
-    ampere_contiguity_cap: env_int = env_int("PACT_AMPERE_CONTIGUITY_CAP", 8)
-    # P5: Pipeline block threshold
-    #   "definitely_unprofitable" (default): only block when harm is certain
-    #   "likely_unprofitable": block when harm is likely (more conservative)
-    #   "none": never block pipeline (most permissive)
-    p5_block_threshold: env_str = env_str("PACT_P5_BLOCK_THRESHOLD", "definitely_unprofitable")
-    # P3: AxisInfo override strategy
-    #   "auto": auto-detect from SM version (recommended)
-    #   "ampere_adaptive": force Ampere conservative profile
-    #   "hopper_aggressive": force Hopper aggressive profile
-    axisinfo_override_strategy: env_str = env_str("PACT_AXISINFO_OVERRIDE_STRATEGY", "auto")
 
 
 build = build_knobs()

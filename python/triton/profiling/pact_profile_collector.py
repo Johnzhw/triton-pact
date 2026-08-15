@@ -176,10 +176,11 @@ class PactCuptiFallbackCollector(PactProfileCollector):
     def collect(self, steps: int = 20, trace_path: Optional[Path] = None) -> Dict[str, Any]:
         trace_path = Path(trace_path or (self.cache_root / "pact_cupti.chrome_trace"))
         trace_path.parent.mkdir(parents=True, exist_ok=True)
+        backend = "roctracer" if os.environ.get("PACT_AMD_ARCH") else "cupti"
         code = self._target_args_code() + f"""
 from triton.profiler import start, finalize
 from kernels.pact_optimization_target import run_pact_target
-s = start({str(trace_path.with_suffix(''))!r}, context='shadow', backend='cupti',
+s = start({str(trace_path.with_suffix(''))!r}, context='shadow', backend={backend!r},
           mode='periodic_flushing:format=chrome_trace')
 torch.cuda.synchronize()
 start_ev = torch.cuda.Event(enable_timing=True); end_ev = torch.cuda.Event(enable_timing=True)
@@ -196,7 +197,7 @@ print('LATENCY_US:' + str(latency_us))
         rc, out, err = self._run_subprocess(_make_runner(code, {}), env,
                                             timeout=600, cwd=str(trace_path.parent))
         if rc != 0:
-            raise RuntimeError(f"cupti fallback failed: {err[-2000:]}")
+            raise RuntimeError(f"{backend} fallback failed: {err[-2000:]}")
         facts: Dict[str, Any] = {}
         for line in out.splitlines():
             if line.startswith("LATENCY_US:"):

@@ -51,6 +51,20 @@ inline const std::set<std::string> CACHE_INVALIDATING_ENV_VARS = {
     "TRITON_PARTITION_SCHEDULING_ENABLE_DUMP_DOT",
     "TRITON_PARTITION_SCHEDULING_DUMP_DATA_ONLY",
     "TRITON_PARTITION_SCHEDULING_DUMP_LOOP_ONLY",
+    // PACT: pass selection and numeric inputs are read from the environment by
+    // C++ passes, so every PACT env var must participate in the JIT cache key.
+    "PACT_ENABLE",
+    "PACT_ENABLE_PAGE_TRANSFORM",
+    "PACT_ENABLE_PAGE_LOCAL_ANALYSIS",
+    "PACT_ENABLE_AXISINFO_OVERRIDE",
+    "PACT_ENABLE_PASS_B",
+    "PACT_PASS_B_MAX_DEPTH",
+    "PACT_ENABLE_AUTO_NUM_STAGES",
+    "PACT_ENABLE_AUTO_NUM_WARPS",
+    "PACT_MAX_PIPELINE_STAGES",
+    "PACT_SM_VERSION",
+    "PACT_AMD_ARCH",
+    "PACT_PGO_HINTS_JSON",
     // clang-format on
 };
 

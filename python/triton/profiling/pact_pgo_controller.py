@@ -265,10 +265,13 @@ class PactPgoGatedController:
             return plan
 
         # S3b: theory candidate + explicit 2-warp candidate (P3/M2 retained,
-        # P6/P11 disabled so they cannot override the explicit choice).  A
-        # failed explicit compile only removes that candidate; the theory
-        # candidate remains measurable and its compile cost is still charged.
+        # P6/P11 disabled so they cannot override the explicit choice).
+        # S4: stage_down at the theory warp count is added because the v3
+        # oracle evidence gate (s4_stage_candidates_v3.json) showed it improves
+        # >=5% on 3/7 shapes with no >5% regression.  stage_up failed the same
+        # gate and is deliberately not compiled.
         theory_stages = int(md_dict.get("pact_optimal_num_stages", 3) or 3)
+        theory_warps = int(md_dict.get("num_warps", 4) or 4)
         low_warp = None
         t0 = time.monotonic()
         try:
@@ -278,7 +281,17 @@ class PactPgoGatedController:
             low_warp = None
         overhead_wall_s += time.monotonic() - t0
 
-        variants = {"theory": candidate, "low_warp": low_warp}
+        stage_down = None
+        t0 = time.monotonic()
+        try:
+            stage_down = swapper.compile_explicit(
+                num_stages=max(2, theory_stages - 1), num_warps=theory_warps)
+        except Exception:
+            stage_down = None
+        overhead_wall_s += time.monotonic() - t0
+
+        variants = {"theory": candidate, "low_warp": low_warp,
+                    "stage_down": stage_down}
         us = {"baseline": _measure(swapper, swapper.baseline, measure_iters)}
         for name, kernel in variants.items():
             if kernel is not None:

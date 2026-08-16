@@ -48,6 +48,10 @@ static bool isEnabled() {
   return !env || std::string(env) != "0";
 }
 
+static bool hasExplicitMaxPipelineStages() {
+  return std::getenv("PACT_MAX_PIPELINE_STAGES") != nullptr;
+}
+
 static int getMaxPipelineStages() {
   const char *env = std::getenv("PACT_MAX_PIPELINE_STAGES");
   if (env) {
@@ -106,7 +110,12 @@ static int computeOptimalNumStages(int64_t tileBytes, int64_t estIterations,
   input.tileBytes = tileBytes;
   input.estIterations = estIterations;
   input.defaultStages = defaultStages;
+  // B5 fix: an *explicit* PACT_MAX_PIPELINE_STAGES stays a hard user cap.
+  // When the knob is not set, the default value (4) must not silently clamp a
+  // higher architecture default such as Hopper's 5.
   input.maxStages = getMaxPipelineStages();
+  if (!hasExplicitMaxPipelineStages())
+    input.maxStages = std::max(input.maxStages, defaultStages);
   input.numWarps = numWarps;
 
   auto decision = pact::selectNumStages(input);
@@ -213,6 +222,13 @@ struct PACTAutoNumStagesPass
           tileBytes, estIterations, haveIterationEstimate, pageSize,
           tileTokens, defaultStages, numWarps);
 
+      // Always publish the computed decision on the module so the PGO branch
+      // can read the theory-selected stage count back from metadata even when
+      // it equals the native default.
+      mod->setAttr("pact.optimal_num_stages",
+                   mlir::IntegerAttr::get(
+                       mlir::IntegerType::get(&getContext(), 32), optimal));
+
       if (optimal == defaultStages) {
         llvm::errs() << "[PACT P6] Keeping default num_stages="
                      << defaultStages << " (optimal=" << optimal
@@ -224,11 +240,6 @@ struct PACTAutoNumStagesPass
       auto stagesAttr = mlir::IntegerAttr::get(
           mlir::IntegerType::get(&getContext(), 32), optimal);
       forOp->setAttr("tt.num_stages", stagesAttr);
-
-      // Also write the module attribute for compiler.py fallback.
-      mod->setAttr("pact.optimal_num_stages",
-                   mlir::IntegerAttr::get(
-                       mlir::IntegerType::get(&getContext(), 32), optimal));
 
       llvm::errs() << "[PACT P6] " << pact::SMDetector::getGPUName()
                    << ": num_stages " << defaultStages << " → " << optimal

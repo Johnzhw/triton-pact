@@ -370,6 +370,19 @@ class CUDABackend(BaseBackend):
             passes.common.add_cse(pm)
 
         pm.run(mod, 'make_ttgir')
+        # PACT stage/trigger write-back: the PGO controller reads the theory
+        # decision from the compiled-kernel metadata without parsing IR files.
+        try:
+            op = mod.get_operation()
+            if hasattr(op, 'attributes'):
+                for attr in ("pact.optimal_num_stages", "pact.pgo.trigger",
+                             "pact.pgo.trigger_reason"):
+                    value = op.attributes.get(attr)
+                    if value is not None:
+                        metadata[attr] = (
+                            int(value.value) if hasattr(value, 'value') else str(value))
+        except Exception:
+            pass
         metadata["tensordesc_meta"] = mod.get_tensordesc_metadata()
         return mod
 

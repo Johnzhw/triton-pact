@@ -18,11 +18,11 @@ namespace mlir::triton::pact {
 
 namespace {
 
-double occupancyFor(int64_t tileBytes, int64_t regsPerThread, int numStages,
+double occupancyFor(int64_t smemPerBlock, int64_t regsPerThread, int numStages,
                     int numWarps) {
-  // numStages is folded into the per-block SMEM by the caller, matching
+  // smemPerBlock already includes numStages (callers fold it), matching
   // SMDetector::estimateOccupancy's documented contract.
-  return SMDetector::estimateOccupancy(numStages, tileBytes, regsPerThread,
+  return SMDetector::estimateOccupancy(numStages, smemPerBlock, regsPerThread,
                                        numWarps);
 }
 
@@ -39,8 +39,9 @@ SelectWarpsResult selectNumWarps(int64_t tileBytes, int64_t regsPerThread,
                                  int stagesPerBlock) {
   SelectWarpsResult result;
   const int baseline = PactDecisionConstants::kDefaultNumWarps;
-  result.baselineOccupancy = occupancyFor(tileBytes, regsPerThread,
-                                          stagesPerBlock, baseline);
+  result.baselineOccupancy = occupancyFor(tileBytes * stagesPerBlock,
+                                          regsPerThread, stagesPerBlock,
+                                          baseline);
   result.chosenOccupancy = result.baselineOccupancy;
   result.numWarps = baseline;
 
@@ -59,15 +60,21 @@ SelectWarpsResult selectNumWarps(int64_t tileBytes, int64_t regsPerThread,
   }
 
   double bestGain = -std::numeric_limits<double>::infinity();
-  // Order {2, 1, 8}: on exact ties prefer num_warps=2 (the closest useful
-  // low-warp candidate), then 1, then 8.
+  constexpr double kTieEps = 1e-9;
+  // Strictly-better candidates must beat the computed one-CTA error bound.
+  // A separate S3a tie rule only switches on an exact occupancy tie, where
+  // lowering the warp count cannot cost model occupancy; the order {2, 1, 8}
+  // therefore prefers 2 warps on ties.  No negative-tolerance band is used.
   for (int candidate : {2, 1, 8}) {
     if (candidate == baseline)
       continue;
-    double occ = occupancyFor(tileBytes, regsPerThread, stagesPerBlock,
-                              candidate);
+    double occ = occupancyFor(tileBytes * stagesPerBlock, regsPerThread,
+                              stagesPerBlock, candidate);
     double gain = occ - result.baselineOccupancy;
-    if (gain > result.requiredGain && gain > bestGain) {
+    bool exactTie = std::abs(gain) <= kTieEps;
+    if ((gain > result.requiredGain ||
+         (exactTie && candidate < baseline && !result.switched)) &&
+        gain > bestGain) {
       bestGain = gain;
       result.numWarps = candidate;
       result.chosenOccupancy = occ;

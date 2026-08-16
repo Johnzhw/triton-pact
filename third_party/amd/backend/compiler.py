@@ -328,6 +328,20 @@ class HIPBackend(BaseBackend):
             amd.passes.ttgpuir.add_fp_sanitizer(pm)
             passes.ttgpuir.add_fp_sanitizer(pm)
         pm.run(mod, 'make_ttgir')
+        # PACT stage/trigger write-back, mirroring the NVIDIA backend.  AMD P6
+        # keeps the native default today, so the value is informational until a
+        # validated CDNA model exists.
+        try:
+            op = mod.get_operation()
+            if hasattr(op, 'attributes'):
+                for attr in ("pact.optimal_num_stages", "pact.pgo.trigger",
+                             "pact.pgo.trigger_reason"):
+                    value = op.attributes.get(attr)
+                    if value is not None:
+                        metadata[attr] = (
+                            int(value.value) if hasattr(value, 'value') else str(value))
+        except Exception:
+            pass
         metadata["tensordesc_meta"] = mod.get_tensordesc_metadata()
         return mod
 

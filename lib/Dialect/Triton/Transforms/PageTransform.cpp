@@ -90,6 +90,76 @@ static bool dependsOn(Value val, Operation *target, int maxDepth = 8) {
 }
 
 //===----------------------------------------------------------------------===//
+// B1 v2 helpers: distinguish a scalar-token Q access (decode) from a tile Q
+// access (chunked prefill).  The block-table index chain alone is ambiguous:
+// both value-tensor decode and prefill build `addptr(addptr(block_table, pid
+// offset), page_idx)`.  The reliable structural difference in the shipped
+// kernels is that decode derives a *scalar* query pointer from program_id,
+// whereas prefill splats program_id into a tile and adds make_range offsets
+// before a tensor load.
+//===----------------------------------------------------------------------===//
+
+// Walk users through scalar muli/addi chains.  Returns true when the value
+// eventually becomes the offset of an tt.addptr whose pointer operand is a
+// scalar !tt.ptr (decode-style scalar Q pointer).
+static bool reachesScalarPointerAddPtr(Value val, int maxDepth = 8) {
+  if (maxDepth <= 0)
+    return false;
+  for (auto *user : val.getUsers()) {
+    auto name = user->getName().getStringRef();
+    if (auto addptr = dyn_cast<triton::AddPtrOp>(user)) {
+      if (addptr.getOffset() == val &&
+          !dyn_cast<RankedTensorType>(addptr.getPtr().getType())) {
+        // Require the scalar pointer to originate from a query-named argument:
+        // the prefill block_table chain also contains a scalar
+        // `addptr(block_table_ptr, pid*stride)` and must not count as Q.
+        Value base = addptr.getPtr();
+        if (auto arg = dyn_cast<BlockArgument>(base)) {
+          if (auto nameLoc = dyn_cast<NameLoc>(arg.getLoc())) {
+            StringRef argName = nameLoc.getName().getValue();
+            if (argName.contains("q") || argName.contains("Q"))
+              return true;
+          }
+        }
+      }
+      continue;
+    }
+    if ((name == "arith.addi" || name == "arith.muli") &&
+        user->getNumResults() == 1) {
+      for (auto result : user->getResults())
+        if (result != val && reachesScalarPointerAddPtr(result, maxDepth - 1))
+          return true;
+    }
+  }
+  return false;
+}
+
+// Walk users through tensor shape ops.  Returns true when the value is splat
+// or broadcast into a tensor used as a tile offset (prefill-style Q tile).
+static bool reachesTensorTileOffset(Value val, int maxDepth = 8) {
+  if (maxDepth <= 0)
+    return false;
+  for (auto *user : val.getUsers()) {
+    auto name = user->getName().getStringRef();
+    if (name == "tt.splat" || name == "tt.broadcast" ||
+        name == "tt.expand_dims") {
+      if (user->getNumResults() == 1 &&
+          dyn_cast<RankedTensorType>(user->getResult(0).getType()))
+        return true;
+      continue;
+    }
+    if ((name == "arith.addi" || name == "arith.muli") &&
+        user->getNumResults() == 1 &&
+        dyn_cast<RankedTensorType>(user->getResult(0).getType())) {
+      for (auto result : user->getResults())
+        if (result != val && reachesTensorTileOffset(result, maxDepth - 1))
+          return true;
+    }
+  }
+  return false;
+}
+
+//===----------------------------------------------------------------------===//
 // Helper: extract a constant integer value from an MLIR attribute, supporting
 // both scalar IntegerAttr and splat DenseElementsAttr.
 //===----------------------------------------------------------------------===//
@@ -407,8 +477,30 @@ struct PageTransformPass
 
   static KernelType classifyKernel(ModuleOp mod) {
     bool hasDivsiPattern = false;
-    bool hasAddptrPageIndex = false; // page_idx feeds tt.addptr directly (prefill)
+    bool hasAddptrPageIndex = false;   // page_idx feeds tt.addptr directly
+    bool hasArithPageIndex = false;    // page_idx feeds arith.addi/muli (decode)
     bool hasBlockTableParam = false;
+
+    // B1 v2 Q-path structural signals.  The block-table chain
+    // `addptr(addptr(block_table, pid*stride), page_idx)` is shared by
+    // value-tensor decode and chunked prefill, so it alone cannot classify.
+    // Decode derives a scalar query pointer from program_id; prefill splats
+    // program_id into a tile and adds make_range offsets.
+    bool scalarProgramIdQ = false;
+    bool tileProgramIdQ = false;
+    mod.walk([&](Operation *op) {
+      if (op->getName().getStringRef() != "tt.get_program_id")
+        return WalkResult::advance();
+      auto pidOp = cast<triton::GetProgramIdOp>(op);
+      if (pidOp.getAxisAsInt() != 0) // x-axis only (token/chunk index)
+        return WalkResult::advance();
+      Value pid = pidOp.getResult();
+      if (reachesScalarPointerAddPtr(pid))
+        scalarProgramIdQ = true;
+      if (reachesTensorTileOffset(pid))
+        tileProgramIdQ = true;
+      return WalkResult::advance();
+    });
 
     // Signal A: check for divsi(PAGE_SIZE) patterns
     mod.walk([&](arith::DivSIOp divOp) {
@@ -416,16 +508,13 @@ struct PageTransformPass
         int64_t divisor = constOp.value();
         // PAGE_SIZE is typically 16, 32, 64, 128
         if (divisor == 16 || divisor == 32 || divisor == 64 || divisor == 128) {
-          // prefill kernels feed page_idx directly into tt.addptr
-          // (block_table_ptr + page_idx) rather than through arith.addi/muli
-          // (which decode kernels use for bt_offset = token_idx*max_blocks + page_idx).
           for (auto *user : divOp->getUsers()) {
             if (isa<triton::AddPtrOp>(user))
               hasAddptrPageIndex = true;
-            if (isa<arith::AddIOp, arith::MulIOp, triton::AddPtrOp>(user)) {
+            if (isa<arith::AddIOp, arith::MulIOp>(user))
+              hasArithPageIndex = true;
+            if (isa<arith::AddIOp, arith::MulIOp, triton::AddPtrOp>(user))
               hasDivsiPattern = true;
-              return WalkResult::interrupt();
-            }
           }
         }
       }
@@ -442,14 +531,28 @@ struct PageTransformPass
       }
     }
 
-    // Joint decision: direct addptr indexing = prefill, otherwise decode.
-    if (hasDivsiPattern && hasAddptrPageIndex)
-      return KernelType::PrefillPagedAttention;
-    if (hasDivsiPattern)
+    if (!hasDivsiPattern) {
+      if (hasBlockTableParam)
+        return KernelType::PrefillPagedAttention;
+      return KernelType::PrefillAttention;
+    }
+
+    // Decode style: page_idx is merged with the per-token block-table stride
+    // through arith.addi/muli before the addptr (pointer-tensor decode).
+    if (hasArithPageIndex && !hasAddptrPageIndex)
       return KernelType::DecodePagedAttention;
-    if (hasBlockTableParam)
+
+    // Ambiguous direct-addptr style: use the Q-path structure, conservatively
+    // staying prefill_paged when the signals disagree or are absent.
+    if (hasAddptrPageIndex) {
+      if (scalarProgramIdQ && !tileProgramIdQ)
+        return KernelType::DecodePagedAttention;
       return KernelType::PrefillPagedAttention;
-    return KernelType::PrefillAttention;
+    }
+
+    // Arithmetic pattern but the page index is also used directly: keep the
+    // conservative prefill label rather than guessing.
+    return KernelType::PrefillPagedAttention;
   }
 
   void runOnOperation() override {

@@ -398,13 +398,15 @@ class CUDABackend(BaseBackend):
         # decision from the compiled-kernel metadata without parsing IR files.
         try:
             op = mod.get_operation()
-            if hasattr(op, 'attributes'):
-                for attr in ("pact.optimal_num_stages", "pact.pgo.trigger",
-                             "pact.pgo.trigger_reason"):
-                    value = op.attributes.get(attr)
-                    if value is not None:
-                        metadata[attr] = (
-                            int(value.value) if hasattr(value, 'value') else str(value))
+            for attr, meta_name in (
+                    ("pact.optimal_num_stages", "pact_optimal_num_stages"),
+                    ("pact.pgo.trigger", "pact_pgo_trigger")):
+                value = op.get_int_attr(attr)
+                if value is not None:
+                    metadata[meta_name] = int(value)
+            value = op.get_str_attr("pact.pgo.trigger_reason")
+            if value is not None:
+                metadata["pact_pgo_trigger_reason"] = str(value)
         except Exception:
             pass
         metadata["tensordesc_meta"] = mod.get_tensordesc_metadata()

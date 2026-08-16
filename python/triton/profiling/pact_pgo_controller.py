@@ -172,8 +172,8 @@ class PactPgoGatedController:
         # G2 theory trigger, computed in C++ and returned through metadata.
         md = candidate.metadata
         md_dict = md._asdict() if hasattr(md, "_asdict") else dict(md)
-        trigger = int(md_dict.get("pact.pgo.trigger", 0) or 0)
-        trigger_reason = md_dict.get("pact.pgo.trigger_reason")
+        trigger = int(md_dict.get("pact_pgo_trigger", 0) or 0)
+        trigger_reason = md_dict.get("pact_pgo_trigger_reason")
         if not force and not trigger:
             plan = {"triggered": False, "reason": f"theory gate: {trigger_reason}",
                     "trigger_reason": trigger_reason, "context_key": key}
@@ -183,7 +183,7 @@ class PactPgoGatedController:
 
         # S3b: theory candidate + explicit 2-warp candidate (P3/M2 retained,
         # P6/P11 disabled so they cannot override the explicit choice).
-        theory_stages = int(md_dict.get("pact.optimal_num_stages", 3) or 3)
+        theory_stages = int(md_dict.get("pact_optimal_num_stages", 3) or 3)
         try:
             low_warp = swapper.compile_explicit(num_stages=theory_stages,
                                                 num_warps=2)

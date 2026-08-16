@@ -160,10 +160,12 @@ if regs_err:
         code = self._target_args_code() + f"""
 from triton.profiler import start, finalize
 from triton.profiler import mode
-from kernels.pact_optimization_target import run_pact_target
 s = start({str(trace_path.with_suffix(''))!r}, data='trace', backend='instrumentation',
           mode=mode.Default(optimizations='clock32,time_shift',
                             buffer_type='global', buffer_size=65536))
+# Import the kernel only after proton has registered its instrumentation
+# dialects in the current backend context.
+from kernels.pact_optimization_target import run_pact_target
 torch.cuda.synchronize()
 # B3 fix: warm up outside any timed region so the first JIT compilation of the
 # instrumented override is excluded from the reported step time.
@@ -175,9 +177,10 @@ for _ in range({steps}):
     out = run_pact_target(q, kc, vc, bt, sl, page_size=P)
 end_ev.record(); torch.cuda.synchronize()
 host_wall_step_us = start_ev.elapsed_time(end_ev) * 1000 / {steps}
-finalize(s, output_format='chrome_trace')
 print('HOST_WALL_STEP_US:' + str(host_wall_step_us))
-# Kernel-only median, measured after finalize so profiler shutdown is excluded.
+# Kernel-only median must be measured while the instrumentation hook is still
+# registered (finalize unregisters it and a post-finalize cache miss would
+# otherwise re-parse the proton.record override without the proton dialect).
 import statistics as _stat
 klat=[]
 for _ in range(min({steps}, 10)):
@@ -185,6 +188,7 @@ for _ in range(min({steps}, 10)):
     st.record(); out = run_pact_target(q, kc, vc, bt, sl, page_size=P); en.record()
     torch.cuda.synchronize(); klat.append(st.elapsed_time(en)*1000.0)
 print('KERNEL_MEDIAN_US:' + str(_stat.median(klat)))
+finalize(s, output_format='chrome_trace')
 """
         shutil.rmtree(self.cache_dir, ignore_errors=True)
         env = self._base_env()
@@ -205,8 +209,13 @@ print('KERNEL_MEDIAN_US:' + str(_stat.median(klat)))
             raise RuntimeError(f"trace missing: {trace_path}")
 
         B, S, P, D, Hq, Hk = self.shape
+        # The trace contains: 1 warmup launch (needed so the instrumented
+        # override is compiled before the timed loop), the timed `steps` loop,
+        # and min(steps,10) kernel-median launches.  Divide the per-scope event
+        # count by the total number of launches.
+        total_launches = steps + 1 + min(steps, 10)
         facts = parse_instrument_trace(trace_path, expected_ctas=B * Hq,
-                                       num_warps=4, steps=steps)
+                                       num_warps=4, steps=total_launches)
         if host_wall_step_us is not None:
             facts["host_wall_step_us"] = host_wall_step_us
         if kernel_median_us is not None:

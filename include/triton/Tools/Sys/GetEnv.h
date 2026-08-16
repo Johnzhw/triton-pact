@@ -65,6 +65,7 @@ inline const std::set<std::string> CACHE_INVALIDATING_ENV_VARS = {
     "PACT_SM_VERSION",
     "PACT_AMD_ARCH",
     "PACT_PGO_HINTS_JSON",
+    "PACT_ENABLE_PGO_TRIGGER",
     // clang-format on
 };
 

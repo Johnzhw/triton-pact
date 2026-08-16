@@ -295,6 +295,9 @@ class HIPBackend(BaseBackend):
         passes.ttgpuir.add_coalesce(pm)
         if knobs.pact.enable and knobs.pact.enable_auto_num_stages:
             passes.ttgpuir.add_pact_auto_num_stages(pm)
+        if (knobs.pact.enable and knobs.pact.enable_auto_num_stages and
+                os.environ.get("PACT_ENABLE_PGO_TRIGGER", "1") != "0"):
+            passes.ttgpuir.add_pact_pgo_trigger(pm)
         passes.ttgpuir.add_f32_dot_tc(pm, emuTF32)
         passes.ttgpuir.add_remove_layout_conversions(pm)
         passes.ttgpuir.add_optimize_thread_locality(pm)

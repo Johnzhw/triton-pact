@@ -6,6 +6,8 @@ The active CompiledKernel can be swapped between decode steps under a lock;
 launches bypass JITFunction.run and go directly through CompiledKernel[grid].
 """
 import dataclasses
+import hashlib
+import json
 import os
 import threading
 from typing import Any, Dict, Optional, Tuple
@@ -60,20 +62,27 @@ def compile_variant(jit_fn, args, kwargs, extra_env: Dict[str, str],
 
 
 class PactKernelSwapper:
-    def __init__(self, jit_fn, args, kwargs, grid, extra_env: Dict[str, str]):
+    def __init__(self, jit_fn, args, kwargs, grid, extra_env: Dict[str, str],
+                 baseline_env: Optional[Dict[str, str]] = None,
+                 candidate_env: Optional[Dict[str, str]] = None):
         self.jit_fn = jit_fn
         self.args = args
         self.kwargs = kwargs
         self.grid = grid
         self.extra_env = dict(extra_env)
+        # Gated PGO starts from vanilla: baseline_env=PACT_ENABLE=0 and
+        # candidate_env=PACT_ENABLE=1.  When not supplied, the legacy behavior
+        # (baseline = candidate base env) is preserved for old callers.
+        self.baseline_env = dict(baseline_env) if baseline_env is not None else dict(extra_env)
+        self.candidate_env = dict(candidate_env) if candidate_env is not None else dict(extra_env)
         self._lock = threading.Lock()
         self.active: Optional[Any] = None
         self.bound_args = None
         self.baseline, self.bound_args = compile_variant(
-            jit_fn, args, kwargs, self.extra_env)
+            jit_fn, args, kwargs, self.baseline_env)
 
     def compile_candidate(self, hints: Dict[str, Any], hints_path: str):
-        env = dict(self.extra_env)
+        env = dict(self.candidate_env)
         # The PGO candidate is the joint-decision build: P6 consumes
         # measured_iterations (always ON) and P11 consumes measured
         # regs_per_thread + active_warp_ratio_permille.  P11 is OFF by
@@ -81,16 +90,22 @@ class PactKernelSwapper:
         # collected facts are missing, P11/P6 fall back to their theory-only
         # paths and this still compiles a valid candidate.
         env.setdefault("PACT_ENABLE_AUTO_NUM_WARPS", "1")
+        # The cache key only hashes the env value (the path), not the JSON
+        # contents.  Make the path depend on the hint contents so changed facts
+        # can never reuse a stale compiled candidate.
+        digest = hashlib.sha256(
+            json.dumps(hints, sort_keys=True).encode()).hexdigest()[:12]
+        p = __import__("pathlib").Path(hints_path)
+        hints_path = str(p.with_name(f"{p.stem}_{digest}{p.suffix}"))
         env["PACT_PGO_HINTS_JSON"] = hints_path
         with open(hints_path, "w") as f:
-            import json
             json.dump(hints, f)
         return compile_variant(self.jit_fn, self.args, self.kwargs, env)[0]
 
     def compile_explicit(self, num_stages: int, num_warps: int):
         """Oracle-grid variant: explicit num_stages/num_warps with the PACT
         auto passes disabled so the knobs are not overridden."""
-        env = dict(self.extra_env)
+        env = dict(self.candidate_env)
         env["PACT_ENABLE_AUTO_NUM_STAGES"] = "0"
         env["PACT_ENABLE_AUTO_NUM_WARPS"] = "0"
         return compile_variant(

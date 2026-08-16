@@ -24,6 +24,7 @@ add_triton_library(TritonGPUTransforms
   Pipeliner/PipeliningUtility.cpp
   Pipeliner/Schedule.cpp
   AutoNumStages.cpp
+  PactPgoTrigger.cpp
   Prefetch.cpp
   RemoveLayoutConversions.cpp
   ReorderInstructions.cpp

@@ -355,4 +355,18 @@ def PACTAutoNumStages : Pass<"tritongpu-pact-auto-num-stages", "mlir::ModuleOp">
                            "mlir::arith::ArithDialect"];
 }
 
+def PACTPgoTrigger : Pass<"tritongpu-pact-pgo-trigger", "mlir::ModuleOp"> {
+  let summary = "Compute the PACT PGO trigger from theory/IR facts";
+  let description = [{
+    PGO branch only.  Reads pact.axisinfo.baseline_contiguity,
+    pact.pagelocal.dim_contiguity, pact.optimal_num_stages / num_warps and the
+    loop trip count, then writes pact.pgo.trigger, pact.pgo.trigger_reason and
+    pact.pgo.opportunity_bits.  The trigger only decides whether to attempt
+    profile-guided recompilation; the actual swap is gated by measurement.
+  }];
+  let dependentDialects = ["mlir::triton::gpu::TritonGPUDialect",
+                           "mlir::triton::TritonDialect",
+                           "mlir::arith::ArithDialect"];
+}
+
 #endif

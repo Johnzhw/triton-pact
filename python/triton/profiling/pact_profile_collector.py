@@ -165,14 +165,26 @@ s = start({str(trace_path.with_suffix(''))!r}, data='trace', backend='instrument
           mode=mode.Default(optimizations='clock32,time_shift',
                             buffer_type='global', buffer_size=65536))
 torch.cuda.synchronize()
+# B3 fix: warm up outside any timed region so the first JIT compilation of the
+# instrumented override is excluded from the reported step time.
+out = run_pact_target(q, kc, vc, bt, sl, page_size=P)
+torch.cuda.synchronize()
 start_ev = torch.cuda.Event(enable_timing=True); end_ev = torch.cuda.Event(enable_timing=True)
 start_ev.record()
 for _ in range({steps}):
     out = run_pact_target(q, kc, vc, bt, sl, page_size=P)
 end_ev.record(); torch.cuda.synchronize()
-latency_us = start_ev.elapsed_time(end_ev) * 1000 / {steps}
+host_wall_step_us = start_ev.elapsed_time(end_ev) * 1000 / {steps}
 finalize(s, output_format='chrome_trace')
-print('LATENCY_US:' + str(latency_us))
+print('HOST_WALL_STEP_US:' + str(host_wall_step_us))
+# Kernel-only median, measured after finalize so profiler shutdown is excluded.
+import statistics as _stat
+klat=[]
+for _ in range(min({steps}, 10)):
+    st=torch.cuda.Event(enable_timing=True); en=torch.cuda.Event(enable_timing=True)
+    st.record(); out = run_pact_target(q, kc, vc, bt, sl, page_size=P); en.record()
+    torch.cuda.synchronize(); klat.append(st.elapsed_time(en)*1000.0)
+print('KERNEL_MEDIAN_US:' + str(_stat.median(klat)))
 """
         shutil.rmtree(self.cache_dir, ignore_errors=True)
         env = self._base_env()
@@ -182,18 +194,23 @@ print('LATENCY_US:' + str(latency_us))
         if rc != 0:
             raise RuntimeError(f"instrumented run failed: {err[-2000:]}")
 
-        latency_us = None
+        host_wall_step_us = None
+        kernel_median_us = None
         for line in out.splitlines():
-            if line.startswith("LATENCY_US:"):
-                latency_us = float(line.split(":", 1)[1])
+            if line.startswith("HOST_WALL_STEP_US:"):
+                host_wall_step_us = float(line.split(":", 1)[1])
+            elif line.startswith("KERNEL_MEDIAN_US:"):
+                kernel_median_us = float(line.split(":", 1)[1])
         if not trace_path.exists():
             raise RuntimeError(f"trace missing: {trace_path}")
 
         B, S, P, D, Hq, Hk = self.shape
         facts = parse_instrument_trace(trace_path, expected_ctas=B * Hq,
                                        num_warps=4, steps=steps)
-        if latency_us is not None:
-            facts["latency_us"] = latency_us
+        if host_wall_step_us is not None:
+            facts["host_wall_step_us"] = host_wall_step_us
+        if kernel_median_us is not None:
+            facts["kernel_median_us"] = kernel_median_us
         if regs > 0:
             facts["regs_per_thread"] = regs
         elif regs_err:
@@ -265,10 +282,14 @@ def parse_instrument_trace(trace_path: Path, expected_ctas: int,
         facts["measured_iterations"] = int(round(
             first_count / max(load_warps, 1) / max(steps, 1)))
 
+    # B2 honesty: this is a participation ratio (unique (pid,tid) observed in
+    # any instrumented scope), NOT hardware occupancy.  It must never be
+    # published under the pact.pgo.active_warp_ratio_permille hint.  A separate
+    # CUPTI probe may provide the real hardware number.
     all_warps = len(set((e.get("pid"), e.get("tid")) for e in events))
     expected_warps = expected_ctas * num_warps
     if expected_warps:
         ratio = min(1.0, all_warps / expected_warps)
-        facts["active_warp_ratio_permille"] = int(round(ratio * 1000))
+        facts["warp_participation_permille"] = int(round(ratio * 1000))
 
     return facts

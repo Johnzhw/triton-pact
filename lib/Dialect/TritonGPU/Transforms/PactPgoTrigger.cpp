@@ -15,6 +15,7 @@
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/Transforms/Passes.h"
 #include "triton/Support/PactPgoDecision.h"
+#include "triton/Support/PactSMDetect.h"
 
 #include "llvm/Support/raw_ostream.h"
 
@@ -98,9 +99,20 @@ struct PACTPgoTriggerPass
       return WalkResult::advance();
     });
 
-    input.defaultStages = 3;
-    if (auto attr = mod->getAttrOfType<IntegerAttr>("tt.num_stages"))
-      input.defaultStages = attr.getInt();
+    // N3: compare chosenStages against the same native baseline P6 used.
+    // P6 publishes pact.native_num_stages; only when P6 did not run fall back
+    // to the same architecture default AutoNumStages would have computed.
+    // The module-level tt.num_stages attribute is never written by the
+    // pipeline, but is honored as a legacy override for external producers.
+    int defaultStages = 3;
+    auto smResources = pact::SMDetector::getResources();
+    if (smResources.smVersion >= 90)
+      defaultStages = smResources.optimalNumStages;
+    if (auto attr = mod->getAttrOfType<IntegerAttr>("pact.native_num_stages"))
+      defaultStages = attr.getInt();
+    else if (auto attr = mod->getAttrOfType<IntegerAttr>("tt.num_stages"))
+      defaultStages = attr.getInt();
+    input.defaultStages = defaultStages;
     input.chosenStages = input.defaultStages;
     if (auto attr = mod->getAttrOfType<IntegerAttr>("pact.optimal_num_stages"))
       input.chosenStages = attr.getInt();

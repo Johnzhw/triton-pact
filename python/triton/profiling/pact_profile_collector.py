@@ -19,8 +19,9 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from triton.profiling.pact_profile_db import default_cache_root
 
-TEST2 = Path("/home/johnzhw/workspace/test_2")
-TRITON_PY = Path("/home/johnzhw/workspace/triton/python")
+TEST2 = Path(os.environ.get("PACT_TEST2_DIR", "/home/johnzhw/workspace/test_2"))
+TRITON_PY = Path(os.environ.get("PACT_TRITON_PY",
+                                "/home/johnzhw/workspace/triton/python"))
 CACHE_ROOT = default_cache_root()
 DEFAULT_ENV = {
     "PACT_ENABLE": "1",

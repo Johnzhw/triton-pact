@@ -64,7 +64,6 @@ inline const std::set<std::string> CACHE_INVALIDATING_ENV_VARS = {
     "PACT_MAX_PIPELINE_STAGES",
     "PACT_SM_VERSION",
     "PACT_AMD_ARCH",
-    "PACT_PGO_HINTS_JSON",
     // clang-format on
 };
 

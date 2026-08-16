@@ -583,7 +583,6 @@ class pact_knobs(base_knobs):
     enable_auto_num_stages: env_bool = env_bool("PACT_ENABLE_AUTO_NUM_STAGES", True)
     enable_auto_num_warps: env_bool = env_bool("PACT_ENABLE_AUTO_NUM_WARPS", False)
     max_pipeline_stages: env_int = env_int("PACT_MAX_PIPELINE_STAGES", 4)
-    dump_ir: env_bool = env_bool("PACT_DUMP_IR", False)
     verbose: env_bool = env_bool("PACT_VERBOSE", False)
 
 

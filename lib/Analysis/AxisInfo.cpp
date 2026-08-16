@@ -228,9 +228,13 @@ static triton::LoadOp reachesPagedLoadReturnOp(Value val, int maxDepth) {
 // mutates the width just to hide the async path.
 
 enum class OverrideStrategy {
-  NoOverride,            // No override: use original AxisInfo inference
-  StaticOverride,        // Statically safe: tile provably fits within page
-  ConservativeOverride,  // Not statically safe: same exact width, guarded path
+  NoOverride, // No override: use original AxisInfo inference.
+  StaticOverride, // Statically safe: tile provably fits within one page.
+  // Not statically safe: PACT returns the *same exact page-bounded width* as
+  // StaticOverride (both strategies are numerically identical); the semantic
+  // difference is that this path relies on Triton's load-mask guarded path
+  // (mask + other=0.0) for out-of-page elements.
+  ConservativeOverride,
 };
 
 // Core P3 decision function: restore the exact page-bounded contiguity for the

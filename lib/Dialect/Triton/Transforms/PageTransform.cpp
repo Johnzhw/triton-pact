@@ -1,8 +1,9 @@
 //===- PageTransform.cpp - PACT Page Transform Pass -----------------------===//
 //
-// PACT PageTransform pass: recognizes paged KV cache access patterns in TTIR.
-// Stage A: semantic recognition — adds pact.* attributes to matching loads.
-// Stage B: safe canonicalization — div→shift, mod→and, conservative hoisting.
+// PACT PageTransform pass: recognizes paged KV cache access patterns in TTIR
+// and annotates matching loads with pact.* semantic attributes.  This pass is
+// annotation-only: it does not rewrite IR structure, addresses, or arithmetic
+// (no div→shift/mod→and canonicalization and no hoisting).
 //
 //===----------------------------------------------------------------------===//
 
@@ -14,7 +15,6 @@
 #include "mlir/IR/Location.h"
 #include "mlir/IR/Value.h"
 #include "mlir/Interfaces/FunctionInterfaces.h"
-#include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/Triton/Transforms/Passes.h"
 
@@ -572,6 +572,9 @@ struct PageTransformPass
         }
 
         if (hasDivByPageSize) {
+          // pact.block_table_lookup is a P1-internal marker: it only prevents
+          // this load from being re-annotated as a paged KV load below.  No
+          // downstream pass reads it.
           loadOp->setAttr("pact.block_table_lookup",
                           UnitAttr::get(&getContext()));
           blockTableLoads.push_back(loadOp);
@@ -581,7 +584,7 @@ struct PageTransformPass
         return WalkResult::advance();
       });
 
-      // If no block table loads found, skip prefetch annotation
+      // If no block table loads found, skip paged KV-load annotation.
       if (blockTableLoads.empty())
         return WalkResult::advance();
 

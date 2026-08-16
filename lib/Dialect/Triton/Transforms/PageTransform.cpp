@@ -24,6 +24,9 @@
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/Support/raw_ostream.h"
 
+#include <cstdlib>
+#include <string>
+
 namespace mlir::triton {
 
 #define GEN_PASS_DEF_TRITONPAGETRANSFORM
@@ -97,11 +100,67 @@ static bool dependsOn(Value val, Operation *target, int maxDepth = 8) {
 // kernels is that decode derives a *scalar* query pointer from program_id,
 // whereas prefill splats program_id into a tile and adds make_range offsets
 // before a tensor load.
+//
+// v4 (S2): the signals are structural only.  Query parameter naming is no
+// longer required (and no longer used); a scalar pointer addptr whose base is
+// a pointer BlockArgument and whose result is splatted into a rank-1 tensor
+// load counts as the decode Q path, regardless of `q_ptr`-style names.
 //===----------------------------------------------------------------------===//
+
+static bool isVerbose() {
+  const char *env = std::getenv("PACT_VERBOSE");
+  return env && std::string(env) == "1";
+}
+
+// Shared page-size predicate: power of two in [16, 256].  ClassifyKernel and
+// detectPageSize must agree on this domain (v3 classify only accepted
+// divsi by {16,32,64,128}, while detection also handled floordivsi and
+// divisors up to 256).
+static bool isPageSizeDivisor(int64_t divisor) {
+  return divisor >= 16 && divisor <= 256 && (divisor & (divisor - 1)) == 0;
+}
+
+// Follow tensor shape ops, tensor addptr and tensor arith until a tensor load
+// of at least `minRank`.  `expectedElemType` may be null (no element check).
+static bool reachesRankedTensorLoad(Value val, int64_t minRank,
+                                    Type expectedElemType,
+                                    int maxDepth = 8) {
+  if (maxDepth <= 0)
+    return false;
+  for (auto *user : val.getUsers()) {
+    if (auto loadOp = dyn_cast<triton::LoadOp>(user)) {
+      auto ty = dyn_cast<RankedTensorType>(loadOp.getResult().getType());
+      if (ty && ty.getRank() >= minRank &&
+          (!expectedElemType || ty.getElementType() == expectedElemType))
+        return true;
+      continue;
+    }
+    auto name = user->getName().getStringRef();
+    bool passthrough = name == "tt.splat" || name == "tt.broadcast" ||
+                       name == "tt.expand_dims" || name == "tt.addptr" ||
+                       name == "arith.addi" || name == "arith.muli";
+    if (passthrough && user->getNumResults() == 1) {
+      Value result = user->getResult(0);
+      if (result != val &&
+          reachesRankedTensorLoad(result, minRank, expectedElemType,
+                                  maxDepth - 1))
+        return true;
+    }
+  }
+  return false;
+}
+
+static bool isPointerBlockArgument(Value val) {
+  return dyn_cast<BlockArgument>(val) != nullptr &&
+         isa<triton::PointerType>(val.getType());
+}
 
 // Walk users through scalar muli/addi chains.  Returns true when the value
 // eventually becomes the offset of an tt.addptr whose pointer operand is a
-// scalar !tt.ptr (decode-style scalar Q pointer).
+// scalar !tt.ptr BlockArgument and whose result is splatted into a rank-1
+// tensor load (decode-style scalar Q pointer).  The rank-1-load requirement
+// distinguishes Q from the scalar block-table lookup, whose addptr result is
+// loaded as a scalar.
 static bool reachesScalarPointerAddPtr(Value val, int maxDepth = 8) {
   if (maxDepth <= 0)
     return false;
@@ -110,18 +169,13 @@ static bool reachesScalarPointerAddPtr(Value val, int maxDepth = 8) {
     if (auto addptr = dyn_cast<triton::AddPtrOp>(user)) {
       if (addptr.getOffset() == val &&
           !dyn_cast<RankedTensorType>(addptr.getPtr().getType())) {
-        // Require the scalar pointer to originate from a query-named argument:
-        // the prefill block_table chain also contains a scalar
-        // `addptr(block_table_ptr, pid*stride)` and must not count as Q.
         Value base = addptr.getPtr();
-        if (auto arg = dyn_cast<BlockArgument>(base)) {
-          if (auto nameLoc = dyn_cast<NameLoc>(arg.getLoc())) {
-            StringRef argName = nameLoc.getName().getValue();
-            if (argName == "q" || argName == "q_ptr" ||
-                argName == "query" || argName == "query_ptr" ||
-                argName.starts_with("q_"))
-              return true;
-          }
+        if (isPointerBlockArgument(base)) {
+          Type elemTy =
+              cast<triton::PointerType>(base.getType()).getPointeeType();
+          if (reachesRankedTensorLoad(addptr.getResult(), /*minRank=*/1,
+                                      elemTy, /*maxDepth=*/8))
+            return true;
         }
       }
       continue;
@@ -136,8 +190,12 @@ static bool reachesScalarPointerAddPtr(Value val, int maxDepth = 8) {
   return false;
 }
 
-// Walk users through tensor shape ops.  Returns true when the value is splat
-// or broadcast into a tensor used as a tile offset (prefill-style Q tile).
+// Walk users through shape ops and arith.  Returns true when the value is
+// splat/broadcast into a tensor that ends in a rank>=2 tensor load
+// (prefill-style Q tile).  Scalar arith between program_id and the splat is
+// followed explicitly: the shipped prefill kernels build
+// `pid -> muli(scalar) -> splat -> tensor addi -> ... -> rank-2 load`, which
+// the v3 tensor-result-only recursion missed.
 static bool reachesTensorTileOffset(Value val, int maxDepth = 8) {
   if (maxDepth <= 0)
     return false;
@@ -146,13 +204,14 @@ static bool reachesTensorTileOffset(Value val, int maxDepth = 8) {
     if (name == "tt.splat" || name == "tt.broadcast" ||
         name == "tt.expand_dims") {
       if (user->getNumResults() == 1 &&
-          dyn_cast<RankedTensorType>(user->getResult(0).getType()))
+          dyn_cast<RankedTensorType>(user->getResult(0).getType()) &&
+          reachesRankedTensorLoad(user->getResult(0), /*minRank=*/2, Type(),
+                                  /*maxDepth=*/8))
         return true;
       continue;
     }
     if ((name == "arith.addi" || name == "arith.muli") &&
-        user->getNumResults() == 1 &&
-        dyn_cast<RankedTensorType>(user->getResult(0).getType())) {
+        user->getNumResults() == 1) {
       for (auto result : user->getResults())
         if (result != val && reachesTensorTileOffset(result, maxDepth - 1))
           return true;
@@ -504,21 +563,30 @@ struct PageTransformPass
       return WalkResult::advance();
     });
 
-    // Signal A: check for divsi(PAGE_SIZE) patterns
-    mod.walk([&](arith::DivSIOp divOp) {
-      if (auto constOp = divOp.getRhs().getDefiningOp<arith::ConstantIntOp>()) {
-        int64_t divisor = constOp.value();
-        // PAGE_SIZE is typically 16, 32, 64, 128
-        if (divisor == 16 || divisor == 32 || divisor == 64 || divisor == 128) {
-          for (auto *user : divOp->getUsers()) {
-            if (isa<triton::AddPtrOp>(user))
-              hasAddptrPageIndex = true;
-            if (isa<arith::AddIOp, arith::MulIOp>(user))
-              hasArithPageIndex = true;
-            if (isa<arith::AddIOp, arith::MulIOp, triton::AddPtrOp>(user))
-              hasDivsiPattern = true;
-          }
-        }
+    if (isVerbose())
+      llvm::errs() << "[PACT P1] classify signals scalarQ=" << scalarProgramIdQ
+                   << " tileQ=" << tileProgramIdQ << "\n";
+
+    // Signal A: check for divsi/floordivsi(PAGE_SIZE) patterns.  The op set
+    // and divisor domain are shared with detectPageSize so classification can
+    // never skip a kernel that PageTransform would otherwise recognize.
+    mod.walk([&](Operation *op) {
+      auto name = op->getName().getStringRef();
+      if (name != "arith.divsi" && name != "arith.floordivsi")
+        return WalkResult::advance();
+      auto constOp = op->getOperand(1).getDefiningOp<arith::ConstantOp>();
+      if (!constOp)
+        return WalkResult::advance();
+      auto divisor = extractConstantInt(constOp.getValue());
+      if (!divisor || !isPageSizeDivisor(*divisor))
+        return WalkResult::advance();
+      for (auto *user : op->getResult(0).getUsers()) {
+        if (isa<triton::AddPtrOp>(user))
+          hasAddptrPageIndex = true;
+        if (isa<arith::AddIOp, arith::MulIOp>(user))
+          hasArithPageIndex = true;
+        if (isa<arith::AddIOp, arith::MulIOp, triton::AddPtrOp>(user))
+          hasDivsiPattern = true;
       }
       return WalkResult::advance();
     });

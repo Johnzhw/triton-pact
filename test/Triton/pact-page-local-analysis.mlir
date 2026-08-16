@@ -22,6 +22,18 @@ module {
                        pact.page_boundary_safe = true, pact.page_size = 16 : i64,
                        pact.paged_load, pact.tile_tokens = 16 : i64}
              : tensor<16x64x!tt.ptr<f16>>
+    // When P1's fallback flag says the tile is not provably page-aligned and
+    // P2 cannot trace a remsi(PAGE_SIZE) offset, statically_safe must be
+    // propagated as false.  The dim_contiguity output stays identical (the
+    // ConservativeOverride path uses the same exact page-bounded width and
+    // relies on the load mask for out-of-page elements).
+    // CHECK: tt.load {{.*}} {pact.head_dim_idx = 1 : i64, pact.head_dim_size = 64 : i64,
+    // CHECK-SAME: pact.pagelocal.dim_contiguity = array<i64: 1, 64>,
+    // CHECK-SAME: pact.pagelocal.statically_safe = false
+    %w = tt.load %ptr {pact.head_dim_idx = 1 : i64, pact.head_dim_size = 64 : i64,
+                       pact.page_boundary_safe = false, pact.page_size = 16 : i64,
+                       pact.paged_load, pact.tile_tokens = 16 : i64}
+             : tensor<16x64x!tt.ptr<f16>>
     tt.return
   }
 }

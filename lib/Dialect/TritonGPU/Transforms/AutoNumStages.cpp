@@ -3,7 +3,8 @@
 // P6: architecture-aware num_stages decision for paged attention loops.
 //
 // Inputs (in priority order):
-//   1. pact.pgo.measured_iterations  (PGO branch; absent in the static base)
+//   1. pact.pgo.measured_iterations  (injected by this branch's compiler.py;
+//      without it the static theory-only path is used)
 //   2. statically-resolvable scf.for bounds
 //   3. no estimate -> keep the native/default num_stages (no override)
 //
@@ -23,6 +24,7 @@
 #include "triton/Dialect/TritonGPU/IR/LinearLayoutConversions.h"
 #include "triton/Dialect/TritonGPU/Transforms/Passes.h"
 #include "triton/Dialect/TritonGPU/Transforms/PipeliningUtility.h"
+#include "triton/Support/PactDecision.h"
 #include "triton/Support/PactSMDetect.h"
 
 #include "llvm/Support/Debug.h"
@@ -87,113 +89,42 @@ static int64_t estimateTripCount(scf::ForOp forOp) {
 
 static int computeOptimalNumStages(int64_t tileBytes, int64_t estIterations,
                                    bool haveIterationEstimate, int pageSize,
-                                   int tileTokens, int defaultStages) {
-  auto sm = pact::SMDetector::getResources();
-
-  // Without a static or PGO-provided trip count, PACT must not override the
-  // native pipeline decision.
+                                   int tileTokens, int defaultStages,
+                                   int numWarps) {
+  // Without a static or measured trip count PACT must not override the native
+  // pipeline decision.
   if (!haveIterationEstimate) {
     llvm::errs() << "[PACT P6] " << pact::SMDetector::getGPUName()
-                 << ": no iteration estimate (static bound or PGO) — keeping "
-                    "num_stages="
+                 << ": no iteration estimate — keeping num_stages="
                  << defaultStages << "\n";
     return defaultStages;
   }
 
-  auto budget = pact::SMDetector::computePipelineBudget(
-      tileBytes, estIterations, pageSize, tileTokens, defaultStages);
+  // Theory-as-code: the feasible stage set and each candidate's occupancy are
+  // computed from the capacity equations and the LinearLayout-exact SMEM
+  // footprint.  The measured trip count (PGO) and the static bound are both
+  // just inputs to this same computation.
+  pact::SelectStagesInput input;
+  input.tileBytes = tileBytes;
+  input.estIterations = estIterations;
+  input.defaultStages = defaultStages;
+  input.maxStages = getMaxPipelineStages();
+  input.numWarps = numWarps;
+
+  auto decision = pact::selectNumStages(input);
 
   int tilesPerPage = (tileTokens > 0 && tileTokens <= pageSize)
                          ? pageSize / tileTokens : 1;
-
-  bool isNvidia = pact::SMDetector::getBackend() ==
-                  pact::TargetBackend::NVIDIA;
-  // Ampere (SM 80-89): Occupancy-First Heuristic
-  if (isNvidia && sm.smVersion < 90) {
-    if (estIterations <= 16) {
-      llvm::errs() << "[PACT P6] " << pact::SMDetector::getGPUName()
-                   << ": short seq (" << estIterations
-                   << " iters) → num_stages=2 (max occupancy)\n";
-      return 2;
-    }
-
-    if (estIterations <= 64) {
-      llvm::errs() << "[PACT P6] " << pact::SMDetector::getGPUName()
-                   << ": medium seq (" << estIterations
-                   << " iters) → num_stages=" << defaultStages
-                   << " (keep default)\n";
-      return defaultStages;
-    }
-
-    bool largeTile = tileBytes >= 2048;
-    bool lowLocality = tilesPerPage <= 2;
-    double occCurrent = pact::SMDetector::estimateOccupancy(
-        defaultStages, tileBytes * defaultStages, 96);
-    double occNext = pact::SMDetector::estimateOccupancy(
-        defaultStages + 1, tileBytes * (defaultStages + 1), 96);
-    bool occAcceptable =
-        occCurrent > 0 && (occCurrent - occNext) / occCurrent < 0.20;
-
-    if (largeTile && lowLocality && occAcceptable && estIterations >= 128) {
-      int optimal = std::min(defaultStages + 1, sm.optimalNumStages);
-      llvm::errs() << "[PACT P6] " << pact::SMDetector::getGPUName()
-                   << ": long seq + large tile + low locality"
-                   << " → num_stages=" << optimal
-                   << " (occ: " << (int)(occCurrent * 100) << "% → "
-                   << (int)(occNext * 100) << "%)\n";
-      return optimal;
-    }
-
-    if (tilesPerPage >= 4) {
-      llvm::errs() << "[PACT P6] " << pact::SMDetector::getGPUName()
-                   << ": high page locality (" << tilesPerPage
-                   << " tiles/page) → num_stages=2 (L2 cache friendly)\n";
-      return 2;
-    }
-
-    llvm::errs() << "[PACT P6] " << pact::SMDetector::getGPUName()
-                 << ": keeping num_stages=" << defaultStages
-                 << " (tile=" << tileBytes << "B, iters=" << estIterations
-                 << ", TPP=" << tilesPerPage
-                 << ", occLoss="
-                 << (occCurrent > 0 ? (int)((occCurrent - occNext) / occCurrent * 100)
-                                    : 0)
-                 << "%)\n";
-    return defaultStages;
-  }
-
-  // AMD: keep the native default until a CDNA-specific occupancy model is
-  // validated on real hardware.  The page semantics and exact V still apply;
-  // only the stage heuristic is deferred.
-  if (!isNvidia) {
-    llvm::errs() << "[PACT P6] " << pact::SMDetector::getGPUName()
-                 << ": AMD target — keeping num_stages=" << defaultStages
-                 << " (CDNA stage model pending hardware validation)\n";
-    return defaultStages;
-  }
-
-  // Hopper (SM 90+): Pipeline-First Heuristic
-  int maxStages = getMaxPipelineStages();
-  int candidate = std::min({sm.optimalNumStages + 2,
-                             budget.maxStagesBySMEM,
-                             budget.maxStagesByIters,
-                             budget.maxStagesByOccupancy,
-                             maxStages});
-
-  if (tilesPerPage >= 4) {
-    candidate = std::min(candidate, sm.optimalNumStages - 1);
-  } else if (tilesPerPage <= 1) {
-    candidate = std::min(candidate, sm.optimalNumStages + 2);
-  }
-
-  candidate = std::clamp(candidate, 2, 7);
-
   llvm::errs() << "[PACT P6] " << pact::SMDetector::getGPUName()
-               << ": num_stages=" << candidate
-               << " (tile=" << tileBytes << "B, iters=" << estIterations
-               << ", TPP=" << tilesPerPage
-               << ", smemBudget=" << budget.smemBudget / 1024 << "KB)\n";
-  return candidate;
+               << ": selectNumStages=" << decision.numStages
+               << " (feasible=[" << decision.feasibleMin << ","
+               << decision.feasibleMax << "] smemBound=" << decision.smemBound
+               << " iterBound=" << decision.iterBound
+               << ", bestOcc=" << decision.bestOccupancy
+               << ", occ=" << decision.occupancy
+               << ", tile=" << tileBytes << "B, iters=" << estIterations
+               << ", TPP=" << tilesPerPage << " [informational])\n";
+  return decision.numStages;
 }
 
 struct PACTAutoNumStagesPass
@@ -224,10 +155,15 @@ struct PACTAutoNumStagesPass
       defaultStages = attr.getInt();
 
     // Optional PGO-provided measured trip count (injected by the PGO branch).
+    // It enters the same selectNumStages computation as a static bound would.
     int64_t pgoIterations = -1;
     if (auto attr = mod->getAttrOfType<mlir::IntegerAttr>(
             "pact.pgo.measured_iterations"))
       pgoIterations = attr.getInt();
+
+    int numWarps = pact::PactDecisionConstants::kDefaultNumWarps;
+    if (auto attr = mod->getAttrOfType<mlir::IntegerAttr>("ttg.num-warps"))
+      numWarps = attr.getInt();
 
     mod.walk([&](scf::ForOp forOp) {
       int64_t tileBytes = 0;
@@ -288,7 +224,7 @@ struct PACTAutoNumStagesPass
 
       int optimal = computeOptimalNumStages(
           tileBytes, estIterations, haveIterationEstimate, pageSize,
-          tileTokens, defaultStages);
+          tileTokens, defaultStages, numWarps);
 
       if (optimal == defaultStages) {
         llvm::errs() << "[PACT P6] Keeping default num_stages="

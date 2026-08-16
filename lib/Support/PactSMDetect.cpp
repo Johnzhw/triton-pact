@@ -19,6 +19,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdlib>
+#include <limits>
 #include <sstream>
 
 namespace mlir::triton::pact {
@@ -293,11 +294,13 @@ PipelineBudget SMDetector::computePipelineBudget(
     budget.maxStagesByOccupancy = 8;
   }
 
-  // Max stages by iterations
+  // Max stages by iterations: a modulo-scheduled pipeline cannot usefully
+  // have more stages than loop iterations.  This bound is computed from the
+  // actual trip count, not a fixed divisor.
   if (estIterations > 0)
-    budget.maxStagesByIters = std::max(2, estIterations / 4);
+    budget.maxStagesByIters = std::max(1, estIterations);
   else
-    budget.maxStagesByIters = 6;
+    budget.maxStagesByIters = std::max(1, sm.optimalNumStages);
 
   // Combined recommendation: take the minimum of all constraints
   budget.recommendedStages = std::min(
@@ -326,10 +329,15 @@ double SMDetector::estimateOccupancy(int numStages, int64_t smemPerBlock,
 
   // Blocks limited by SMEM
   int blocksBySMEM = sm.smemPerSM / std::max(smemTotal, (int64_t)1);
-  // Blocks limited by registers
-  int regsPerWarp = regsPerThread * waveSize;
-  int regsPerBlock = regsPerWarp * numWarps;
-  int blocksByRegs = sm.maxRegsPerSM / std::max(regsPerBlock, 1);
+  // Blocks limited by registers.  regsPerThread <= 0 means "unknown": the
+  // register constraint is intentionally ignored (model input convention,
+  // see PactDecisionConstants::kUnboundedRegsPerThread).
+  int blocksByRegs = std::numeric_limits<int>::max();
+  if (regsPerThread > 0) {
+    int regsPerWarp = regsPerThread * waveSize;
+    int regsPerBlock = regsPerWarp * numWarps;
+    blocksByRegs = sm.maxRegsPerSM / std::max(regsPerBlock, 1);
+  }
   // Blocks limited by warps
   int blocksByWarps = sm.maxWarpsPerSM / numWarps;
   // Blocks limited by threads

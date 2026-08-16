@@ -1,3 +1,11 @@
+set(TRITON_LLVMIR_TARGET_LIBS "")
+if(TRITON_BUILD_CODEGEN_NVIDIA)
+  list(APPEND TRITON_LLVMIR_TARGET_LIBS MLIRNVVMToLLVMIRTranslation)
+endif()
+if(TRITON_BUILD_CODEGEN_AMD)
+  list(APPEND TRITON_LLVMIR_TARGET_LIBS MLIRROCDLToLLVMIRTranslation)
+endif()
+
 add_triton_library(TritonLLVMIR
         LLVMDIScope.cpp
         LLVMDILocalVariable.cpp
@@ -17,8 +25,7 @@ add_triton_library(TritonLLVMIR
         MLIRLLVMDialect
         MLIRNVVMToLLVM
         MLIRLLVMToLLVMIRTranslation
-        MLIRNVVMToLLVMIRTranslation
-        MLIRROCDLToLLVMIRTranslation
+        ${TRITON_LLVMIR_TARGET_LIBS}
         MLIRSCFToControlFlow
         MLIRSupport
         MLIRTargetLLVMIRExport

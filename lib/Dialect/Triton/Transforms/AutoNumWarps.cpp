@@ -4,11 +4,14 @@
 // writes pact.optimal_num_warps on the module; compiler.py reads it before
 // make_ttgir to override opt.num_warps.
 //
-// Inputs (in priority order):
-//   1. pact.pgo.regs_per_thread / pact.pgo.active_warp_ratio (PGO branch)
-//   2. conservative SMDetector occupancy estimates (static theory-only path)
-//
-// Without either signal the recommendation stays at the Triton default (4).
+// Inputs (hardware parameters + theory joint decision, PGO branch):
+//   1. pact.pgo.regs_per_thread — measured registers, substituted directly
+//      into the L2 capacity equations.
+//   2. pact.pgo.active_warp_ratio_permille — measured active-warp ratio,
+//      converted to the model-error estimate used by selectNumWarps.
+//   3. paged-load tile geometry from IR attributes.
+// When no PGO facts are present the same selectNumWarps call reduces to the
+// theory-only path (computed discretization granularity as the required gain).
 //
 //===----------------------------------------------------------------------===//
 
@@ -18,12 +21,14 @@
 #include "mlir/IR/BuiltinTypes.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/Triton/Transforms/Passes.h"
+#include "triton/Support/PactDecision.h"
 #include "triton/Support/PactSMDetect.h"
 
 #include "llvm/Support/Debug.h"
 #include "llvm/Support/raw_ostream.h"
 
 #include <cstdlib>
+#include <optional>
 #include <string>
 #include <algorithm>
 
@@ -74,39 +79,32 @@ struct PACTAutoNumWarpsPass
       return WalkResult::advance();
     });
 
-    // Optional PGO-provided facts (injected only by the PGO branch).
-    int64_t pgoRegsPerThread = -1;
+    // Optional PGO-provided facts (injected by this branch's compiler.py).
+    // They are inputs to the *same* theory decision core as the non-PGO tree;
+    // measured registers substitute the unknown-register assumption and the
+    // measured active-warp ratio refines the computed model-error bound.
+    int64_t regsPerThread = pact::PactDecisionConstants::kUnknownRegsPerThread;
     if (auto attr =
             mod->getAttrOfType<IntegerAttr>("pact.pgo.regs_per_thread"))
-      pgoRegsPerThread = attr.getInt();
-    double pgoActiveWarpRatio = -1.0;
+      if (attr.getInt() > 0)
+        regsPerThread = attr.getInt();
+
+    std::optional<double> pgoActiveWarpRatio;
     if (auto attr = mod->getAttrOfType<IntegerAttr>(
             "pact.pgo.active_warp_ratio_permille"))
       pgoActiveWarpRatio = attr.getInt() / 1000.0;
 
-    int optimalWarps = 4;
+    int optimalWarps = pact::PactDecisionConstants::kDefaultNumWarps;
     if (numPagedLoads >= 4 && maxTileBytes > 0) {
-      int64_t regsPerThread = pgoRegsPerThread > 0 ? pgoRegsPerThread : 64;
-      double occ4 =
-          pact::SMDetector::estimateOccupancy(/*numStages=*/3, maxTileBytes,
-                                              regsPerThread, /*numWarps=*/4);
-      double occ2 =
-          pact::SMDetector::estimateOccupancy(/*numStages=*/3, maxTileBytes,
-                                              regsPerThread, /*numWarps=*/2);
-
-      // Static theory: switch only for a large occupancy gain.  PGO makes the
-      // threshold more willing when the measured warp occupancy is actually
-      // low, and refuses the switch when occupancy is already healthy.
-      double gainThreshold = 1.30;
-      if (pgoActiveWarpRatio >= 0.0) {
-        if (pgoActiveWarpRatio < 0.5)
-          gainThreshold = 1.15;
-        else if (pgoActiveWarpRatio >= 0.75)
-          gainThreshold = 2.0; // effectively keep warps=4
-      }
-
-      if (occ2 > occ4 * gainThreshold)
-        optimalWarps = 2;
+      auto decision =
+          pact::selectNumWarps(maxTileBytes, regsPerThread, pgoActiveWarpRatio);
+      optimalWarps = decision.numWarps;
+      llvm::errs() << "[PACT P11] selectNumWarps: " << optimalWarps
+                   << " (occ4=" << decision.baselineOccupancy
+                   << ", occChosen=" << decision.chosenOccupancy
+                   << ", requiredGain=" << decision.requiredGain
+                   << ", switched=" << (decision.switched ? "yes" : "no")
+                   << ")\n";
     }
 
     mod->setAttr("pact.optimal_num_warps",
@@ -116,8 +114,7 @@ struct PACTAutoNumWarpsPass
     llvm::errs() << "[PACT P11] num_warps recommendation: " << optimalWarps
                  << " (pagedLoads=" << numPagedLoads
                  << ", maxTileB=" << maxTileBytes
-                 << ", pgoRegs=" << pgoRegsPerThread
-                 << ", pgoActiveWarp=" << pgoActiveWarpRatio << ")\n";
+                 << ", regs=" << regsPerThread << ")\n";
   }
 };
 

@@ -2,7 +2,7 @@
 //
 // P2: Derives page-local memory properties from PACT semantic attributes.
 //     Does NOT modify AxisInfo — only outputs verifiable analysis results
-//     as IR attributes for downstream consumers (P3, P4, P8).
+//     as IR attributes for downstream consumers (P3).
 //
 //===----------------------------------------------------------------------===//
 

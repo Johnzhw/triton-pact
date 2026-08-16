@@ -11,12 +11,24 @@ from pathlib import Path
 from typing import Any, Dict, Optional
 
 
+PACT_PGO_CACHE_ROOT_ENV = "PACT_PGO_CACHE_ROOT"
+
+
+def default_cache_root() -> Path:
+    """Single source of truth for the PACT PGO cache root.
+
+    Shared with pact_profile_collector (cache-pgo/dump-pgo/override-pgo) so
+    the DB and the collector can never drift apart.
+    """
+    return Path(os.environ.get(PACT_PGO_CACHE_ROOT_ENV,
+                               str(Path.home() / ".triton")))
+
+
 def default_db_dir() -> Path:
     base = os.environ.get("PACT_PGO_DB_DIR")
     if base:
         return Path(base)
-    cache = os.environ.get("TRITON_CACHE_DIR", str(Path.home() / ".triton" / "cache"))
-    return Path(cache) / "pact_pgo"
+    return default_cache_root() / "pact_pgo_db"
 
 
 class PactProfileDB:

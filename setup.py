@@ -40,6 +40,75 @@ sys.path.insert(0, os.path.dirname(__file__))
 from python.build_helpers import get_base_dir, get_cmake_dir
 
 
+# In-tree codegen backends and the LLVM target each one requires.  A host LLVM
+# built with LLVM_TARGETS_TO_BUILD=host+<GPU target> therefore automatically
+# selects the matching backend(s) at install time; TRITON_CODEGEN_BACKENDS is
+# an explicit override (semicolon- or comma-separated backend names).
+IN_TREE_CODEGEN_BACKENDS = ("nvidia", "amd")
+_BACKEND_TO_LLVM_TARGET = {"nvidia": "NVPTX", "amd": "AMDGPU"}
+
+
+def _find_llvm_config() -> Optional[Path]:
+    llvm_syspath = os.getenv("LLVM_SYSPATH")
+    if llvm_syspath:
+        candidate = Path(llvm_syspath) / "bin" / "llvm-config"
+        if candidate.exists():
+            return candidate
+    llvm_lib_dir = os.getenv("LLVM_LIBRARY_DIR")
+    if llvm_lib_dir:
+        candidate = Path(llvm_lib_dir).parent / "bin" / "llvm-config"
+        if candidate.exists():
+            return candidate
+    which = shutil.which("llvm-config")
+    return Path(which) if which else None
+
+
+def _get_llvm_targets_to_build() -> Optional[list]:
+    """Return the LLVM target names available in the configured host LLVM."""
+    llvm_config = _find_llvm_config()
+    if llvm_config is not None:
+        try:
+            out = subprocess.check_output([str(llvm_config), "--targets-built"],
+                                          text=True, stderr=subprocess.DEVNULL)
+            targets = out.split()
+            if targets:
+                return targets
+        except (subprocess.CalledProcessError, OSError):
+            pass
+
+    llvm_syspath = os.getenv("LLVM_SYSPATH")
+    if llvm_syspath:
+        config = Path(llvm_syspath) / "lib" / "cmake" / "llvm" / "LLVMConfig.cmake"
+        if config.exists():
+            text = config.read_text()
+            match = re.search(r"set\(LLVM_TARGETS_TO_BUILD ([^)]+)\)", text)
+            if match:
+                return match.group(1).split()
+    return None
+
+
+def get_in_tree_backends():
+    """Backend names to install and pass to CMake, derived from host LLVM."""
+    override = os.getenv("TRITON_CODEGEN_BACKENDS")
+    if override:
+        requested = [name.strip() for name in re.split(r"[;,]", override) if name.strip()]
+        for name in requested:
+            assert name in IN_TREE_CODEGEN_BACKENDS, \
+                f"unknown TRITON_CODEGEN_BACKENDS entry '{name}'"
+        return requested
+
+    targets = _get_llvm_targets_to_build()
+    if targets is None:
+        print("[setup] warning: cannot detect LLVM targets; installing all in-tree "
+              "codegen backends (nvidia, amd). Set LLVM_SYSPATH/LLVM_LIBRARY_DIR for "
+              "host-target auto-selection.")
+        return list(IN_TREE_CODEGEN_BACKENDS)
+    selected = [backend for backend in IN_TREE_CODEGEN_BACKENDS
+                if _BACKEND_TO_LLVM_TARGET[backend] in targets]
+    print(f"[setup] LLVM targets {targets} -> codegen backends {selected}")
+    return selected
+
+
 def is_git_repo() -> bool:
     """Return True if this file resides at the root of a git repository."""
     expected_toplevel = Path(__file__).parent.resolve()
@@ -380,7 +449,7 @@ class CMakeBuild(build_ext):
         subprocess.check_call(["cmake", "--build", ".", "--target", "mlir-doc"], cwd=cmake_dir)
 
 
-backends = [*BackendInstaller.copy(["nvidia", "amd"]), *BackendInstaller.copy_externals()]
+backends = [*BackendInstaller.copy(get_in_tree_backends()), *BackendInstaller.copy_externals()]
 
 
 def get_package_dirs():

@@ -17,10 +17,11 @@ import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+from triton.profiling.pact_profile_db import default_cache_root
+
 TEST2 = Path("/home/johnzhw/workspace/test_2")
 TRITON_PY = Path("/home/johnzhw/workspace/triton/python")
-CACHE_ROOT = Path(os.environ.get("PACT_PGO_CACHE_ROOT",
-                                 Path.home() / ".triton"))
+CACHE_ROOT = default_cache_root()
 DEFAULT_ENV = {
     "PACT_ENABLE": "1",
     "PACT_ENABLE_PAGE_TRANSFORM": "1",
@@ -85,13 +86,38 @@ for b in range(B):
 sl=torch.full((B,),S,dtype=torch.int32,device='cuda')
 """
 
-    def dump_ttgir(self) -> Tuple[Path, str]:
-        """Compile the target once with TRITON_KERNEL_DUMP and return TTGIR path + key."""
+    def dump_ttgir(self) -> Tuple[Path, str, int, str]:
+        """Compile the target once with TRITON_KERNEL_DUMP and return TTGIR
+        path + key + real register count (regs_per_thread producer)."""
         shutil.rmtree(self.dump_dir, ignore_errors=True)
         shutil.rmtree(self.cache_dir, ignore_errors=True)
-        code = self._target_args_code() + """
+        B, S, P, D, Hq, Hk = self.shape
+        code = self._target_args_code() + f"""
 from kernels.pact_optimization_target import run_pact_target
+from kernels.pact_optimization_target import pact_optimization_target
 out = run_pact_target(q, kc, vc, bt, sl, page_size=P)
+# regs_per_thread producer: warmup() returns the CompiledKernel whose n_regs
+# comes from the binary metadata loaded by driver.active.utils.load_binary.
+out_ref = torch.empty_like(q)
+regs = 0
+regs_err = ''
+try:
+    max_seq_len = bt.shape[1] * P
+    gqa_ratio = Hq // Hk
+    kernel = pact_optimization_target.warmup(
+        out_ref, q, kc, vc, bt, sl,
+        sm_scale=1.0 / (D ** 0.5), NUM_TOKENS=B, NUM_HEADS=Hq,
+        NUM_KV_HEADS=Hk, HEAD_DIM=D, PAGE_SIZE=P, MAX_SEQ_LEN=max_seq_len,
+        TILE_SIZE=16, GQA_RATIO=gqa_ratio,
+        STRIDE_BLOCK=Hk * P * D, STRIDE_KV_HEAD=P * D, STRIDE_PAGE=D,
+        STRIDE_HEAD_DIM=1, USE_DUAL_TILE=False, TILE_SIZE_LARGE=32,
+        TOKEN_IMPORTANCE_MODE=0, grid=({B}, {Hq}))
+    regs = int(getattr(kernel, 'n_regs', 0) or 0)
+except Exception as e:
+    regs_err = str(e)[:200]
+print('N_REGS:' + str(regs))
+if regs_err:
+    print('N_REGS_UNAVAILABLE:' + repr(regs_err))
 """
         env = self._base_env()
         env["TRITON_KERNEL_DUMP"] = "1"
@@ -106,12 +132,19 @@ out = run_pact_target(q, kc, vc, bt, sl, page_size=P)
         ttgir = keydir / "pact_optimization_target.ttgir"
         if not ttgir.exists():
             raise RuntimeError(f"missing {ttgir}")
-        return ttgir, keydir.name
+        regs = 0
+        regs_err = ""
+        for line in out.splitlines():
+            if line.startswith("N_REGS:"):
+                regs = int(line.split(":", 1)[1])
+            elif line.startswith("N_REGS_UNAVAILABLE:"):
+                regs_err = line.split(":", 1)[1].strip().strip("'")
+        return ttgir, keydir.name, regs, regs_err
 
     def collect(self, steps: int = 20, trace_path: Optional[Path] = None) -> Dict[str, Any]:
         from triton.profiler.hooks.pact_instrumentation import instrument_ttgir_text
 
-        base_ttgir, key = self.dump_ttgir()
+        base_ttgir, key, regs, regs_err = self.dump_ttgir()
         instrumented = instrument_ttgir_text(base_ttgir.read_text())
 
         override_key_dir = self.override_dir / key
@@ -161,6 +194,10 @@ print('LATENCY_US:' + str(latency_us))
                                        num_warps=4, steps=steps)
         if latency_us is not None:
             facts["latency_us"] = latency_us
+        if regs > 0:
+            facts["regs_per_thread"] = regs
+        elif regs_err:
+            facts["regs_unavailable"] = regs_err
         return facts
 
 
@@ -216,13 +253,9 @@ def parse_instrument_trace(trace_path: Path, expected_ctas: int,
     def stats(prefix: str):
         evs = [e for e in events if e.get("name", "").startswith(prefix)]
         warps = len(set((e.get("pid"), e.get("tid")) for e in evs))
-        cycles = [e.get("dur", 0.0) * 1000.0 for e in evs]  # us at 1 GHz
-        return evs, warps, cycles
+        return evs, warps
 
-    load_evs, load_warps, load_cycles = stats("pact.load")
-    copy_evs, copy_warps, copy_cycles = stats("pact.async_copy")
-    wait_evs, wait_warps, wait_cycles = stats("pact.async_wait")
-    compute_evs, compute_warps, compute_cycles = stats("pact.compute")
+    load_evs, load_warps = stats("pact.load")
 
     facts: Dict[str, Any] = {}
     if load_evs and load_warps:
@@ -238,17 +271,4 @@ def parse_instrument_trace(trace_path: Path, expected_ctas: int,
         ratio = min(1.0, all_warps / expected_warps)
         facts["active_warp_ratio_permille"] = int(round(ratio * 1000))
 
-    if copy_cycles and wait_cycles:
-        avg_copy = sum(copy_cycles) / len(copy_cycles)
-        avg_wait = sum(wait_cycles) / len(wait_cycles)
-        if avg_copy > 0:
-            benefit = max(0.0, min(1.0, 1.0 - avg_wait / avg_copy))
-            facts["pipeline_overlap_benefit_permille"] = int(round(benefit * 1000))
-            facts["async_copy_cycles"] = avg_copy
-            facts["async_wait_cycles"] = avg_wait
-
-    if load_cycles:
-        facts["load_cycles_avg"] = sum(load_cycles) / len(load_cycles)
-    if compute_cycles:
-        facts["compute_cycles_avg"] = sum(compute_cycles) / len(compute_cycles)
     return facts

@@ -41,6 +41,19 @@ def _discover_backends() -> dict[str, Backend]:
     # discover only in-tree backends under the `triton.backends` namespace.
     skip_entrypoints_env = os.environ.get("TRITON_BACKENDS_IN_TREE", "")
 
+    def discover_one(name: str, module_prefix: str):
+        try:
+            compiler = importlib.import_module(f"{module_prefix}.compiler")
+            driver = importlib.import_module(f"{module_prefix}.driver")
+        except ImportError as e:
+            # A backend Python package may be present while its C++ extension
+            # was not built (host LLVM lacked the matching target).  Skip it so
+            # the remaining backends can still be discovered.
+            print(f"[triton.backends] skipping backend '{name}': {e}")
+            return
+        backends[name] = Backend(_find_concrete_subclasses(compiler, BaseBackend),
+                                 _find_concrete_subclasses(driver, DriverBase))
+
     if skip_entrypoints_env == "1":
         root = os.path.dirname(__file__)
         for name in os.listdir(root):
@@ -48,18 +61,12 @@ def _discover_backends() -> dict[str, Backend]:
                 continue
             if name.startswith('__'):
                 continue
-            compiler = importlib.import_module(f"triton.backends.{name}.compiler")
-            driver = importlib.import_module(f"triton.backends.{name}.driver")
-            backends[name] = Backend(_find_concrete_subclasses(compiler, BaseBackend),
-                                     _find_concrete_subclasses(driver, DriverBase))
+            discover_one(name, f"triton.backends.{name}")
         return backends
 
     # Default path: discover via entry points for out-of-tree/downstream plugins.
     for ep in entry_points().select(group="triton.backends"):
-        compiler = importlib.import_module(f"{ep.value}.compiler")
-        driver = importlib.import_module(f"{ep.value}.driver")
-        backends[ep.name] = Backend(_find_concrete_subclasses(compiler, BaseBackend),  # type: ignore
-                                    _find_concrete_subclasses(driver, DriverBase))  # type: ignore
+        discover_one(ep.name, f"{ep.value}")
     return backends
 
 

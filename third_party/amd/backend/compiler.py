@@ -6,6 +6,7 @@ from typing import Any, Dict, Tuple
 from types import ModuleType
 import os
 import hashlib
+import json
 import tempfile
 import re
 import functools
@@ -221,6 +222,28 @@ class HIPBackend(BaseBackend):
         # PACT Phase 0: propagate AMD gfx arch to C++ passes.
         if knobs.pact.enable:
             os.environ.setdefault("PACT_AMD_ARCH", options.arch)
+
+        # PACT PGO (aligned with the NVIDIA backend): inject measured facts as
+        # module attributes.  AMD P6 currently keeps the native default stage
+        # count until a CDNA-specific occupancy model is validated on real
+        # hardware; the attributes are accepted so the hint chain is identical
+        # across backends and becomes effective once that model lands.
+        if knobs.pact.enable:
+            hints_path = os.environ.get("PACT_PGO_HINTS_JSON")
+            if hints_path:
+                try:
+                    with open(hints_path) as f:
+                        hints = json.load(f)
+                    builder = ir.builder(mod.context)
+                    int_hints = ("pact.pgo.measured_iterations",
+                                 "pact.pgo.regs_per_thread",
+                                 "pact.pgo.active_warp_ratio_permille")
+                    for name in int_hints:
+                        if name in hints:
+                            mod.set_attr(name,
+                                         builder.get_int32_attr(int(hints[name])))
+                except Exception as e:
+                    print(f"[PACT PGO] failed to inject hints: {e}")
 
         pm = ir.pass_manager(mod.context)
         pm.enable_debug()

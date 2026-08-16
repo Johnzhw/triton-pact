@@ -1,3 +1,11 @@
+set(TRITON_GPU_TO_LLVM_TARGET_LIBS "")
+if(TRITON_BUILD_CODEGEN_NVIDIA)
+  list(APPEND TRITON_GPU_TO_LLVM_TARGET_LIBS MLIRGPUToNVVMTransforms)
+endif()
+if(TRITON_BUILD_CODEGEN_AMD)
+  list(APPEND TRITON_GPU_TO_LLVM_TARGET_LIBS MLIRGPUToROCDLTransforms)
+endif()
+
 add_triton_library(TritonGPUToLLVM
     DotOpToLLVM/FMA.cpp
     DotOpToLLVM/FMADotUtility.cpp
@@ -31,8 +39,7 @@ add_triton_library(TritonGPUToLLVM
     MLIRIR
     MLIRPass
     MLIRGPUDialect
-    MLIRGPUToNVVMTransforms
-    MLIRGPUToROCDLTransforms
+    ${TRITON_GPU_TO_LLVM_TARGET_LIBS}
     MLIRGPUTransforms
     TritonAnalysis
     TritonIR

@@ -556,6 +556,28 @@ private:
       // but at the addptr level the head_dim elements are byte-contiguous
       // in memory (page_base + block_offset + arange(16)×1 within a page).
       // Override contiguity on head_dim for paged addptr results.
+      // Original AxisInfo inference at this addptr, before any PACT override.
+      // PACT publishes it as a load/module fact so the PGO trigger theory can
+      // compute whether P3 actually restores contiguity.
+      int64_t baselineContiguity =
+          std::max(gcd(lhs.getConstancy(dim), rhs.getContiguity(dim)),
+                   gcd(lhs.getContiguity(dim), rhs.getConstancy(dim)));
+      auto recordBaseline = [&](triton::LoadOp loadOp) {
+        loadOp->setAttr("pact.axisinfo.baseline_contiguity",
+                        IntegerAttr::get(IntegerType::get(loadOp->getContext(),
+                                                          64),
+                                         baselineContiguity));
+        if (auto mod = loadOp->template getParentOfType<ModuleOp>()) {
+          int64_t cur = 1;
+          if (auto attr = mod->getAttrOfType<IntegerAttr>(
+                  "pact.axisinfo.baseline_contiguity"))
+            cur = attr.getInt();
+          mod->setAttr("pact.axisinfo.baseline_contiguity",
+                       IntegerAttr::get(
+                           IntegerType::get(mod->getContext(), 64),
+                           std::max(cur, baselineContiguity)));
+        }
+      };
       if (!op.getResult().getUsers().empty()) {
         for (auto *user : op.getResult().getUsers()) {
           if (auto loadOp = dyn_cast<triton::LoadOp>(user)) {
@@ -564,6 +586,7 @@ private:
             auto strategy = getOverrideStrategy(loadOp, dim, safeContiguity);
             if (strategy == OverrideStrategy::StaticOverride ||
                 strategy == OverrideStrategy::ConservativeOverride) {
+              recordBaseline(loadOp);
               return safeContiguity;
             }
             // NoOverride → continue checking other users
@@ -580,6 +603,7 @@ private:
             auto strategy = getOverrideStrategy(foundLoad, dim, safeContiguity);
             if (strategy == OverrideStrategy::StaticOverride ||
                 strategy == OverrideStrategy::ConservativeOverride) {
+              recordBaseline(foundLoad);
               llvm::errs() << "[PACT P0+P3] penetration SUCCESS: contiguity["
                            << dim << "]=" << safeContiguity
                            << " (depth=" << depth

@@ -95,7 +95,9 @@ struct PACTAutoNumWarpsPass
       pgoActiveWarpRatio = attr.getInt() / 1000.0;
 
     int optimalWarps = pact::PactDecisionConstants::kDefaultNumWarps;
-    if (numPagedLoads >= 4 && maxTileBytes > 0) {
+    // The canonical paged-attention tile has exactly two annotated K/V loads.
+    // Requiring >=4 loads silently disabled P11 for the primary target shape.
+    if (numPagedLoads >= 1 && maxTileBytes > 0) {
       auto decision =
           pact::selectNumWarps(maxTileBytes, regsPerThread, pgoActiveWarpRatio);
       optimalWarps = decision.numWarps;

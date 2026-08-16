@@ -34,6 +34,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32,
   }
 }
 
-// CHECK: module attributes {pact.optimal_num_stages = 5 : i32
+// CHECK: module attributes {pact.native_num_stages = 5 : i32
+// CHECK-SAME: pact.optimal_num_stages = 5 : i32
 // When optimal == default, the loop attribute is intentionally left untouched.
 // CHECK-NOT: tt.num_stages =

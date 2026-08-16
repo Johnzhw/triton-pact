@@ -84,6 +84,10 @@ struct PACTAutoNumWarpsPass
       // legal warp count and the required gain is the equations' own
       // discretization granularity.  The register count is unknown here, so
       // it is passed as the explicit named model-input assumption.
+      // Known limitation (N4): stagesPerBlock keeps the Triton native default
+      // of 3 because P11 runs at TTIR before P6 decides stages at TTGIR; on
+      // pipeline-first targets this under-counts SMEM and may bias the warp
+      // choice conservatively.  Documented, not worked around here.
       auto decision = pact::selectNumWarps(
           maxTileBytes, pact::PactDecisionConstants::kUnknownRegsPerThread);
       optimalWarps = decision.numWarps;

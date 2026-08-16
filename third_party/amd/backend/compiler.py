@@ -247,17 +247,18 @@ class HIPBackend(BaseBackend):
     @staticmethod
     def make_ttgir(mod, metadata, options):
         # P11: read pact.optimal_num_warps before TTIR→TTGIR conversion.
+        # `mod` already went through make_ttir's pm.run(), so use the bound
+        # attr accessors (op.attributes is stale after a pass-manager run).
         if knobs.pact.enable and knobs.pact.enable_auto_num_warps:
             try:
                 op = mod.get_operation()
-                if hasattr(op, 'attributes'):
-                    pact_warp = op.attributes.get("pact.optimal_num_warps")
-                    if pact_warp is not None:
-                        pw = int(pact_warp.value)
-                        if pw != options.num_warps:
-                            print(f"[PACT P11→compiler] num_warps: "
-                                  f"{options.num_warps} -> {pw}")
-                            options.num_warps = pw
+                pact_warp = op.get_int_attr("pact.optimal_num_warps")
+                if pact_warp is not None:
+                    pw = int(pact_warp)
+                    if pw != options.num_warps:
+                        print(f"[PACT P11→compiler] num_warps: "
+                              f"{options.num_warps} -> {pw}")
+                        options.num_warps = pw
             except Exception:
                 pass
 

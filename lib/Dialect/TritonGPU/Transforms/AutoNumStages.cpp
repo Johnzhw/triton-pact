@@ -161,6 +161,13 @@ struct PACTAutoNumStagesPass
     if (auto attr = mod->getAttrOfType<mlir::IntegerAttr>("tt.num_stages"))
       defaultStages = attr.getInt();
 
+    // N3: publish the native/default baseline that P6 itself compared
+    // against, so the PGO trigger pass uses the same reference instead of
+    // guessing from a module attribute that the pipeline never writes.
+    mod->setAttr("pact.native_num_stages",
+                 mlir::IntegerAttr::get(
+                     mlir::IntegerType::get(&getContext(), 32), defaultStages));
+
     int numWarps = pact::PactDecisionConstants::kDefaultNumWarps;
     if (auto attr = mod->getAttrOfType<mlir::IntegerAttr>("ttg.num-warps"))
       numWarps = attr.getInt();

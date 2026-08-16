@@ -328,18 +328,14 @@ class HIPBackend(BaseBackend):
             amd.passes.ttgpuir.add_fp_sanitizer(pm)
             passes.ttgpuir.add_fp_sanitizer(pm)
         pm.run(mod, 'make_ttgir')
-        # PACT stage/trigger write-back, mirroring the NVIDIA backend.  AMD P6
-        # keeps the native default today, so the value is informational until a
-        # validated CDNA model exists.
+        # PACT stage write-back, mirroring the NVIDIA backend.  AMD P6 keeps
+        # the native default today, so the value is informational until a
+        # validated CDNA model exists.  The non-PGO tree publishes no PGO attr.
         try:
             op = mod.get_operation()
-            if hasattr(op, 'attributes'):
-                for attr in ("pact.optimal_num_stages", "pact.pgo.trigger",
-                             "pact.pgo.trigger_reason"):
-                    value = op.attributes.get(attr)
-                    if value is not None:
-                        metadata[attr] = (
-                            int(value.value) if hasattr(value, 'value') else str(value))
+            value = op.get_int_attr("pact.optimal_num_stages")
+            if value is not None:
+                metadata["pact_optimal_num_stages"] = int(value)
         except Exception:
             pass
         metadata["tensordesc_meta"] = mod.get_tensordesc_metadata()

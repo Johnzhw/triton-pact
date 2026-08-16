@@ -31,6 +31,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32,
   }
 }
 
-// CHECK: module attributes {pact.optimal_num_stages = 2 : i32
+// CHECK: module attributes {pact.native_num_stages = 3 : i32
+// CHECK-SAME: pact.optimal_num_stages = 2 : i32
 // CHECK: scf.for
 // CHECK: tt.num_stages = 2 : i32

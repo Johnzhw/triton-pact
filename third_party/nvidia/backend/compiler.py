@@ -289,17 +289,18 @@ class CUDABackend(BaseBackend):
 
     @staticmethod
     def make_ttgir(mod, metadata, opt, capability):
-        # P11: read pact.optimal_num_warps before TTIR→TTGIR conversion
+        # P11: read pact.optimal_num_warps before TTIR→TTGIR conversion.
+        # `mod` already went through make_ttir's pm.run(), so use the bound
+        # attr accessors (op.attributes is stale after a pass-manager run).
         if knobs.pact.enable and knobs.pact.enable_auto_num_warps:
             try:
                 op = mod.get_operation()
-                if hasattr(op, 'attributes'):
-                    pact_warp = op.attributes.get("pact.optimal_num_warps")
-                    if pact_warp is not None:
-                        pw = int(pact_warp.value)
-                        if pw != opt.num_warps:
-                            print(f"[PACT P11→compiler] num_warps: {opt.num_warps} -> {pw}")
-                            opt.num_warps = pw
+                pact_warp = op.get_int_attr("pact.optimal_num_warps")
+                if pact_warp is not None:
+                    pw = int(pact_warp)
+                    if pw != opt.num_warps:
+                        print(f"[PACT P11→compiler] num_warps: {opt.num_warps} -> {pw}")
+                        opt.num_warps = pw
             except Exception:
                 pass
         # Set maxnreg on all kernels, if it was provided.
@@ -332,19 +333,13 @@ class CUDABackend(BaseBackend):
             passes.ttir.add_triton_licm(pm)
             passes.common.add_canonicalizer(pm)
             passes.ttgpuir.add_combine_tensor_select_and_if(pm)
-            # P6 AutoNumStages may have set pact.optimal_num_stages on the module
-            if knobs.pact.enable and knobs.pact.enable_auto_num_stages:
-                try:
-                    op = mod.get_operation()
-                    if hasattr(op, 'attributes'):
-                        pact_attr = op.attributes.get("pact.optimal_num_stages")
-                        if pact_attr is not None:
-                            optimal_ns = int(pact_attr.value)
-                            if optimal_ns > opt.num_stages:
-                                opt.num_stages = optimal_ns
-                                print(f"[PACT P6→Pipeline] num_stages overridden: {optimal_ns}")
-                except Exception:
-                    pass  # P6→Pipeline link: loop attribute is primary mechanism
+            # P6 runs inside this pass manager and writes `tt.num_stages` on
+            # the pipelined loop.  AssignLatencies/Pipeline consume that loop
+            # attribute as their primary mechanism; `opt.num_stages` remains
+            # the fallback value for loops P6 did not touch.  There is
+            # deliberately no Python-level re-read of pact.optimal_num_stages
+            # here: before pm.run() the attribute does not exist yet, so any
+            # such read would be dead code.
             nvidia.passes.hopper.add_hopper_warpspec(pm, opt.num_stages, dump_enabled)
             passes.ttgpuir.add_assign_latencies(pm, opt.num_stages)
             passes.ttgpuir.add_schedule_loops(pm)

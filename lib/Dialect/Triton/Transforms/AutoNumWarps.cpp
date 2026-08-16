@@ -98,6 +98,12 @@ struct PACTAutoNumWarpsPass
     // The canonical paged-attention tile has exactly two annotated K/V loads.
     // Requiring >=4 loads silently disabled P11 for the primary target shape.
     if (numPagedLoads >= 1 && maxTileBytes > 0) {
+      // PGO facts replace the unknown-register assumption; both trees run the
+      // same L2 capacity equations with the same discretization bound.
+      // Known limitation (N4): stagesPerBlock keeps the Triton native default
+      // of 3 because P11 runs at TTIR before P6 decides stages at TTGIR; on
+      // pipeline-first targets this under-counts SMEM and may bias the warp
+      // choice conservatively.  Documented, not worked around here.
       auto decision =
           pact::selectNumWarps(maxTileBytes, regsPerThread, pgoActiveWarpRatio);
       optimalWarps = decision.numWarps;

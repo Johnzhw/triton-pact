@@ -117,7 +117,9 @@ static bool reachesScalarPointerAddPtr(Value val, int maxDepth = 8) {
         if (auto arg = dyn_cast<BlockArgument>(base)) {
           if (auto nameLoc = dyn_cast<NameLoc>(arg.getLoc())) {
             StringRef argName = nameLoc.getName().getValue();
-            if (argName.contains("q") || argName.contains("Q"))
+            if (argName == "q" || argName == "q_ptr" ||
+                argName == "query" || argName == "query_ptr" ||
+                argName.starts_with("q_"))
               return true;
           }
         }

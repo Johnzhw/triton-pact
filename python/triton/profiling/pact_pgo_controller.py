@@ -59,8 +59,24 @@ def _measure(swapper: PactKernelSwapper, kernel, iters: int = 20) -> float:
     return statistics.median(lat)
 
 
-def context_key(swapper: PactKernelSwapper, shape: tuple) -> str:
-    """Cheap signature of everything that should re-arm the PGO trigger."""
+def _remaining_steps_bucket(remaining_steps):
+    if remaining_steps is None:
+        return "unknown"
+    for cap in (64, 512, 2048, 8192):
+        if remaining_steps <= cap:
+            return f"le{cap}"
+    return "gt8192"
+
+
+def context_key(swapper: PactKernelSwapper, shape: tuple,
+                remaining_steps: Optional[int] = None) -> str:
+    """Cheap signature of everything that should re-arm the PGO trigger.
+
+    ``remaining_steps`` is bucketed coarsely so an amortization rejection at a
+    short remaining decode length does not permanently latch the same
+    kernel/shape when a later request has enough steps to amortize the PGO
+    compile cost.
+    """
     material = {
         "kernel": f"{swapper.jit_fn.fn.__module__}.{swapper.jit_fn.fn.__name__}",
         "shape": list(shape),
@@ -68,6 +84,8 @@ def context_key(swapper: PactKernelSwapper, shape: tuple) -> str:
             (k, v) for k, v in os.environ.items() if k.startswith("PACT_")),
         "target": str(getattr(swapper.baseline.metadata, "target", "")),
     }
+    if remaining_steps is not None:
+        material["remaining_bucket"] = _remaining_steps_bucket(remaining_steps)
     return hashlib.sha256(repr(material).encode()).hexdigest()[:16]
 
 
@@ -145,29 +163,94 @@ class PactPgoGatedController:
         self.reprobe_after_steps = reprobe_after_steps
         self.last_plan: Dict[str, Any] = {}
 
+    def _rejected(self, key: str, reason: str) -> Dict[str, Any]:
+        plan = {"triggered": False, "swapped": False, "rolled_back": False,
+                "reason": reason, "context_key": key}
+        try:
+            self.db.put(key, {"decision": "rejected", **plan})
+        except Exception:
+            pass
+        self.last_plan = plan
+        return plan
+
     def evaluate(self, key: str, swapper: PactKernelSwapper,
                  remaining_steps: int, measure_iters: int = 20,
                  force: bool = False) -> Dict[str, Any]:
-        """Run the full gated pipeline.  `key` should embed the context_key."""
-        prior = self.db.get(key)
-        if not force and prior.get("decision") in ("rejected", "swapped", "rolled_back"):
-            # G1 context gate: same context never re-runs.
-            return {"triggered": False, "reason": f"context gate: {prior.get('decision')}",
-                    "context_key": key, **prior}
+        """Run the full gated pipeline.  `key` should embed the context_key.
 
-        facts = self.collector.collect(steps=1)
-        facts.update(probe_active_warp_permille())
+        Any exception inside the gates (collect, compile, measure, swap or
+        rollback) is converted into a persisted `rejected` decision and a
+        non-triggered plan: the PGO layer must never propagate an exception to
+        the vLLM/benchmark harness.
+        """
+        try:
+            return self._evaluate(key, swapper, remaining_steps,
+                                  measure_iters, force)
+        except Exception as e:
+            plan = {"triggered": False, "swapped": False, "rolled_back": False,
+                    "reason": f"pgo error fallback: {e}", "context_key": key}
+            try:
+                self.db.put(key, {"decision": "rejected", **plan})
+            except Exception:
+                pass
+            self.last_plan = plan
+            return plan
+
+    def _evaluate(self, key: str, swapper: PactKernelSwapper,
+                  remaining_steps: int, measure_iters: int = 20,
+                  force: bool = False) -> Dict[str, Any]:
+        prior = self.db.get(key)
+        if not force and prior.get("decision") in ("rejected", "swapped",
+                                                   "rolled_back"):
+            # G1 context gate: same context never re-runs.  One exception:
+            # an amortization rejection may be retried after
+            # reprobe_after_steps evaluate() calls (each call corresponds to a
+            # harness prepare event), because the remaining decode length may
+            # have changed enough to cover the compile cost.
+            if (prior.get("decision") == "rejected" and
+                    prior.get("amortization_rejected") and
+                    self.reprobe_after_steps > 0):
+                seen = int(prior.get("probe_skips", 0)) + 1
+                updated = dict(prior, probe_skips=seen)
+                self.db.put(key, updated)
+                if seen < self.reprobe_after_steps:
+                    return {**updated, "triggered": False,
+                            "reason": (f"context gate: amortization rejection "
+                                       f"(reprobe {seen}/"
+                                       f"{self.reprobe_after_steps})"),
+                            "context_key": key}
+                # Reached the reprobe limit: fall through and re-run the gates.
+            else:
+                return {**prior, "triggered": False,
+                        "reason": f"context gate: {prior.get('decision')}",
+                        "context_key": key}
+
+        # Total PGO overhead for the amortization gate: profile collection
+        # (subprocess compile + instrumented run) plus every variant compile.
+        # The gate may only count cost it actually incurred.
+        overhead_wall_s = 0.0
+
+        t0 = time.monotonic()
+        try:
+            facts = self.collector.collect(steps=1)
+        except Exception as e:
+            return self._rejected(key, f"collect failed: {e}")
+        overhead_wall_s += time.monotonic() - t0
+        try:
+            facts.update(probe_active_warp_permille())
+        except Exception as e:
+            facts["active_warp_ratio_unavailable"] = f"probe raised: {e}"
         hints = facts_to_hints(facts)
         self.db.put(key, facts)
 
         t0 = time.monotonic()
         try:
-            candidate = swapper.compile_candidate(hints, str(self.hints_dir / f"{key}.json"))
+            candidate = swapper.compile_candidate(
+                hints, str(self.hints_dir / f"{key}.json"))
         except Exception as e:
-            self.db.put(key, {"decision": "rejected", "reason": f"compile failed: {e}"})
-            return {"triggered": False, "reason": f"compile failed: {e}",
-                    "context_key": key}
-        compile_seconds = time.monotonic() - t0
+            return self._rejected(key, f"compile failed: {e}")
+        candidate_compile_seconds = time.monotonic() - t0
+        overhead_wall_s += candidate_compile_seconds
 
         # G2 theory trigger, computed in C++ and returned through metadata.
         md = candidate.metadata
@@ -182,13 +265,19 @@ class PactPgoGatedController:
             return plan
 
         # S3b: theory candidate + explicit 2-warp candidate (P3/M2 retained,
-        # P6/P11 disabled so they cannot override the explicit choice).
+        # P6/P11 disabled so they cannot override the explicit choice).  A
+        # failed explicit compile only removes that candidate; the theory
+        # candidate remains measurable and its compile cost is still charged.
         theory_stages = int(md_dict.get("pact_optimal_num_stages", 3) or 3)
+        low_warp = None
+        t0 = time.monotonic()
         try:
             low_warp = swapper.compile_explicit(num_stages=theory_stages,
                                                 num_warps=2)
-        except Exception as e:
+        except Exception:
             low_warp = None
+        overhead_wall_s += time.monotonic() - t0
+
         variants = {"theory": candidate, "low_warp": low_warp}
         us = {"baseline": _measure(swapper, swapper.baseline, measure_iters)}
         for name, kernel in variants.items():
@@ -200,7 +289,7 @@ class PactPgoGatedController:
         chosen = variants[chosen_name]
         gain_us = us["baseline"] - us[chosen_name]
         gain_percent = 100.0 * gain_us / max(us["baseline"], 1e-6)
-        compile_cost_us = compile_seconds * 1e6 * 1.5
+        compile_cost_us = 1.5 * overhead_wall_s * 1e6
         predicted_us = gain_us * max(remaining_steps, 1)
         passed = (gain_us > 0 and gain_percent >= self.min_gain_percent and
                   predicted_us > compile_cost_us)
@@ -214,16 +303,19 @@ class PactPgoGatedController:
             "chosen": chosen_name,
             "theory_stages": theory_stages,
             "gain_percent": gain_percent,
-            "compile_seconds": compile_seconds,
+            "compile_seconds": candidate_compile_seconds,
+            "overhead_wall_seconds": overhead_wall_s,
             "context_key": key,
         }
         if not passed:
-            plan.update({"swapped": False, "reason":
-                         ("gain <= 0" if gain_us <= 0 else
-                          f"gain {gain_percent:.1f}% < {self.min_gain_percent}%"
-                          if gain_percent < self.min_gain_percent else
-                          "predicted gain does not cover compile cost")})
-            self.db.put(key, {"decision": "rejected", **plan})
+            reason = ("gain <= 0" if gain_us <= 0 else
+                      f"gain {gain_percent:.1f}% < {self.min_gain_percent}%"
+                      if gain_percent < self.min_gain_percent else
+                      "predicted gain does not cover compile cost")
+            plan.update({"swapped": False, "reason": reason})
+            self.db.put(key, {"decision": "rejected", **plan,
+                              "amortization_rejected":
+                                  reason.startswith("predicted gain does not")})
             self.last_plan = plan
             return plan
 

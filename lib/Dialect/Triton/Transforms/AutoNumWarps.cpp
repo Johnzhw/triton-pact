@@ -26,6 +26,7 @@
 #include "llvm/Support/raw_ostream.h"
 
 #include <cstdlib>
+#include <optional>
 #include <string>
 #include <algorithm>
 
@@ -77,6 +78,16 @@ struct PACTAutoNumWarpsPass
     });
 
     int optimalWarps = pact::PactDecisionConstants::kDefaultNumWarps;
+    // Data gate (Phase 1, 2026-09-08): substituting SMDetector::optimalNumStages
+    // for the historical stagesPerBlock=3 changes the SM80 16x64 f16 choice
+    // from 2 warps (stages=3, exact occupancy tie) back to 4 warps (stages=4).
+    // That would break the SM80 P11 4→2 assertion, so the architecture default
+    // is NOT used.  An *explicit* PACT_MAX_PIPELINE_STAGES still overrides.
+    int stagesPerBlock = 3;
+    if (const char *env = std::getenv("PACT_MAX_PIPELINE_STAGES")) {
+      int val = std::atoi(env);
+      stagesPerBlock = std::max(2, std::min(val, 8));
+    }
     // The canonical paged-attention tile has exactly two annotated K/V loads.
     // Requiring >=4 loads silently disabled P11 for the primary target shape.
     if (numPagedLoads >= 1 && maxTileBytes > 0) {
@@ -84,12 +95,9 @@ struct PACTAutoNumWarpsPass
       // legal warp count and the required gain is the equations' own
       // discretization granularity.  The register count is unknown here, so
       // it is passed as the explicit named model-input assumption.
-      // Known limitation (N4): stagesPerBlock keeps the Triton native default
-      // of 3 because P11 runs at TTIR before P6 decides stages at TTGIR; on
-      // pipeline-first targets this under-counts SMEM and may bias the warp
-      // choice conservatively.  Documented, not worked around here.
       auto decision = pact::selectNumWarps(
-          maxTileBytes, pact::PactDecisionConstants::kUnknownRegsPerThread);
+          maxTileBytes, pact::PactDecisionConstants::kUnknownRegsPerThread,
+          /*measuredActiveWarpRatio=*/std::nullopt, stagesPerBlock);
       optimalWarps = decision.numWarps;
       llvm::errs() << "[PACT P11] selectNumWarps: " << optimalWarps
                    << " (occ4=" << decision.baselineOccupancy
@@ -99,13 +107,16 @@ struct PACTAutoNumWarpsPass
                    << ")\n";
     }
 
+    auto i32 = IntegerType::get(&getContext(), 32);
     mod->setAttr("pact.optimal_num_warps",
-                 IntegerAttr::get(IntegerType::get(&getContext(), 32),
-                                  optimalWarps));
+                 IntegerAttr::get(i32, optimalWarps));
+    mod->setAttr("pact.p11.stages_assumption",
+                 IntegerAttr::get(i32, stagesPerBlock));
 
     llvm::errs() << "[PACT P11] num_warps recommendation: " << optimalWarps
                  << " (pagedLoads=" << numPagedLoads
-                 << ", maxTileB=" << maxTileBytes << ")\n";
+                 << ", maxTileB=" << maxTileBytes
+                 << ", stagesAssumption=" << stagesPerBlock << ")\n";
   }
 };
 

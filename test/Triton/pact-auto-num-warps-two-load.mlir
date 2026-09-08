@@ -30,4 +30,5 @@ module {
   }
 }
 
-// CHECK: module attributes {pact.optimal_num_warps = 4 : i32}
+// CHECK: module attributes {pact.optimal_num_warps = 4 : i32
+// CHECK-SAME: pact.p11.stages_assumption = 3 : i32

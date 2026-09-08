@@ -110,13 +110,37 @@ SelectStagesResult selectNumStages(const SelectStagesInput &input) {
     return result;
   result.feasibleMin = 2;
 
+  const int64_t regsPerThread = input.regsPerThread > 0
+                                    ? input.regsPerThread
+                                    : PactDecisionConstants::kUnknownRegsPerThread;
+  auto clamp01 = [](double x) { return std::clamp(x, 0.0, 1.0); };
+  const double stallFrac =
+      input.stallMemoryPermille.has_value()
+          ? clamp01(static_cast<double>(*input.stallMemoryPermille) / 1000.0)
+          : 0.0;
+  const double smEffFrac =
+      input.smEfficiencyPermille.has_value()
+          ? clamp01(static_cast<double>(*input.smEfficiencyPermille) / 1000.0)
+          : 0.0;
+
+  auto scoreFor = [&](int s) {
+    double occ = occupancyFor(input.tileBytes * s, regsPerThread, s,
+                              input.numWarps);
+    int extra = std::max(0, s - input.defaultStages);
+    // Caller-supplied linear terms; both coefficients default to 0 so the
+    // ranking is identical to the occupancy-only scan when no table is loaded.
+    occ -= input.stallPenaltyPerExtraStage * stallFrac *
+           static_cast<double>(extra);
+    occ += input.smEffBonusPerExtraStage * (1.0 - smEffFrac) *
+           static_cast<double>(extra);
+    return occ;
+  };
+
   // Scan the computed feasible set with the L2 capacity equations.
   double bestOcc = -std::numeric_limits<double>::infinity();
   int bestStages = input.defaultStages;
   for (int s = 2; s <= result.feasibleMax; ++s) {
-    double occ = occupancyFor(input.tileBytes * s,
-                              PactDecisionConstants::kUnknownRegsPerThread, s,
-                              input.numWarps);
+    double occ = scoreFor(s);
     constexpr double kEps = 1e-9;
     if (occ > bestOcc + kEps) {
       bestOcc = occ;
@@ -139,9 +163,7 @@ SelectStagesResult selectNumStages(const SelectStagesInput &input) {
     // discretization granularity of the best occupancy.
     double tolerance = modelGranularity(input.numWarps);
     for (int s = result.feasibleMax; s >= 2; --s) {
-      double occ = occupancyFor(input.tileBytes * s,
-                                PactDecisionConstants::kUnknownRegsPerThread,
-                                s, input.numWarps);
+      double occ = scoreFor(s);
       if (occ >= bestOcc - tolerance) {
         chosen = s;
         result.occupancy = occ;
@@ -149,10 +171,7 @@ SelectStagesResult selectNumStages(const SelectStagesInput &input) {
       }
     }
   } else {
-    result.occupancy = occupancyFor(
-        input.tileBytes * bestStages,
-        PactDecisionConstants::kUnknownRegsPerThread, bestStages,
-        input.numWarps);
+    result.occupancy = scoreFor(bestStages);
     chosen = bestStages;
   }
 

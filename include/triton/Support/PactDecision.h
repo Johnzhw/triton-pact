@@ -74,6 +74,18 @@ struct SelectStagesInput {
   int defaultStages = 3;
   int maxStages = 4;        // user/knob upper bound (PACT_MAX_PIPELINE_STAGES)
   int numWarps = PactDecisionConstants::kDefaultNumWarps;
+  // Register count used by the L2 occupancy scan.  Defaults to the named
+  // unknown-register assumption; a measured value (PGO / dynamic tree) is
+  // substituted by the caller.  Unused optional metrics leave this path
+  // bit-identical to the theory-only scan.
+  int64_t regsPerThread = PactDecisionConstants::kUnknownRegsPerThread;
+  // Optional measured counters in permille [0, 1000].  Absent -> ignored.
+  std::optional<int> stallMemoryPermille;
+  std::optional<int> smEfficiencyPermille;
+  // Coefficients supplied by the caller (offline family table).  Zero keeps
+  // the occupancy ranking unchanged.  C++ does not hard-code 0.30 / 0.50.
+  double stallPenaltyPerExtraStage = 0.0;
+  double smEffBonusPerExtraStage = 0.0;
 };
 
 struct SelectStagesResult {

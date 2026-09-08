@@ -117,6 +117,7 @@ static int computeOptimalNumStages(int64_t tileBytes, int64_t estIterations,
   if (!hasExplicitMaxPipelineStages())
     input.maxStages = std::max(input.maxStages, defaultStages);
   input.numWarps = numWarps;
+  input.regsPerThread = pact::PactDecisionConstants::kUnknownRegsPerThread;
 
   auto decision = pact::selectNumStages(input);
 

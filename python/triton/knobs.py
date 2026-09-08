@@ -583,6 +583,10 @@ class pact_knobs(base_knobs):
     enable_auto_num_stages: env_bool = env_bool("PACT_ENABLE_AUTO_NUM_STAGES", True)
     enable_auto_num_warps: env_bool = env_bool("PACT_ENABLE_AUTO_NUM_WARPS", False)
     max_pipeline_stages: env_int = env_int("PACT_MAX_PIPELINE_STAGES", 4)
+    # 0 = unset (do not pin).  C++ / compiler.py treat a positive value as a hard pin.
+    override_warps: env_int = env_int("PACT_OVERRIDE_WARPS", 0)
+    override_stages: env_int = env_int("PACT_OVERRIDE_STAGES", 0)
+    override_v: env_int = env_int("PACT_OVERRIDE_V", 0)
     verbose: env_bool = env_bool("PACT_VERBOSE", False)
 
 

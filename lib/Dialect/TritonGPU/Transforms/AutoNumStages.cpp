@@ -229,6 +229,16 @@ struct PACTAutoNumStagesPass
       int optimal = computeOptimalNumStages(
           tileBytes, estIterations, haveIterationEstimate, pageSize,
           tileTokens, defaultStages, numWarps);
+      if (const char *env = std::getenv("PACT_OVERRIDE_STAGES")) {
+        int pinned = std::atoi(env);
+        if (pinned >= 2 && pinned <= 8 && pinned != optimal) {
+          llvm::errs() << "[PACT P6] OVERRIDE_STAGES " << optimal << " -> "
+                       << pinned << "\n";
+          optimal = pinned;
+        } else if (pinned >= 2 && pinned <= 8) {
+          optimal = pinned;
+        }
+      }
 
       // Always publish the computed decision on the module so the PGO branch
       // can read the theory-selected stage count back from metadata even when

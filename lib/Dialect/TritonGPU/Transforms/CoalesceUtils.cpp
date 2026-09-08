@@ -12,6 +12,8 @@
 #include "triton/Tools/StrUtil.h"
 #include "llvm/Support/Debug.h"
 
+#include <cstdlib>
+
 #define DEBUG_TYPE "tritongpu-coalesce"
 #define DBGS() (llvm::dbgs() << "[" DEBUG_TYPE "]: ")
 #define LDBG(X) LLVM_DEBUG(DBGS() << X << "\n")
@@ -133,6 +135,13 @@ buildCoalescedEncoding(ModuleAxisInfoAnalysis &axisInfoAnalysis, Operation *op,
 
         int64_t exactV = std::min(memCap, regContig);
         perThread = (unsigned)std::max<int64_t>(exactV, 1);
+        if (const char *env = std::getenv("PACT_OVERRIDE_V")) {
+          int pinned = std::atoi(env);
+          if (pinned >= 1) {
+            perThread = (unsigned)pinned;
+            LDBG("PACT OVERRIDE_V: perThread -> " << perThread);
+          }
+        }
         LDBG("PACT M2 exact V: perThread -> " << perThread
              << " (memContig=" << memContig
              << ", memCap=" << memCap

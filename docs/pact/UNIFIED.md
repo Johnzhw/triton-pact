@@ -1,61 +1,36 @@
-# PACT Unified Architecture (non-PGO form)
+# PACT Unified Architecture (dynamic / PGO form)
 
-`pact-unified` is the non-PGO single-codebase form of PACT v4: the same tree
-supports NVIDIA, generic AMD, and Hygon gfx936 targets. The earlier
-`pact-amd` and `pact-hygon` branches are development snapshots; their
-non-PGO code is fully contained here. The PGO-enabled final form lives in
-`pact-pgo-unified` (`pact-pgo-unified-v4` tag).
+`pact-pgo-unified` is the v5 dynamic hot-swap tree. It contains the same
+static passes as `pact-unified` plus `python/triton/pact/**` (socket + shm +
+CUPTI probe + one-variant compiler + dual-slot G4 swap).
 
-**This tree contains no PGO code**: there are no `pact.pgo.*` attribute
-readers/writers, no `PACT_PGO_HINTS_JSON`, and no PGO runtime modules or
-Proton PACT hook. P6/P11 use only IR-static inputs and the theory model
-below, so the build is fully independent of runtime-collected hardware
-parameters.
+Rollback: `pact-pgo-unified-v4` is the previous Proton/GatedController PGO
+tree and is **not** an ancestor of this branch. Checkout that tag to restore
+the v4 PGO runtime.
 
 ## How architecture selection works
-1. Triton selects the backend compiler by active driver at runtime: CUDA uses
-   `third_party/nvidia/backend/compiler.py`, HIP uses
-   `third_party/amd/backend/compiler.py`.
-2. Each backend propagates the driver-reported target:
-   - NVIDIA: `PACT_SM_VERSION=<capability>` (e.g. 86).
-   - AMD/Hygon: `PACT_AMD_ARCH=<gfx string>` (e.g. gfx942, gfx936).
-3. At build time, `CMakeLists.txt` derives `TRITON_CODEGEN_BACKENDS` from the
-   LLVM targets the host LLVM was built with (`NVPTX→nvidia`,
-   `AMDGPU→amd`); `setup.py` installs the matching Python backends.
-4. `SMDetector::detect()` reads the propagated variables at JIT time, selects
-   `TargetBackend::NVIDIA/AMD/Unknown`, and fills the architecture resource
-   table. `numCUs` and `hasTMA` are reserved interfaces: intentionally unread
-   until official per-SKU capacity data / a TMA policy land.
+Same as the static tree: `PACT_SM_VERSION` / `PACT_AMD_ARCH` at JIT time,
+LLVM targets at build time, `SMDetector` resource tables.
 
-## Theory-as-code layering
-- L1: the page-internal F₂ `LinearLayout` (`PageLocalAnalysis.cpp`) and the
-  candidate-register `LinearLayout` (M2 block of `CoalesceUtils.cpp`) compute
-  `mem_contig` / `reg_contig` / `V` at compile time. No theorem value is
-  hard-coded.
-- L2: `SMDetector::estimateOccupancy` computes the capacity equations
-  (`min{SMEM, regs, warps, threads}`); `PactDecision.cpp` turns them into
-  decisions with a computed one-CTA discretization error bound.
-- The unknown register count is an explicit named model-input assumption
-  (`PactDecisionConstants::kUnknownRegsPerThread`), not a theorem constant.
-- P3 is architecture-neutral; AMD P6 keeps the native default stages until a
-  CDNA-specific model is validated. P6 publishes `pact.native_num_stages`
-  so downstream consumers (the PGO trigger in the other tree) compare the
-  chosen stage count against the same baseline P6 used.
+## Dynamic path
+1. Inference process launches the active CompiledKernel (slot 0).
+2. On (B,S) bucket change it sends `profile_and_compile` over a Unix socket.
+3. Compiler service: replica CUDA-event probe (L2) + CUPTI Profiling API
+   (L3, honest unavailable on this SM86 host) + family table + one JIT.
+4. Candidate cubin+metadata is written to shm; inference process compiles
+   the same env (cache hit if `TRITON_CACHE_DIR` is shared) and G4-swaps.
+5. `PACT_HW_HINTS_JSON` injects `pact.hw.*` module attrs into P6/P11.
+6. `PACT_OVERRIDE_WARPS/STAGES/V` pins a family choice.
 
-## Validation status (v4)
-- lit: 12/12 (`test/Triton/pact-*.mlir` + `test/TritonGPU/pact-*.mlir`).
-- zero-PGO gate: `git grep pact.pgo|PACT_PGO|pact_instrumentation|
-  online_profiler|optimization_planner` over lib/include/python/third_party/
-  test returns nothing.
-- NVIDIA SM80/86/89/90: SMDetector branch assertions + P3 contiguity=64 +
-  correctness diff 5.8e-5, recorded in pact_paper
-  (`results/verification_nvidia_smoke_v4.json`, including the P11 SM80
-  `num_warps: 4 -> 2` assertion).
-- AMD gfx942: logic smoke passes and a true `hip:gfx942` compile reaches
-  `hsaco` (`results/verification_amd_target_v4.json`).
-- Hygon gfx936: logic smoke passes; true `hip:gfx936` codegen reaches the AMD
-  LLIR pipeline and fails in native `ConvertWarpPipeline` because this LLVM
-  build does not know gfx936. Runtime validation is deferred to DTK/HIP
-  hardware.
-- Micro/ablation v4: `pact_paper/results/micro_stable_v4.json` and
-  `ablation_stages_v4.json`; P3 remains the dominant median gain.
+Family table (`PACT_FAMILY_TABLE`, default
+`pact_paper/eval/offline/family_table.json`) is **disabled** until the
+hold-out accuracy gate passes; lookup then returns `theory`.
+
+## Validation status (v5)
+- lit: 14/14 (shared with static tree).
+- Python unit: 10/10 in `pact_paper/eval/unit`.
+- Dual-process demo: S=256→4096 swaps, launch loop not blocked.
+- CUPTI: `cuptiProfilerInitialize rc=999` → unavailable, no fabricated
+  occupancy (`results/cupti_probe_v5.json`).
+- NVIDIA SM80/86/89/90 + P11 4→2, AMD gfx942 hsaco, gfx936
+  ConvertWarpPipeline: `results/verification_dynamic_v5.json`.

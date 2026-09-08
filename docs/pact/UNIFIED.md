@@ -41,20 +41,14 @@ parameters.
   so downstream consumers (the PGO trigger in the other tree) compare the
   chosen stage count against the same baseline P6 used.
 
-## Validation status (v4)
-- lit: 12/12 (`test/Triton/pact-*.mlir` + `test/TritonGPU/pact-*.mlir`).
-- zero-PGO gate: `git grep pact.pgo|PACT_PGO|pact_instrumentation|
-  online_profiler|optimization_planner` over lib/include/python/third_party/
-  test returns nothing.
-- NVIDIA SM80/86/89/90: SMDetector branch assertions + P3 contiguity=64 +
-  correctness diff 5.8e-5, recorded in pact_paper
-  (`results/verification_nvidia_smoke_v4.json`, including the P11 SM80
-  `num_warps: 4 -> 2` assertion).
-- AMD gfx942: logic smoke passes and a true `hip:gfx942` compile reaches
-  `hsaco` (`results/verification_amd_target_v4.json`).
-- Hygon gfx936: logic smoke passes; true `hip:gfx936` codegen reaches the AMD
-  LLIR pipeline and fails in native `ConvertWarpPipeline` because this LLVM
-  build does not know gfx936. Runtime validation is deferred to DTK/HIP
-  hardware.
-- Micro/ablation v4: `pact_paper/results/micro_stable_v4.json` and
-  `ablation_stages_v4.json`; P3 remains the dominant median gain.
+## v5 additions (static tree)
+- Optional measured stall/SM-efficiency coefficients on SelectStagesInput
+  (default 0 keeps v4 ranking).  P6/P11 read optional `pact.hw.*` attrs.
+- `PACT_OVERRIDE_WARPS/STAGES/V` pins, cache-keyed.  Lit 14/14.
+- P11 keeps `stagesPerBlock=3` (SM80 16x64 data gate).  Publishes
+  `pact.p11.stages_assumption`.
+
+## Validation status (v5)
+- lit: 14/14.
+- zero-dynamic gate PASS.
+- NVIDIA/AMD matrix: `pact_paper/results/verification_dynamic_v5.json`.

@@ -65,6 +65,7 @@ inline const std::set<std::string> CACHE_INVALIDATING_ENV_VARS = {
     "PACT_OVERRIDE_WARPS",
     "PACT_OVERRIDE_STAGES",
     "PACT_OVERRIDE_V",
+    "PACT_HW_HINTS_JSON",
     "PACT_SM_VERSION",
     "PACT_AMD_ARCH",
     // clang-format on

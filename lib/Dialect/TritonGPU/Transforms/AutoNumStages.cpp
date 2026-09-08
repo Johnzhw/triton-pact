@@ -92,7 +92,7 @@ static int64_t estimateTripCount(scf::ForOp forOp) {
 static int computeOptimalNumStages(int64_t tileBytes, int64_t estIterations,
                                    bool haveIterationEstimate, int pageSize,
                                    int tileTokens, int defaultStages,
-                                   int numWarps) {
+                                   int numWarps, pact::SelectStagesInput extra) {
   // Without a statically-resolvable trip count PACT must not override the
   // native pipeline decision (no profile input exists in this tree).
   if (!haveIterationEstimate) {
@@ -117,7 +117,11 @@ static int computeOptimalNumStages(int64_t tileBytes, int64_t estIterations,
   if (!hasExplicitMaxPipelineStages())
     input.maxStages = std::max(input.maxStages, defaultStages);
   input.numWarps = numWarps;
-  input.regsPerThread = pact::PactDecisionConstants::kUnknownRegsPerThread;
+  input.regsPerThread = extra.regsPerThread;
+  input.stallMemoryPermille = extra.stallMemoryPermille;
+  input.smEfficiencyPermille = extra.smEfficiencyPermille;
+  input.stallPenaltyPerExtraStage = extra.stallPenaltyPerExtraStage;
+  input.smEffBonusPerExtraStage = extra.smEffBonusPerExtraStage;
 
   auto decision = pact::selectNumStages(input);
 
@@ -173,6 +177,22 @@ struct PACTAutoNumStagesPass
     if (auto attr = mod->getAttrOfType<mlir::IntegerAttr>("ttg.num-warps"))
       numWarps = attr.getInt();
 
+    pact::SelectStagesInput hw;
+    hw.regsPerThread = pact::PactDecisionConstants::kUnknownRegsPerThread;
+    if (auto attr = mod->getAttrOfType<mlir::IntegerAttr>("pact.hw.regs_per_thread"))
+      if (attr.getInt() > 0)
+        hw.regsPerThread = attr.getInt();
+    if (auto attr = mod->getAttrOfType<mlir::IntegerAttr>(
+            "pact.hw.stall_memory_permille"))
+      hw.stallMemoryPermille = (int)attr.getInt();
+    if (auto attr = mod->getAttrOfType<mlir::IntegerAttr>(
+            "pact.hw.sm_efficiency_permille"))
+      hw.smEfficiencyPermille = (int)attr.getInt();
+    int64_t hwIters = -1;
+    if (auto attr = mod->getAttrOfType<mlir::IntegerAttr>(
+            "pact.hw.measured_iterations"))
+      hwIters = attr.getInt();
+
     mod.walk([&](scf::ForOp forOp) {
       int64_t tileBytes = 0;
       int64_t exactSMEMBytes = 0;
@@ -181,6 +201,10 @@ struct PACTAutoNumStagesPass
       bool hasPagedLoad = false;
       int64_t estIterations = estimateTripCount(forOp);
       bool haveIterationEstimate = estIterations > 0;
+      if (hwIters > 0) {
+        estIterations = hwIters;
+        haveIterationEstimate = true;
+      }
 
       forOp.walk([&](triton::LoadOp loadOp) {
         if (!loadOp->hasAttr("pact.paged_load"))
@@ -228,7 +252,7 @@ struct PACTAutoNumStagesPass
 
       int optimal = computeOptimalNumStages(
           tileBytes, estIterations, haveIterationEstimate, pageSize,
-          tileTokens, defaultStages, numWarps);
+          tileTokens, defaultStages, numWarps, hw);
       if (const char *env = std::getenv("PACT_OVERRIDE_STAGES")) {
         int pinned = std::atoi(env);
         if (pinned >= 2 && pinned <= 8 && pinned != optimal) {

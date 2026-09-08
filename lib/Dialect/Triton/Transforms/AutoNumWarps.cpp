@@ -90,14 +90,20 @@ struct PACTAutoNumWarpsPass
     }
     // The canonical paged-attention tile has exactly two annotated K/V loads.
     // Requiring >=4 loads silently disabled P11 for the primary target shape.
+    int64_t regsPerThread = pact::PactDecisionConstants::kUnknownRegsPerThread;
+    if (auto attr = mod->getAttrOfType<IntegerAttr>("pact.hw.regs_per_thread"))
+      if (attr.getInt() > 0)
+        regsPerThread = attr.getInt();
+    std::optional<double> measuredOcc;
+    if (auto attr = mod->getAttrOfType<IntegerAttr>(
+            "pact.hw.active_warp_ratio_permille"))
+      measuredOcc = attr.getInt() / 1000.0;
+
     if (numPagedLoads >= 1 && maxTileBytes > 0) {
-      // Theory-only path: the L2 capacity equations compute occ(w) for every
-      // legal warp count and the required gain is the equations' own
-      // discretization granularity.  The register count is unknown here, so
-      // it is passed as the explicit named model-input assumption.
+      // Optional pact.hw.* attrs (injected by the dynamic tree) enter the
+      // same L2 equations; absent attrs keep the theory-only path.
       auto decision = pact::selectNumWarps(
-          maxTileBytes, pact::PactDecisionConstants::kUnknownRegsPerThread,
-          /*measuredActiveWarpRatio=*/std::nullopt, stagesPerBlock);
+          maxTileBytes, regsPerThread, measuredOcc, stagesPerBlock);
       optimalWarps = decision.numWarps;
       llvm::errs() << "[PACT P11] selectNumWarps: " << optimalWarps
                    << " (occ4=" << decision.baselineOccupancy

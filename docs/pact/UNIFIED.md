@@ -1,10 +1,9 @@
 # PACT Unified Architecture (non-PGO form)
 
-`pact-unified` is the non-PGO single-codebase form of PACT v4: the same tree
-supports NVIDIA, generic AMD, and Hygon gfx936 targets. The earlier
-`pact-amd` and `pact-hygon` branches are development snapshots; their
-non-PGO code is fully contained here. The PGO-enabled final form lives in
-`pact-pgo-unified` (`pact-pgo-unified-v4` tag).
+`pact-unified` is the non-PGO single-codebase form of PACT v5: the same tree
+supports NVIDIA, generic AMD, and Hygon gfx936 targets. The dynamic/PGO form
+lives in `pact-pgo-unified` (`pact-pgo-unified-v5` tag). v4 tags remain as
+rollback points (`pact-unified-v4` / `pact-pgo-unified-v4`).
 
 **This tree contains no PGO code**: there are no `pact.pgo.*` attribute
 readers/writers, no `PACT_PGO_HINTS_JSON`, and no PGO runtime modules or

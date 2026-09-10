@@ -258,14 +258,20 @@ class HIPBackend(BaseBackend):
                     if pw != options.num_warps:
                         print(f"[PACT P11→compiler] num_warps: "
                               f"{options.num_warps} -> {pw}")
-                        options.num_warps = pw
+                        try:
+                            options.num_warps = pw
+                        except Exception:
+                            object.__setattr__(options, "num_warps", pw)
             except Exception:
                 pass
         if knobs.pact.enable and knobs.pact.override_warps:
             pw = int(knobs.pact.override_warps)
             if pw >= 1 and pw != options.num_warps:
                 print(f"[PACT OVERRIDE_WARPS] num_warps: {options.num_warps} -> {pw}")
-                options.num_warps = pw
+                try:
+                    options.num_warps = pw
+                except Exception:
+                    object.__setattr__(options, "num_warps", pw)
 
         pm = ir.pass_manager(mod.context)
         pm.enable_debug()

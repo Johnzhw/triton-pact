@@ -295,7 +295,10 @@ class CUDABackend(BaseBackend):
                     pw = int(pact_warp)
                     if pw != opt.num_warps:
                         print(f"[PACT P11→compiler] num_warps: {opt.num_warps} -> {pw}")
-                        opt.num_warps = pw
+                        try:
+                            opt.num_warps = pw
+                        except Exception:
+                            object.__setattr__(opt, "num_warps", pw)
             except Exception:
                 pass
         # Hard pin wins over P11.  0 / unset leaves the theory (or native) value.
@@ -303,7 +306,10 @@ class CUDABackend(BaseBackend):
             pw = int(knobs.pact.override_warps)
             if pw >= 1 and pw != opt.num_warps:
                 print(f"[PACT OVERRIDE_WARPS] num_warps: {opt.num_warps} -> {pw}")
-                opt.num_warps = pw
+                try:
+                    opt.num_warps = pw
+                except Exception:
+                    object.__setattr__(opt, "num_warps", pw)
         # Set maxnreg on all kernels, if it was provided.
         if opt.maxnreg is not None:
             mod.set_attr("ttg.maxnreg", ir.builder(mod.context).get_int32_attr(opt.maxnreg))

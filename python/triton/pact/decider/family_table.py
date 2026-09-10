@@ -42,7 +42,7 @@ class FamilyTable:
 
     @classmethod
     def from_dict(cls, data: Dict) -> "FamilyTable":
-        return cls(bool(data.get("enabled", True)),
+        return cls(bool(data.get("enabled", False)),
                    dict(data.get("entries") or {}),
                    str(data.get("default", "theory")))
 

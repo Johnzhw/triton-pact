@@ -5,6 +5,7 @@ G4 re-measures after the swap and rolls back if the new kernel is not faster.
 """
 from __future__ import annotations
 
+import os
 import statistics
 import threading
 from typing import Any, Callable, Dict, Optional, Tuple
@@ -59,6 +60,17 @@ class HotSwapper:
         g = _normalize_grid(grid or self.grid, self.bound_args)
         return k[g](*self.bound_args.values())
 
+    def retarget(self, args, kwargs, grid):
+        """Point the next compile/launch at a new tensor tuple (same constexprs)."""
+        self.args = args
+        self.kwargs = kwargs
+        self.grid = grid
+
+    def launch_with(self, args, grid=None):
+        k = self.current
+        g = _normalize_grid(grid or self.grid, self.bound_args)
+        return k[g](*args)
+
     def swap(self, kernel) -> int:
         with self._lock:
             if kernel is self.slots[0]:
@@ -86,11 +98,15 @@ class HotSwapper:
     def g4_install(self, kernel, measure_iters: int = 10,
                    min_gain_percent: float = 0.0) -> Dict[str, Any]:
         """Install `kernel` into slot 1, swap, rollback on regression."""
+        import time
+        t0 = time.monotonic()
+        measure_iters = int(os.environ.get("PACT_G4_ITERS", str(measure_iters)))
         base_us = self._measure(self.slots[0], measure_iters)
         cand_us = self._measure(kernel, measure_iters)
         gain_percent = 100.0 * (base_us - cand_us) / max(base_us, 1e-6)
         self.swap(kernel)
         post_us = self._measure(self.current, max(measure_iters // 2, 3))
+        measure_time_ms = (time.monotonic() - t0) * 1000.0
         rolled = post_us >= base_us or gain_percent < min_gain_percent
         if rolled:
             self.swap(self.slots[0])
@@ -101,6 +117,7 @@ class HotSwapper:
             "gain_percent": gain_percent,
             "swapped": not rolled,
             "rolled_back": rolled and post_us >= base_us,
+            "measure_time_ms": measure_time_ms,
         }
         self.last_g4 = plan
         return plan

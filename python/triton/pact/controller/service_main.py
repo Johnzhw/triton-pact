@@ -45,6 +45,13 @@ class CompilerService:
         facts.update(collect_or_unavailable(
             launch_fn=self.replica_launch if os.environ.get(
                 "PACT_CUPTI_PROFILING") == "1" else None))
+        cfg = req.get("current_config") or {}
+        try:
+            n_regs = int(cfg.get("n_regs") or facts.get("regs_per_thread") or 0)
+        except (TypeError, ValueError):
+            n_regs = 0
+        if n_regs > 0:
+            facts["regs_per_thread"] = n_regs
         profile_ms = (time.monotonic() - t0) * 1000.0
         wl = req.get("workload") or {}
         batch = int(wl.get("B") or 1)

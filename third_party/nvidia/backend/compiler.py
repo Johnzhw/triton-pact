@@ -3,7 +3,7 @@ from triton._C.libtriton import ir, passes, llvm, nvidia
 from triton import knobs
 from triton.runtime.errors import PTXASError
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import functools
 from typing import Any, Dict, Tuple, Optional
 from types import ModuleType
@@ -287,6 +287,9 @@ class CUDABackend(BaseBackend):
         # P11: read pact.optimal_num_warps before TTIR→TTGIR conversion.
         # `mod` already went through make_ttir's pm.run(), so use the bound
         # attr accessors (op.attributes is stale after a pass-manager run).
+        # CUDAOptions is frozen: build a real replacement instead of mutating it
+        # in place, so no downstream code can observe a half-updated options
+        # object (the old code needed `object.__setattr__` to work at all).
         if knobs.pact.enable and knobs.pact.enable_auto_num_warps:
             try:
                 op = mod.get_operation()
@@ -295,10 +298,7 @@ class CUDABackend(BaseBackend):
                     pw = int(pact_warp)
                     if pw != opt.num_warps:
                         print(f"[PACT P11→compiler] num_warps: {opt.num_warps} -> {pw}")
-                        try:
-                            opt.num_warps = pw
-                        except Exception:
-                            object.__setattr__(opt, "num_warps", pw)
+                        opt = replace(opt, num_warps=pw)
             except Exception:
                 pass
         # Hard pin wins over P11.  0 / unset leaves the theory (or native) value.
@@ -306,10 +306,7 @@ class CUDABackend(BaseBackend):
             pw = int(knobs.pact.override_warps)
             if pw >= 1 and pw != opt.num_warps:
                 print(f"[PACT OVERRIDE_WARPS] num_warps: {opt.num_warps} -> {pw}")
-                try:
-                    opt.num_warps = pw
-                except Exception:
-                    object.__setattr__(opt, "num_warps", pw)
+                opt = replace(opt, num_warps=pw)
         # Set maxnreg on all kernels, if it was provided.
         if opt.maxnreg is not None:
             mod.set_attr("ttg.maxnreg", ir.builder(mod.context).get_int32_attr(opt.maxnreg))

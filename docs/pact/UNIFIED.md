@@ -8,6 +8,25 @@ Rollback: `pact-pgo-unified-v4` is the previous Proton/GatedController PGO
 tree and is **not** an ancestor of this branch. Checkout that tag to restore
 the v4 PGO runtime.
 
+## Measurement contract: one PACT preset per process (v7)
+
+Triton caches compiled kernels **per process** keyed on
+`compute_cache_key(kernel_cache, specialization, options)`
+(`python/triton/runtime/jit.py`) — that key contains **no `PACT_*` environment
+variable**. Only the *disk* key does (`include/triton/Tools/Sys/GetEnv.h`,
+`CACHE_INVALIDATING_ENV_VARS`). Consequences:
+
+- compiling the same kernel specialization twice in one process with different
+  PACT presets silently reuses the **first** kernel;
+- `rm -rf ~/.triton/cache` does **not** fix it — the stale kernel is in memory;
+- benchmark/QA harnesses must therefore run one preset per process, and read
+  artifacts back from a cache directory that only that process wrote.
+
+`pact_paper/suite/harness/worker.py` + `run_one.py` implement this: each cell
+gets a fresh process and a fresh `TRITON_CACHE_DIR`. Any harness that measures
+`PACT_ENABLE=0` and `PACT_ENABLE=1` inside one process is measuring vanilla
+against itself.
+
 ## How architecture selection works
 Same as the static tree: `PACT_SM_VERSION` / `PACT_AMD_ARCH` at JIT time,
 LLVM targets at build time, `SMDetector` resource tables.

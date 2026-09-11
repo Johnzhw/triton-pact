@@ -1,54 +1,55 @@
-# PACT Unified Architecture (non-PGO form)
+# PACT Unified Architecture (dynamic / PGO form)
 
-`pact-unified` is the non-PGO single-codebase form of PACT v5: the same tree
-supports NVIDIA, generic AMD, and Hygon gfx936 targets. The dynamic/PGO form
-lives in `pact-pgo-unified` (`pact-pgo-unified-v5` tag). v4 tags remain as
-rollback points (`pact-unified-v4` / `pact-pgo-unified-v4`).
+`pact-pgo-unified` is the v5 dynamic hot-swap tree. It contains the same
+static passes as `pact-unified` plus `python/triton/pact/**` (socket + shm +
+CUPTI probe + one-variant compiler + dual-slot G4 swap).
 
-**This tree contains no PGO code**: there are no `pact.pgo.*` attribute
-readers/writers, no `PACT_PGO_HINTS_JSON`, and no PGO runtime modules or
-Proton PACT hook. P6/P11 use only IR-static inputs and the theory model
-below, so the build is fully independent of runtime-collected hardware
-parameters.
+Rollback: `pact-pgo-unified-v4` is the previous Proton/GatedController PGO
+tree and is **not** an ancestor of this branch. Checkout that tag to restore
+the v4 PGO runtime.
+
+## Measurement contract: one PACT preset per process (v7)
+
+Triton caches compiled kernels **per process** keyed on
+`compute_cache_key(kernel_cache, specialization, options)`
+(`python/triton/runtime/jit.py`) — that key contains **no `PACT_*` environment
+variable**. Only the *disk* key does (`include/triton/Tools/Sys/GetEnv.h`,
+`CACHE_INVALIDATING_ENV_VARS`). Consequences:
+
+- compiling the same kernel specialization twice in one process with different
+  PACT presets silently reuses the **first** kernel;
+- `rm -rf ~/.triton/cache` does **not** fix it — the stale kernel is in memory;
+- benchmark/QA harnesses must therefore run one preset per process, and read
+  artifacts back from a cache directory that only that process wrote.
+
+`pact_paper/suite/harness/worker.py` + `run_one.py` implement this: each cell
+gets a fresh process and a fresh `TRITON_CACHE_DIR`. Any harness that measures
+`PACT_ENABLE=0` and `PACT_ENABLE=1` inside one process is measuring vanilla
+against itself.
 
 ## How architecture selection works
-1. Triton selects the backend compiler by active driver at runtime: CUDA uses
-   `third_party/nvidia/backend/compiler.py`, HIP uses
-   `third_party/amd/backend/compiler.py`.
-2. Each backend propagates the driver-reported target:
-   - NVIDIA: `PACT_SM_VERSION=<capability>` (e.g. 86).
-   - AMD/Hygon: `PACT_AMD_ARCH=<gfx string>` (e.g. gfx942, gfx936).
-3. At build time, `CMakeLists.txt` derives `TRITON_CODEGEN_BACKENDS` from the
-   LLVM targets the host LLVM was built with (`NVPTX→nvidia`,
-   `AMDGPU→amd`); `setup.py` installs the matching Python backends.
-4. `SMDetector::detect()` reads the propagated variables at JIT time, selects
-   `TargetBackend::NVIDIA/AMD/Unknown`, and fills the architecture resource
-   table. `numCUs` and `hasTMA` are reserved interfaces: intentionally unread
-   until official per-SKU capacity data / a TMA policy land.
+Same as the static tree: `PACT_SM_VERSION` / `PACT_AMD_ARCH` at JIT time,
+LLVM targets at build time, `SMDetector` resource tables.
 
-## Theory-as-code layering
-- L1: the page-internal F₂ `LinearLayout` (`PageLocalAnalysis.cpp`) and the
-  candidate-register `LinearLayout` (M2 block of `CoalesceUtils.cpp`) compute
-  `mem_contig` / `reg_contig` / `V` at compile time. No theorem value is
-  hard-coded.
-- L2: `SMDetector::estimateOccupancy` computes the capacity equations
-  (`min{SMEM, regs, warps, threads}`); `PactDecision.cpp` turns them into
-  decisions with a computed one-CTA discretization error bound.
-- The unknown register count is an explicit named model-input assumption
-  (`PactDecisionConstants::kUnknownRegsPerThread`), not a theorem constant.
-- P3 is architecture-neutral; AMD P6 keeps the native default stages until a
-  CDNA-specific model is validated. P6 publishes `pact.native_num_stages`
-  so downstream consumers (the PGO trigger in the other tree) compare the
-  chosen stage count against the same baseline P6 used.
+## Dynamic path
+1. Inference process launches the active CompiledKernel (slot 0).
+2. On (B,S) bucket change it sends `profile_and_compile` over a Unix socket.
+3. Compiler service: replica CUDA-event probe (L2) + CUPTI Profiling API
+   (L3, honest unavailable on this SM86 host) + family table + one JIT.
+4. Candidate cubin+metadata is written to shm; inference process compiles
+   the same env (cache hit if `TRITON_CACHE_DIR` is shared) and G4-swaps.
+5. `PACT_HW_HINTS_JSON` injects `pact.hw.*` module attrs into P6/P11.
+6. `PACT_OVERRIDE_WARPS/STAGES/V` pins a family choice.
 
-## v5 additions (static tree)
-- Optional measured stall/SM-efficiency coefficients on SelectStagesInput
-  (default 0 keeps v4 ranking).  P6/P11 read optional `pact.hw.*` attrs.
-- `PACT_OVERRIDE_WARPS/STAGES/V` pins, cache-keyed.  Lit 14/14.
-- P11 keeps `stagesPerBlock=3` (SM80 16x64 data gate).  Publishes
-  `pact.p11.stages_assumption`.
+Family table (`PACT_FAMILY_TABLE`, default
+`pact_paper/eval/offline/family_table.json`) is **disabled** until the
+hold-out accuracy gate passes; lookup then returns `theory`.
 
 ## Validation status (v5)
-- lit: 14/14.
-- zero-dynamic gate PASS.
-- NVIDIA/AMD matrix: `pact_paper/results/verification_dynamic_v5.json`.
+- lit: 14/14 (shared with static tree).
+- Python unit: 10/10 in `pact_paper/eval/unit`.
+- Dual-process demo: S=256→4096 swaps, launch loop not blocked.
+- CUPTI: `cuptiProfilerInitialize rc=999` → unavailable, no fabricated
+  occupancy (`results/cupti_probe_v5.json`).
+- NVIDIA SM80/86/89/90 + P11 4→2, AMD gfx942 hsaco, gfx936
+  ConvertWarpPipeline: `results/verification_dynamic_v5.json`.

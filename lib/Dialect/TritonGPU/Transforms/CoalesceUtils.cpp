@@ -134,7 +134,14 @@ buildCoalescedEncoding(ModuleAxisInfoAnalysis &axisInfoAnalysis, Operation *op,
         }
 
         int64_t exactV = std::min(memCap, regContig);
-        perThread = (unsigned)std::max<int64_t>(exactV, 1);
+        // M2 restores a lower bound: the exact page-bounded vector width.
+        // It must never lower the width below what AxisInfo already proves
+        // for this load.  On vLLM kernel_unified_attention the K/V loads are
+        // natively coalesced to 128-bit and cp.async-pipelined; replacing
+        // perThread with exactV=1 there demoted them to scalar loads and
+        // cost 12 cp.async conversions (v7 regression #1).
+        perThread = (unsigned)std::max<int64_t>(
+            std::max<unsigned>(perThread, 1), exactV);
         if (const char *env = std::getenv("PACT_OVERRIDE_V")) {
           int pinned = std::atoi(env);
           if (pinned >= 1) {

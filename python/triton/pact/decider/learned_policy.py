@@ -41,6 +41,8 @@ class LearnedPolicy:
         self.tree = data.get("rules") or []
         self.prototypes = data.get("prototypes") or []
         self.k = int(data.get("k", 3))
+        self.max_dist = data.get("max_dist")
+        self.default_pick = data.get("default", "theory")
 
     @classmethod
     def load(cls, path: Optional[str] = None) -> Optional["LearnedPolicy"]:
@@ -71,8 +73,14 @@ class LearnedPolicy:
             d = sum(abs(a - b) for a, b in zip(x, p["feat"]))
             ds.append((d, p.get("gains", {})))
         ds.sort(key=lambda t: t[0])
+        # V9: outside the offline-measured neighbourhood, fall back to the
+        # model's safe default (the static floor) instead of extrapolating.
+        max_dist = getattr(self, "max_dist", None)
+        default = getattr(self, "default_pick", "theory")
+        if max_dist is not None and ds and ds[0][0] > max_dist:
+            return default, 1.0
         top = ds[: self.k]
-        best, best_v = "vanilla", 1.0
+        best, best_v = default, 1.0
         for v in top[0][1]:
             vals = [g.get(v, 1.0) for _, g in top if v in g]
             if not vals:

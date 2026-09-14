@@ -36,5 +36,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32,
 
 // CHECK: module attributes {pact.native_num_stages = 5 : i32
 // CHECK-SAME: pact.optimal_num_stages = 5 : i32
-// When optimal == default, the loop attribute is intentionally left untouched.
-// CHECK-NOT: tt.num_stages =
+// V9-A1: even when optimal == default the loop attribute is now written —
+// an explicit tt.num_stages is what unlocks pipelineWithoutDot for dot-free
+// paged loops (without it AssignLatencies never schedules them).
+// CHECK: } {tt.num_stages = 5 : i32}

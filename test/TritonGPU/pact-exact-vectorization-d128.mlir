@@ -6,10 +6,18 @@
 // `sizePerThread=[1,8], threadsPerWarp=[4,8]`.  The 16x128 shape does *not*
 // follow: with 4 warps over 16x128 there are not enough threads to give every
 // lane 8 contiguous elements on the head axis, so the register layout comes out
-// `[1,8]` over `threadsPerWarp=[2,16]`.  The real kernel then emits scalar
-// 32-bit loads for this shape even though M2 did raise sizePerThread to 8
-// (suite/results/ir_dump_v7/d128_p64_s2048, 1x b16 + 18x b32) -- the wide-load
-// gap called out in the v7 Phase 1 audit.
+// `[1,8]` over `threadsPerWarp=[2,16]`.
+//
+// v7 note (superseded by the v8 fix): with that layout the real kernel still
+// emitted scalar 32-bit loads and this was read as a "wide-load gap" of M2.
+// v8 diagnosis (suite/results/v8/d128_diag/) showed the layout was never the
+// blocker: the old P3 divisibility boost bound elemSize*2 (=4B for f16)
+// gcd-capped the pointer divisibility at 4 bytes on *every* shape, and the
+// single 128-bit load in the v7 d64 dump was the dense Q load, not a paged
+// K/V load.  The v8 fix raises the rhs bound to min(16, head_dim_size *
+// elemSize) in AxisInfo; paged K/V loads now emit ld.global.v4.b32 for both
+// D=64 and D=128 (suite/results/ir_dump_v8fix/), while the Coalesce layout
+// pinned below is unchanged.
 //
 // This test pins the layout M2 produces today so a future change to the
 // regContig/memCap computation cannot silently move it.

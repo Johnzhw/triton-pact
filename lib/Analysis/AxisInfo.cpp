@@ -650,7 +650,21 @@ private:
           auto strategy = getOverrideStrategy(loadOp, dim, safeContiguity);
           if (strategy != OverrideStrategy::NoOverride) {
             lhsDivisibility = std::max(lhsDivisibility, int64_t(16));
-            rhsDivisibility = std::max(rhsDivisibility, elemSize * 2);
+            // V8-1: the head-dim group starts inside a page are, by the
+            // page-local layout L_page, multiples of head_dim_size elements,
+            // i.e. head_dim_size*elemSize bytes (kv_head*D and tok*D strides
+            // before them).  For power-of-two D with D*elemSize >= 16 every
+            // group start is therefore 16B-aligned and the rhs lower bound
+            // is the full vector width — the old elemSize*2 bound (=4B for
+            // f16) gcd-capped the result at 4B and kept every paged K/V load
+            // at 2-element granularity on all shapes (see
+            // suite/results/v8/d128_diag/).  Smaller head dims keep the old
+            // conservative bound, which stays sound for them.
+            int64_t rhsBound = elemSize * 2;
+            if (auto hds = loadOp->template getAttrOfType<IntegerAttr>(
+                    "pact.head_dim_size"))
+              rhsBound = std::min<int64_t>(16, hds.getInt() * elemSize);
+            rhsDivisibility = std::max(rhsDivisibility, rhsBound);
             break;
           }
         }
@@ -663,6 +677,26 @@ private:
           rhsDivisibility = std::max(rhsDivisibility, elemSize * 2);
           LDBG("PACT P0+P3: divisibility boost via penetration");
         }
+      }
+      // PACT diagnostic (log-only; deliberately not in the cache-key env
+      // list): dump the inputs the generic gcd tail consumes for paged
+      // addptrs, so shape asymmetries in divisibility are observable.
+      if (const char *dbg = std::getenv("PACT_DEBUG_DIV");
+          dbg && dbg[0] == '1') {
+        for (auto *user : op.getResult().getUsers())
+          if (auto loadOp = dyn_cast<triton::LoadOp>(user))
+            if (loadOp->hasAttr("pact.paged_load")) {
+              int64_t sc = 0;
+              auto st = getOverrideStrategy(loadOp, dim, sc);
+              llvm::errs()
+                  << "[PACT P3-DIV] addptr dim=" << dim
+                  << " elem=" << elemSize
+                  << " lhsDiv=" << lhsDivisibility
+                  << " rhsDiv=" << rhsDivisibility
+                  << " lhsContig=" << lhs.getContiguity(dim)
+                  << " rhsContig=" << rhs.getContiguity(dim)
+                  << " strategy=" << (int)st << "\n";
+            }
       }
     }
     if (lhs.getContiguity(dim) > 1 && rhs.getContiguity(dim) > 1) {

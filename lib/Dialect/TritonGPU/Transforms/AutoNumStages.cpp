@@ -212,10 +212,17 @@ struct PACTAutoNumStagesPass
       // V9-A1: dot-free loops need an explicit tt.num_stages attribute to be
       // scheduled at all (pipelineWithoutDot); loops that feed a dot are
       // pipelined natively and must keep the historical no-touch behaviour.
+      // V10-P0 (B1 cleanup): interface-based probe with early interrupt
+      // instead of a full string-matching walk. The interface set is a
+      // superset of "tt.dot" (e.g. dot_scaled); those feed the MMA pipeline
+      // natively too, so they belong on the hasDot side — the decode target
+      // family contains none of them and lit pins the existing behaviour.
       bool hasDot = false;
       forOp.walk([&](Operation *op) {
-        if (op->getName().getStringRef() == "tt.dot")
+        if (isa<mlir::triton::DotOpInterface>(op)) {
           hasDot = true;
+          return WalkResult::interrupt();
+        }
         return WalkResult::advance();
       });
       if (hwIters > 0) {

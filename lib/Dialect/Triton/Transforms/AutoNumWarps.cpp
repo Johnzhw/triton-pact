@@ -83,10 +83,25 @@ struct PACTAutoNumWarpsPass
     // from 2 warps (stages=3, exact occupancy tie) back to 4 warps (stages=4).
     // That would break the SM80 P11 4→2 assertion, so the architecture default
     // is NOT used.  An *explicit* PACT_MAX_PIPELINE_STAGES still overrides.
+    //
+    // V10-P0 (BEH-1): stagesPerBlock is a *model input assumption* — it folds
+    // into the SMEM term of the occupancy equations (tileBytes *
+    // stagesPerBlock), it is not a fact about the loop.  P6 runs later (TTGIR)
+    // and may ultimately write 2 (SM86 dot-free floor) or 5 (Hopper default);
+    // P11 cannot read that in a single compilation, so 3 remains the default
+    // (calibrated with the SM80 tie).  An *explicit* PACT_OVERRIDE_STAGES
+    // aligns the assumption with the value P6 will pin (same 2..8 domain as
+    // P6) and wins over PACT_MAX_PIPELINE_STAGES: a pin is more specific than
+    // a cap.  Unset knobs keep the v9 behaviour bit-for-bit.
     int stagesPerBlock = 3;
     if (const char *env = std::getenv("PACT_MAX_PIPELINE_STAGES")) {
       int val = std::atoi(env);
       stagesPerBlock = std::max(2, std::min(val, 8));
+    }
+    if (const char *env = std::getenv("PACT_OVERRIDE_STAGES")) {
+      int val = std::atoi(env);
+      if (val >= 2 && val <= 8)
+        stagesPerBlock = val;
     }
     // The canonical paged-attention tile has exactly two annotated K/V loads.
     // Requiring >=4 loads silently disabled P11 for the primary target shape.

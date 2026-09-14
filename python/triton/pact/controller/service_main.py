@@ -81,7 +81,11 @@ class CompilerService:
             "new_config": {
                 "warps": int(decision["extra_env"].get("PACT_OVERRIDE_WARPS") or
                              header.get("num_warps") or 4),
+                # V10-P0 (V10-5): prefer the loop decision the compiler actually
+                # wrote (P6's pact_optimal_num_stages); header num_stages is the
+                # OPTIONS value and only remains as a legacy fallback.
                 "stages": int(decision["extra_env"].get("PACT_OVERRIDE_STAGES") or
+                              header.get("pact_loop_stages") or
                               header.get("num_stages") or 3),
                 "V": int(os.environ.get("PACT_OVERRIDE_V") or 0),
             },

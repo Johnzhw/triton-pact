@@ -64,6 +64,12 @@ def kernel_to_blob(kernel, extra_header: Optional[Dict[str, Any]] = None
         "shared": int(md_dict.get("shared") or 0),
         "num_warps": int(md_dict.get("num_warps") or 4),
         "num_stages": int(md_dict.get("num_stages") or 3),
+        # V10-P0 (V10-5, kills the B2 trap): num_stages above is the OPTIONS
+        # value, not what the pipelined loop actually runs. The loop decision
+        # P6 wrote is compiled-metadata pact_optimal_num_stages; for the
+        # dot-free decode family the tt.num_stages loop attribute is always
+        # written, so it equals the loop stages. Consumers must prefer this.
+        "pact_loop_stages": md_dict.get("pact_optimal_num_stages"),
         "n_regs": int(getattr(kernel, "n_regs", 0) or md_dict.get("n_regs") or 0),
         "hash": getattr(kernel, "hash", None),
     }

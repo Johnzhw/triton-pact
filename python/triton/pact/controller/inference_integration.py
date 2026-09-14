@@ -25,7 +25,8 @@ class InferenceSession:
         self.launch_count = 0
 
     def maybe_request(self, batch: int, seq_len: int,
-                      current_config: Optional[Dict] = None) -> Optional[Dict]:
+                      current_config: Optional[Dict] = None,
+                      geometry: Optional[Dict] = None) -> Optional[Dict]:
         fire, bucket = should_trigger(self.prev_bucket, batch, seq_len)
         if bucket in self.done_buckets:
             return None
@@ -48,6 +49,7 @@ class InferenceSession:
             "type": "profile_and_compile",
             "kernel_key": getattr(self.swapper.jit_fn, "__name__", "kernel"),
             "workload": {"B": batch, "S": seq_len},
+            "geometry": geometry or {},
             "current_config": cfg,
         }
         resp = self.client.try_request(msg, timeout=120.0)

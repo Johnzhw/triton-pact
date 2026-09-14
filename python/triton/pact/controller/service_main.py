@@ -10,7 +10,7 @@ from typing import Any, Callable, Dict, Optional
 
 from triton.pact.compiler.explicit_compiler import compile_explicit, kernel_to_blob
 from triton.pact.decider.family_table import FamilyTable
-from triton.pact.decider.online_decider import decide
+from triton.pact.decider.learned_policy import decide
 from triton.pact.ipc.shm_manager import ShmManager
 from triton.pact.ipc.socket_server import PactSocketServer
 from triton.pact.profiler.cupti_collector import collect_or_unavailable
@@ -56,7 +56,9 @@ class CompilerService:
         wl = req.get("workload") or {}
         batch = int(wl.get("B") or 1)
         seq = int(wl.get("S") or 0)
-        decision = decide(facts, batch, seq, table=self.table)
+        geometry = req.get("geometry") or {}
+        decision = decide(facts, batch, seq, table=self.table,
+                          cfg=geometry if geometry.get("S") else None)
         t1 = time.monotonic()
         shm_name = ""
         shm_size = 0

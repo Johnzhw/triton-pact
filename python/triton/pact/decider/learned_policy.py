@@ -113,11 +113,21 @@ def decide(facts: Dict[str, Any], batch: int, seq_len: int,
     The caller (service_main) may pass the kernel geometry ``cfg``
     ({D,P,S,B,Hq,GQA}); without it the learned policy is skipped and the
     FamilyTable path behaves exactly as before.
+
+    V10-P0 (BEH-2): when ``cfg`` carries D/GQA they also address the
+    ``d{D}g{gqa}|``-prefixed FamilyTable entries on the table fallback path
+    (explicit head_dim/gqa arguments still win).  Previously the service
+    path looked the plain keys up only, so prefixed entries were
+    unaddressable there (the v7 dead-key lesson in residual form).
     """
     from triton.pact.decider.online_decider import decide as table_decide
     if cfg is None:
         return table_decide(facts, batch, seq_len, table=table,
                             hints_dir=hints_dir, head_dim=head_dim, gqa=gqa)
+    if head_dim is None and cfg.get("D"):
+        head_dim = int(cfg["D"])
+    if gqa is None and cfg.get("GQA"):
+        gqa = int(cfg["GQA"])
     policy = LearnedPolicy.load()
     if policy is not None:
         try:

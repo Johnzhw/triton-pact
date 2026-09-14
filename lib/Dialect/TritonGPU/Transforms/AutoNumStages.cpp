@@ -94,7 +94,15 @@ static int computeOptimalNumStages(int64_t tileBytes, int64_t estIterations,
                                    int tileTokens, int defaultStages,
                                    int numWarps, pact::SelectStagesInput extra) {
   // Without a statically-resolvable trip count PACT must not override the
-  // native pipeline decision (no profile input exists in this tree).
+  // native *stage-count* decision (no profile input exists in this tree).
+  // V9-A1: an explicit tt.num_stages loop attribute is still required to
+  // unlock pipelining for dot-free loops — AssignLatencies only pipelines
+  // loads of such loops when pipelineWithoutDot is set by the attribute, so
+  // a paged KV loop without tl.dot is otherwise never scheduled (0 cp.async
+  // on the naive kernel while the hand-optimised vLLM kernel pipelines via
+  // its MMA path).  The conservative floor is 2 stages: the minimal
+  // fill/drain prologue, measured neutral on the shortest shapes and
+  // >=1.3x on long sequences (suite/results/v9/a0_probe.json).
   if (!haveIterationEstimate) {
     llvm::errs() << "[PACT P6] " << pact::SMDetector::getGPUName()
                  << ": no static iteration estimate — keeping num_stages="
@@ -201,6 +209,15 @@ struct PACTAutoNumStagesPass
       bool hasPagedLoad = false;
       int64_t estIterations = estimateTripCount(forOp);
       bool haveIterationEstimate = estIterations > 0;
+      // V9-A1: dot-free loops need an explicit tt.num_stages attribute to be
+      // scheduled at all (pipelineWithoutDot); loops that feed a dot are
+      // pipelined natively and must keep the historical no-touch behaviour.
+      bool hasDot = false;
+      forOp.walk([&](Operation *op) {
+        if (op->getName().getStringRef() == "tt.dot")
+          hasDot = true;
+        return WalkResult::advance();
+      });
       if (hwIters > 0) {
         estIterations = hwIters;
         haveIterationEstimate = true;
@@ -253,6 +270,13 @@ struct PACTAutoNumStagesPass
       int optimal = computeOptimalNumStages(
           tileBytes, estIterations, haveIterationEstimate, pageSize,
           tileTokens, defaultStages, numWarps, hw);
+      if (!haveIterationEstimate && !hasDot) {
+        // V9-A1 floor: dot-free paged loop, no trip-count estimate. Without
+        // the attribute AssignLatencies never schedules it (0 cp.async); 2
+        // stages is the minimal prologue — neutral on the shortest shapes,
+        // >=1.3x on long ones (suite/results/v9/a0_probe.json).
+        optimal = std::min(optimal, 2);
+      }
       if (const char *env = std::getenv("PACT_OVERRIDE_STAGES")) {
         int pinned = std::atoi(env);
         if (pinned >= 2 && pinned <= 8 && pinned != optimal) {
@@ -272,9 +296,20 @@ struct PACTAutoNumStagesPass
                        mlir::IntegerType::get(&getContext(), 32), optimal));
 
       if (optimal == defaultStages) {
-        llvm::errs() << "[PACT P6] Keeping default num_stages="
-                     << defaultStages << " (optimal=" << optimal
-                     << ", no change needed)\n";
+        if (!hasDot) {
+          // V9-A1: even when the theory keeps the native value, dot-free
+          // loops need the explicit attribute to be scheduled at all.
+          llvm::errs() << "[PACT P6] Keeping default num_stages="
+                       << defaultStages << " (optimal=" << optimal
+                       << ", writing loop attr to enable dot-free pipelining)\n";
+          auto confirmAttr = mlir::IntegerAttr::get(
+              mlir::IntegerType::get(&getContext(), 32), optimal);
+          forOp->setAttr("tt.num_stages", confirmAttr);
+        } else {
+          llvm::errs() << "[PACT P6] Keeping default num_stages="
+                       << defaultStages << " (optimal=" << optimal
+                       << ", no change needed; dot loop scheduled natively)\n";
+        }
         return WalkResult::advance();
       }
 

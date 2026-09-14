@@ -1,5 +1,6 @@
 // RUN: env PACT_SM_VERSION=86 PACT_ENABLE_AUTO_NUM_WARPS=1 triton-opt %s -triton-pact-auto-num-warps | FileCheck %s
 // RUN: env PACT_SM_VERSION=86 PACT_ENABLE_AUTO_NUM_WARPS=1 PACT_MAX_PIPELINE_STAGES=4 triton-opt %s -triton-pact-auto-num-warps | FileCheck %s --check-prefix=PINNED
+// RUN: env PACT_SM_VERSION=86 PACT_ENABLE_AUTO_NUM_WARPS=1 PACT_OVERRIDE_STAGES=2 triton-opt %s -triton-pact-auto-num-warps | FileCheck %s --check-prefix=OVR2
 //
 // P11's stage assumption is a *model input*, not only a P6 cap.
 //
@@ -11,6 +12,11 @@
 //
 // Both runs must also keep the P11 decision itself unchanged: the warp choice on
 // SM86/16x64 is 4 either way, so this file guards the assumption, not the choice.
+//
+// V10-P0 (BEH-1b): an explicit PACT_OVERRIDE_STAGES is what P6 pins the loop to,
+// so the assumption aligns with it (pin beats cap; 2..8 domain, same as P6).
+// The 16x64 warp choice stays 4 under assumption 2 as well — the alignment only
+// matters inside the D128 flip window (see pact_paper suite/results/v10/arch_review.md §1.4).
 
 module {
   tt.func @two_paged_loads(%p0: !tt.ptr<f16>, %p1: !tt.ptr<f16>) {
@@ -42,3 +48,9 @@ module {
 // An explicit knob value is honoured and changes only the assumption.
 // PINNED: module attributes {pact.optimal_num_warps = 4 : i32
 // PINNED-SAME: pact.p11.stages_assumption = 4 : i32
+
+// An explicit PACT_OVERRIDE_STAGES aligns the assumption with P6's pin
+// (and beats PACT_MAX_PIPELINE_STAGES when both are set); on this 16x64
+// tile the warp choice itself is unchanged under assumption 2.
+// OVR2: module attributes {pact.optimal_num_warps = 4 : i32
+// OVR2-SAME: pact.p11.stages_assumption = 2 : i32

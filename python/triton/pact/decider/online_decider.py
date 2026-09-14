@@ -34,19 +34,39 @@ def facts_to_hints(facts: Dict[str, Any]) -> Dict[str, int]:
 
 def decide(facts: Dict[str, Any], batch: int, seq_len: int,
            table: Optional[FamilyTable] = None,
-           hints_dir: Optional[Path] = None) -> Dict[str, Any]:
+           hints_dir: Optional[Path] = None,
+           head_dim: Optional[int] = None,
+           gqa: Optional[int] = None) -> Dict[str, Any]:
+    """Facts + family table -> one extra_env for a single JIT.
+
+    v8: the table may return ``"vanilla"`` (the fit's vanilla-anchored winner
+    for buckets where no PACT variant beats vanilla by the 5% gate).  The
+    vanilla family compiles the untouched default kernel -- there is no
+    advantage in recompiling a PACT variant that measured slower.  Callers
+    that know the kernel geometry pass head_dim/gqa so the d{D}g{gqa}|
+    prefixed entries are addressable.
+    """
     table = table or FamilyTable.load()
     family = table.lookup(
         batch, seq_len,
         facts.get("active_warp_ratio_permille"),
         facts.get("stall_memory_permille"),
+        head_dim=head_dim, gqa=gqa,
     )
+    options_override: Dict[str, Any] = {}
+    if family == "vanilla":
+        extra_env = {"PACT_ENABLE": "0"}
+        return {
+            "family": family,
+            "extra_env": extra_env,
+            "options_override": options_override,
+            "hints": {},
+        }
     extra_env = {
         "PACT_ENABLE": "1",
         "PACT_ENABLE_AUTO_NUM_STAGES": "1",
         "PACT_ENABLE_AUTO_NUM_WARPS": "1",
     }
-    options_override: Dict[str, Any] = {}
     if family == "occupancy":
         extra_env["PACT_OVERRIDE_WARPS"] = "2"
         options_override["num_warps"] = 2

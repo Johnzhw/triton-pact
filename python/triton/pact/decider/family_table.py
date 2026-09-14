@@ -1,4 +1,12 @@
-"""Offline family table: (B,S,occ,stall) buckets -> {theory, occupancy, latency}."""
+"""Offline family table: (B,S,occ,stall) buckets -> {theory, occupancy, latency, vanilla}.
+
+v8: ``vanilla`` is a first-class family value -- the decider maps it to
+``PACT_ENABLE=0`` (no recompile advantage, keep the default kernel).  Keys may
+carry a ``d{D}g{gqa}|`` prefix; lookup prefers the prefixed entry when the
+caller supplies head_dim/gqa and falls back to the unprefixed grammar.  In v7
+the fit emitted prefixed keys that no runtime caller could address (dead
+entries); the prefix is now part of the documented grammar.
+"""
 from __future__ import annotations
 
 import json
@@ -6,6 +14,8 @@ import os
 from typing import Dict, Optional
 
 from triton.pact.runtime.workload_sniffer import bucket_bs
+
+KNOWN_FAMILIES = ("theory", "occupancy", "latency", "vanilla")
 
 
 def _occ_bucket(permille: Optional[int]) -> str:
@@ -29,16 +39,26 @@ def _stall_bucket(permille: Optional[int]) -> str:
 
 
 def make_key(batch: int, seq_len: int, occ_permille: Optional[int],
-             stall_permille: Optional[int]) -> str:
+             stall_permille: Optional[int], head_dim: Optional[int] = None,
+             gqa: Optional[int] = None) -> str:
     b, s = bucket_bs(batch, seq_len)
-    return f"{b}|{s}|{_occ_bucket(occ_permille)}|{_stall_bucket(stall_permille)}"
+    key = f"{b}|{s}|{_occ_bucket(occ_permille)}|{_stall_bucket(stall_permille)}"
+    if head_dim and gqa:
+        key = f"d{int(head_dim)}g{int(gqa)}|{key}"
+    return key
 
 
 class FamilyTable:
-    def __init__(self, enabled: bool, entries: Dict[str, str], default: str = "theory"):
+    def __init__(self, enabled: bool, entries: Dict[str, str],
+                 default: str = "theory"):
         self.enabled = enabled
-        self.entries = dict(entries)
-        self.default = default or "theory"
+        # Drop malformed entries loudly instead of carrying dead weight:
+        # a value outside KNOWN_FAMILIES can never be acted on by the decider.
+        dropped = {k: v for k, v in entries.items()
+                   if not (isinstance(v, str) and v in KNOWN_FAMILIES)}
+        self.entries = {k: v for k, v in entries.items() if k not in dropped}
+        self.dropped = dropped
+        self.default = default if default in KNOWN_FAMILIES else "theory"
 
     @classmethod
     def from_dict(cls, data: Dict) -> "FamilyTable":
@@ -59,20 +79,30 @@ class FamilyTable:
 
     def lookup(self, batch: int, seq_len: int,
                occ_permille: Optional[int] = None,
-               stall_permille: Optional[int] = None) -> str:
+               stall_permille: Optional[int] = None,
+               head_dim: Optional[int] = None,
+               gqa: Optional[int] = None) -> str:
         if not self.enabled:
             return self.default
-        key = make_key(batch, seq_len, occ_permille, stall_permille)
-        if key in self.entries:
-            return self.entries[key]
-        # nearest: drop occ/stall then seq then batch
-        b, s = bucket_bs(batch, seq_len)
-        for cand in (
-            f"{b}|{s}|{_occ_bucket(occ_permille)}|{_stall_bucket(stall_permille)}",
-            f"{b}|{s}|{_occ_bucket(occ_permille)}|stall_unk",
-            f"{b}|{s}|occ_unk|{_stall_bucket(stall_permille)}",
-            f"{b}|{s}|occ_unk|stall_unk",
-        ):
+        # Prefixed entries win when the caller knows (D, GQA).
+        if head_dim and gqa:
+            pref = f"d{int(head_dim)}g{int(gqa)}|"
+            for cand in self._candidates(batch, seq_len, occ_permille,
+                                         stall_permille):
+                if (pref + cand) in self.entries:
+                    return self.entries[pref + cand]
+        for cand in self._candidates(batch, seq_len, occ_permille,
+                                     stall_permille):
             if cand in self.entries:
                 return self.entries[cand]
         return self.default
+
+    @staticmethod
+    def _candidates(batch: int, seq_len: int, occ_permille: Optional[int],
+                    stall_permille: Optional[int]):
+        b, s = bucket_bs(batch, seq_len)
+        # exact, then relax occ/stall buckets to unknown
+        yield f"{b}|{s}|{_occ_bucket(occ_permille)}|{_stall_bucket(stall_permille)}"
+        yield f"{b}|{s}|{_occ_bucket(occ_permille)}|stall_unk"
+        yield f"{b}|{s}|occ_unk|{_stall_bucket(stall_permille)}"
+        yield f"{b}|{s}|occ_unk|stall_unk"

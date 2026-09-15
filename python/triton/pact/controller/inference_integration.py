@@ -24,6 +24,18 @@ class InferenceSession:
         self.in_flight = False
         self.launch_count = 0
 
+    def step(self, batch: int, seq_len: int,
+             current_config: Optional[Dict] = None,
+             geometry: Optional[Dict] = None) -> Optional[Dict]:
+        """V10-4 scheduler-step entry: run the decide/compile/G4 cycle at a
+        capture-safe point chosen by the caller (e.g. a scheduler step or a
+        workload-change boundary) instead of inline inside the attention
+        forward. Same contract and dedup state as maybe_request; returns the
+        plan dict or None."""
+        return self.maybe_request(batch, seq_len,
+                                   current_config=current_config,
+                                   geometry=geometry)
+
     def maybe_request(self, batch: int, seq_len: int,
                       current_config: Optional[Dict] = None,
                       geometry: Optional[Dict] = None) -> Optional[Dict]:

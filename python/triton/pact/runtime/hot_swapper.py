@@ -117,6 +117,9 @@ class HotSwapper:
         self.swap(kernel)
         post_us = self._measure(self.current, max(measure_iters // 2, 3))
         measure_time_ms = (time.monotonic() - t0) * 1000.0
+        # V11-6a R4 (AOBO Table-1 style): segment the switch path so the
+        # paper's overhead narrative has per-stage numbers and R2 pool hits
+        # are distinguishable from compile slow paths.
         rolled = post_us >= base_us or gain_percent < min_gain_percent
         if rolled:
             self.swap(self.slots[0])
@@ -128,6 +131,51 @@ class HotSwapper:
             "swapped": not rolled,
             "rolled_back": rolled and post_us >= base_us,
             "measure_time_ms": measure_time_ms,
+            "slot_swap_ms": 0.0,
         }
         self.last_g4 = plan
         return plan
+
+    # ---- V11-6a R2: resident variant pool (AOBO 预载思想) ------------------
+    def prewarm_pool(self, variants: Dict[str, Dict[str, str]]
+                     ) -> Dict[str, float]:
+        """Compile the named variant set in an idle window and keep the
+        kernels resident.  A later swap_from_pool(name) is a pure slot
+        exchange — no compile, no module load on the switch path."""
+        import time
+        if not hasattr(self, "_pool"):
+            self._pool: Dict[str, Any] = {}
+        spent = {}
+        for name, extra_env in variants.items():
+            if name in self._pool:
+                continue
+            t0 = time.monotonic()
+            k, _ = compile_explicit(self.jit_fn, self.args, self.kwargs,
+                                    dict(extra_env))
+            if getattr(k, "_init_handles", None) and not getattr(
+                    k, "function", None):
+                try:
+                    k._init_handles()
+                except Exception:
+                    pass
+            self._pool[name] = k
+            spent[name] = (time.monotonic() - t0) * 1000.0
+        return spent
+
+    def pool_contains(self, name: str) -> bool:
+        return bool(getattr(self, "_pool", None)) and name in self._pool
+
+    def swap_from_pool(self, name: str) -> bool:
+        """R2 fast path: slot-pointer exchange to a pooled variant.
+        Returns False on a miss (caller falls back to the compile slow
+        path).  Sub-millisecond by construction; measured in R4 segments."""
+        import time
+        pool = getattr(self, "_pool", None)
+        if not pool or name not in pool:
+            return False
+        t0 = time.monotonic()
+        self.swap(pool[name])
+        self.last_g4 = dict(self.last_g4 or {})
+        self.last_g4["pool_hit"] = name
+        self.last_g4["slot_swap_ms"] = (time.monotonic() - t0) * 1000.0
+        return True

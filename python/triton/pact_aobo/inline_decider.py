@@ -17,6 +17,9 @@ VARIANTS: Dict[str, Dict[str, str]] = {
     "occ": {"PACT_ENABLE": "1", "PACT_OVERRIDE_WARPS": "2"},
     "lat": {"PACT_ENABLE": "1", "PACT_OVERRIDE_STAGES": "2"},
     "deep": {"PACT_ENABLE": "1", "PACT_OVERRIDE_STAGES": "5"},
+    # V12-Q1: coverage for shapes where the original families regress
+    "short": {"PACT_ENABLE": "1", "PACT_OVERRIDE_STAGES": "1"},
+    "w1": {"PACT_ENABLE": "1", "PACT_OVERRIDE_WARPS": "1"},
 }
 
 

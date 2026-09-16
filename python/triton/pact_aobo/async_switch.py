@@ -20,9 +20,11 @@ from __future__ import annotations
 import os
 import threading
 import time
+from collections import deque
 from concurrent.futures import ThreadPoolExecutor
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple
 
+from triton.pact.compiler.explicit_compiler import compile_explicit
 from triton.pact_aobo.inline_decider import VARIANTS, decide_inline
 from triton.pact_aobo.resident_pool import ResidentPool
 
@@ -32,14 +34,25 @@ class AsyncKernelSwitch:
         self.pool = pool
         self._exe = ThreadPoolExecutor(
             max_workers=1, thread_name_prefix="pact-aobo-bg")
-        self._pending = None          # (name, future)
+        self._pending = None          # (name, future, geo_key)
         self._pending_lock = threading.Lock()
         self.state: Dict[str, Any] = {
             "decisions": 0, "bg_compiles": 0, "installs": 0,
             "install_ms": [], "compile_ms": [], "active": pool.active,
         }
-        self._ev = None
-        self._last_launch_us: Optional[float] = None
+        # V12-2b: paired CUDA events, elapsed_time drained in batches —
+        # the inline decider gets an in-process 'last_launch_us' fact
+        # without any per-forward host synchronisation.  Events are
+        # PRE-ALLOCATED and rotated (one record serves as pair_j's end and
+        # pair_{j+1}'s start): creating timing events per forward proved to
+        # amplify host-side stalls while the background compiler holds the
+        # driver lock (demo window max 11ms -> 21-23ms); rotation removed
+        # the allocation from the hot path.
+        self._evn = 8
+        self._evs = None
+        self._ev_cursor = 0
+        self._prev_ev = None
+        self._ev_pairs = deque(maxlen=4)
 
     # ---- forward path (hot) ---------------------------------------------
     def forward(self, args=None, grid=None):
@@ -55,14 +68,30 @@ class AsyncKernelSwitch:
         return out
 
     def _observe(self):
-        """Device-side timing of the previous launch (CUDA events, no host
-        sync) — the 'collect current-step performance' input."""
+        """Device-side timing of the previous launch (paired CUDA events,
+        no host sync per forward).  One record closes the previous pair
+        and opens the next; closed pairs sit in a small ring, and once the
+        ring is full the OLDEST pair is drained (it has several launches
+        of slack, so elapsed_time does not stall the stream in practice)
+        and published as state['last_launch_us'] — the 'collect
+        current-step performance' input for decide_inline."""
         try:
             import torch
-            if self._ev is not None:
-                end = torch.cuda.Event(enable_timing=False)
-                end.record()
-                self._ev = end
+            if self._evs is None:
+                self._evs = [torch.cuda.Event(enable_timing=True)
+                             for _ in range(self._evn)]
+            e = self._evs[self._ev_cursor % self._evn]
+            e.record()
+            if self._prev_ev is not None and self._prev_ev is not e:
+                self._ev_pairs.append((self._prev_ev, e))
+            self._prev_ev = e
+            self._ev_cursor += 1
+            if len(self._ev_pairs) >= self._ev_pairs.maxlen:
+                s, t = self._ev_pairs.popleft()
+                try:
+                    self.state["last_launch_us"] = s.elapsed_time(t) * 1000.0
+                except Exception:
+                    pass
         except Exception:
             pass
 
@@ -72,34 +101,64 @@ class AsyncKernelSwitch:
                             geometry: Optional[Dict[str, int]] = None
                             ) -> Optional[str]:
         """Inline decide; if the variant is not resident, compile it on the
-        background worker.  Returns the decided name (never blocks)."""
+        background worker.  Returns the decided name (never blocks).
+        Without explicit facts the latest device-side observation
+        (state['last_launch_us'], V12-2b) is attached so the learned
+        policy has an in-process input."""
+        facts = dict(facts or {})
+        if "last_launch_us" not in facts and \
+                self.state.get("last_launch_us"):
+            facts["last_launch_us"] = self.state["last_launch_us"]
         name, extra_env = decide_inline(facts, batch, seq_len, geometry)
         self.state["decisions"] += 1
         if name in self.pool:
             return name
+        # snapshot the geometry the decision is FOR: the background compile
+        # must land in this sub-pool even if the workload retargets (new S
+        # bucket) before the compile finishes
+        snap: Tuple[tuple, dict, tuple] = (
+            tuple(self.pool.args), dict(self.pool.kwargs),
+            self.pool._cur_key)
         with self._pending_lock:
             if (self._pending and self._pending[0] == name):
                 return name
-            fut = self._exe.submit(self._bg_compile, name, extra_env)
-            self._pending = (name, fut)
+            fut = self._exe.submit(self._bg_compile, name, extra_env, snap)
+            self._pending = (name, fut, snap[2])
         self.state["bg_compiles"] += 1
         return name
 
-    def _bg_compile(self, name: str, extra_env: Dict[str, str]):
+    def _bg_compile(self, name: str, extra_env: Dict[str, str],
+                    snap: Tuple[tuple, dict, tuple]):
         t0 = time.monotonic()
+        args, kwargs, key = snap
         try:
-            spent = self.pool.prewarm({name: extra_env})
-            self.state["compile_ms"].append(spent.get(name, 0.0))
+            k, _ = compile_explicit(self.pool.jit_fn, args, kwargs,
+                                    dict(extra_env))
+            with self.pool._lock:
+                sub = self.pool._geo.setdefault(
+                    key, {"kernels": {"baseline": None}, "active":
+                          "baseline"})
+                sub["kernels"].setdefault(name, k)
+            self.state["compile_ms"].append(
+                (time.monotonic() - t0) * 1000.0)
             # Force the cubin/module load HERE (background thread), so the
             # first launch of the swapped-in kernel does not pay the module
-            # load inside a forward.
-            k = self.pool._kernels.get(name)
+            # load inside a forward.  V12-2d: one dummy launch against a
+            # cloned output additionally settles module lazy-load / first-
+            # launch cost — the v11 cold-run post_install band carried a
+            # 171.9ms spike that survives handle init (v12 measured ~48ms).
             if k is not None and hasattr(k, "_init_handles"):
                 try:
                     k._init_handles()
                 except Exception:
                     pass
-            return name
+            try:
+                import torch
+                dargs = (torch.empty_like(args[0]),) + tuple(args[1:])
+                self.pool.dry_launch(k, dargs, kwargs)
+            except Exception:
+                pass
+            return (name, key)
         except Exception as e:  # noqa: BLE001 - surfaced via state
             self.state["last_bg_error"] = repr(e)
             return None
@@ -110,14 +169,19 @@ class AsyncKernelSwitch:
             pending = self._pending
             if pending is None:
                 return False
-            name, fut = pending
+            name, fut, key = pending
             if not fut.done():
                 return False          # not ready: current slot keeps serving
             self._pending = None
-        if fut.result() is None:
+        res = fut.result()
+        if res is None:
             return False
         t0 = time.monotonic()
-        self.pool.swap(name)          # atomic slot exchange
+        with self.pool._lock:
+            sub = self.pool._geo.get(res[1])
+            if sub is None or res[0] not in sub["kernels"]:
+                return False
+            sub["active"] = res[0]    # atomic slot exchange (its geometry)
         dt = (time.monotonic() - t0) * 1000.0
         self.state["installs"] += 1
         self.state["install_ms"].append(dt)
@@ -175,6 +239,12 @@ def _demo_entry():
 
     pool = ResidentPool(pact_optimization_target, args, kwargs, grid)
     sw = AsyncKernelSwitch(pool)
+    # Warm the inline decider OUTSIDE the measured loop: the first
+    # decide_inline call loads the learned policy (joblib deserialisation,
+    # tens of ms) — that host stall is not part of the async-frame story
+    # and used to land inside the compile-window band.
+    decide_inline(None, B, S, {"S": S, "D": D, "P": P, "B": B, "Hq": Hq,
+                               "GQA": Hq // Hk})
     # only the baseline is resident at start: the decided variant must come
     # from the BACKGROUND compile so the async path is really exercised
     pre = {}

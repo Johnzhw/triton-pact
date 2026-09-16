@@ -65,17 +65,6 @@ def _param_names(kernel) -> List[str]:
     return [p.name for p in kernel.src.fn.params]
 
 
-def _launch_values(kernel, args, kwargs) -> List[Any]:
-    """Non-constexpr argument values in ABI order (CompiledKernel[grid]
-    takes exactly these — constexprs are baked into the binary)."""
-    sig = dict(kernel.src.signature)
-    by_name = dict(zip(_param_names(kernel), args))
-    vals = []
-    for name, ty in sig.items():
-        if ty == "constexpr":
-            continue
-        vals.append(by_name[name] if ty.startswith("*") else kwargs[name])
-    return vals
 
 
 def _node_params(cu, fn, kernel, node_args: _NodeArgs, grid):
@@ -196,17 +185,6 @@ def run(baseline_kernel, deep_kernel, args, kwargs, grid,
         return _close(a, b) <= 5e-3
 
     eager_noise = max(_close(eager(baseline_kernel), ref_base), 1e-3)
-    if os.environ.get("PACT_AOBO_DEBUG") == "1":
-        out_tensor.zero_(); torch.cuda.synchronize()
-        (e,) = cu.cuLaunchKernel(fn_a, int(grid[0]), int(grid[1]),
-                                 int(grid[2]), 32 * int(
-                                     baseline_kernel.metadata.num_warps),
-                                 1, 1, int(baseline_kernel.metadata.shared),
-                                 stream, na.abi_address, 0)
-        torch.cuda.synchronize()
-        print("[dbg] raw fn_a rc", e, "diff",
-              _close(out_tensor, ref_base), flush=True)
-        out_tensor.zero_(); torch.cuda.synchronize()
     # phase 1: graph runs baseline
     out_tensor.zero_(); graph_launch(); torch.cuda.synchronize()
     base_diff = _close(out_tensor, ref_base)

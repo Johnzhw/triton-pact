@@ -70,6 +70,32 @@ class InferenceSession:
             return resp
         self.prev_bucket = bucket
         self.done_buckets.add(bucket)
+        # V11-6a R2 fast path: a variant prewarmed into the resident pool
+        # (idle-window compile, offline-validated mapping) switches by slot
+        # exchange — no compile, no G4 timing on the critical path.  The
+        # plan dict records the pool hit and the R4 segments.
+        fam = resp.get("family")
+        if fam and getattr(self.swapper, "pool_contains", None) and \
+                self.swapper.pool_contains(fam):
+            import time as _t
+            t0 = _t.monotonic()
+            hit = self.swapper.swap_from_pool(fam)
+            plan = {
+                "swapped": bool(hit), "rolled_back": False,
+                "gain_percent": None, "cache_hit": True, "pool_hit": fam,
+                "slot_swap_ms": (_t.monotonic() - t0) * 1000.0,
+                "local_compile_ms": 0.0, "measure_time_ms": 0.0,
+                "service": {k: resp[k] for k in
+                            ("family", "new_config", "profile_time_ms",
+                             "compile_time_ms", "shm_name") if k in resp},
+            }
+            plan["overhead_ms"] = (float(resp.get("profile_time_ms") or 0)
+                                   + plan["slot_swap_ms"])
+            if resp.get("shm_name"):
+                self.client.try_request(
+                    {"msg_id": msg["msg_id"], "type": "release_shm",
+                     "shm_name": resp["shm_name"]}, timeout=2.0)
+            return plan
         extra_env = resp.get("extra_env") or {"PACT_ENABLE": "1"}
         options = resp.get("options_override") or None
         t_compile = time.monotonic()

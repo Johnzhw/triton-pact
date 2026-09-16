@@ -3,7 +3,10 @@ from __future__ import annotations
 
 import itertools
 import os
+import queue
+import threading
 import time
+from concurrent.futures import Future
 from typing import Any, Dict, Optional, Tuple
 
 from triton.pact.compiler.explicit_compiler import compile_explicit
@@ -15,6 +18,10 @@ from triton.pact.runtime.workload_sniffer import should_trigger
 _MSG_IDS = itertools.count(1)
 
 
+def _g4_iters(default: int = 10) -> int:
+    return int(os.environ.get("PACT_G4_ITERS", str(default)))
+
+
 class InferenceSession:
     def __init__(self, swapper: HotSwapper, socket_path: str = "/tmp/pact_compiler.sock"):
         self.swapper = swapper
@@ -23,6 +30,16 @@ class InferenceSession:
         self.done_buckets = set()
         self.in_flight = False
         self.launch_count = 0
+        # V12-P1 (PACT_ASYNC_PGO=1): async frame state — a single daemon
+        # background worker owns the decide/compile/measure cycle; the swap
+        # is consumed at a launch boundary.  All-zero until the env is set.
+        self._bg_thread: Optional[threading.Thread] = None
+        self._bg_queue: Optional[queue.Queue] = None
+        self._async_pending: Optional[Future] = None
+        self.async_state: Dict[str, Any] = {
+            "submits": 0, "installs": 0, "install_ms": [],
+            "last_plan": None, "last_error": None,
+        }
 
     def step(self, batch: int, seq_len: int,
              current_config: Optional[Dict] = None,
@@ -118,6 +135,229 @@ class InferenceSession:
                  "shm_name": resp["shm_name"]}, timeout=2.0)
         return plan
 
+    # ---- V12-P1: async frame, PACT_ASYNC_PGO=1 ----------------------------
+    # Protocol ported from the aobo tree's AsyncKernelSwitch: every forward
+    # launches the current slot and returns; the decide/compile/measure cycle
+    # runs on one background worker; installation is an atomic slot exchange
+    # consumed at the next launch boundary (an R3 safe point).  Unlike the
+    # aobo in-process inline decider, the decision itself still goes through
+    # the out-of-process compiler service — the pgo production semantics.
+    def _submit_bg(self, fn) -> Future:
+        if self._bg_thread is None:
+            self._bg_queue = queue.Queue()
+            self._bg_thread = threading.Thread(
+                target=self._bg_worker, name="pact-async-pgo", daemon=True)
+            self._bg_thread.start()
+        fut: Future = Future()
+        self._bg_queue.put((fn, fut))
+        return fut
+
+    def _bg_worker(self):
+        while True:
+            fn, fut = self._bg_queue.get()
+            if fn is None:
+                return
+            try:
+                fut.set_result(fn())
+            except BaseException as e:  # noqa: BLE001 - surfaced via install
+                fut.set_exception(e)
+
+    def _release_shm(self, msg: Dict, resp: Dict):
+        if resp.get("shm_name"):
+            try:
+                self.client.try_request(
+                    {"msg_id": msg["msg_id"], "type": "release_shm",
+                     "shm_name": resp["shm_name"]}, timeout=2.0)
+            except Exception:
+                pass
+
+    def decide_async(self, batch: int, seq_len: int,
+                     current_config: Optional[Dict] = None,
+                     geometry: Optional[Dict] = None) -> Optional[Dict]:
+        """Submit the decide/compile/measure cycle to the background worker
+        and return immediately — a forward is never blocked by it.  The slot
+        swap is deferred to the next launch boundary (install_at_boundary).
+        While a submitted cycle is unconsumed, further triggers are skipped
+        (bucket dedup still applies once the cycle lands)."""
+        fire, bucket = should_trigger(self.prev_bucket, batch, seq_len)
+        if bucket in self.done_buckets:
+            return None
+        if not fire or self.in_flight:
+            return None
+        self.in_flight = True
+        fut = self._submit_bg(
+            lambda: self._bg_cycle(batch, seq_len, current_config,
+                                   geometry, bucket))
+        self._async_pending = fut
+        self.async_state["submits"] += 1
+        return {"submitted": True,
+                "bucket": [str(x) for x in bucket] if bucket else None}
+
+    def _bg_cycle(self, batch: int, seq_len: int,
+                  current_config: Optional[Dict], geometry: Optional[Dict],
+                  bucket) -> Dict[str, Any]:
+        """maybe_request's body minus the slot swap: service RPC decide, R2
+        pool hit or local compile + handle load, then the G4 base/candidate
+        measurements — all off the forward path.  The swap itself is a
+        launch-boundary pointer exchange (install_at_boundary)."""
+        msg: Optional[Dict] = None
+        resp: Optional[Dict] = None
+        try:
+            n_regs = 0
+            cur = self.swapper.current
+            try:
+                if getattr(cur, "n_regs", None) in (None, 0) and \
+                        hasattr(cur, "_init_handles"):
+                    cur._init_handles()
+                n_regs = int(getattr(cur, "n_regs", 0) or 0)
+            except Exception:
+                n_regs = 0
+            cfg = dict(current_config or {"warps": 4, "stages": 3, "V": 0})
+            if n_regs > 0:
+                cfg["n_regs"] = n_regs
+            msg = {
+                "msg_id": f"req_{next(_MSG_IDS)}",
+                "type": "profile_and_compile",
+                "kernel_key": getattr(self.swapper.jit_fn, "__name__",
+                                      "kernel"),
+                "workload": {"B": batch, "S": seq_len},
+                "geometry": geometry or {},
+                "current_config": cfg,
+            }
+            resp = self.client.try_request(msg, timeout=120.0)
+            if resp is None or resp.get("type") != "kernel_ready":
+                return {"kind": "no_kernel",
+                        "resp_type": (resp or {}).get("type", "none")}
+            self.prev_bucket = bucket
+            self.done_buckets.add(bucket)
+            fam = resp.get("family")
+            if fam and getattr(self.swapper, "pool_contains", None) and \
+                    self.swapper.pool_contains(fam):
+                return {"kind": "pool", "family": fam, "resp": resp,
+                        "msg": msg}
+            extra_env = resp.get("extra_env") or {"PACT_ENABLE": "1"}
+            options = resp.get("options_override") or None
+            t_compile = time.monotonic()
+            kernel = self.swapper.compile_candidate(extra_env, options)
+            compile_ms = (time.monotonic() - t_compile) * 1000.0
+            # Force the module load HERE (background thread) so the first
+            # post-install forward does not pay it inside the serving path.
+            if getattr(kernel, "_init_handles", None) and not getattr(
+                    kernel, "function", None):
+                try:
+                    kernel._init_handles()
+                except Exception:
+                    pass
+            iters = _g4_iters()
+            base_us = self.swapper.measure_kernel(self.swapper.slots[0],
+                                                  iters)
+            cand_us = self.swapper.measure_kernel(kernel, iters)
+            t_meas = time.monotonic()
+            return {
+                "kind": "kernel", "kernel": kernel, "resp": resp, "msg": msg,
+                "base_us": base_us, "cand_us": cand_us,
+                "gain_percent": 100.0 * (base_us - cand_us) /
+                max(base_us, 1e-6),
+                "compile_ms": compile_ms,
+                "measure_ms": (t_meas - t_compile - compile_ms / 1000.0)
+                * 1000.0,
+            }
+        except Exception as e:  # noqa: BLE001 - drained by install_at_boundary
+            return {"kind": "error", "error": repr(e),
+                    "msg": msg, "resp": resp}
+        finally:
+            self.in_flight = False
+
+    def install_at_boundary(self) -> Optional[Dict]:
+        """Consume a finished background cycle at a launch boundary (R3 safe
+        point): the swap is a slot-pointer exchange — sub-µs on the forward
+        path.  Failed cycles are drained here too, so the trigger can retry
+        on a later forward (matching the v11 maybe_request retry semantics).
+        The G4 post-check runs on the background worker: an async rollback
+        keeps the boundary µs-scale while preserving the rollback contract."""
+        fut = self._async_pending
+        if fut is None or not fut.done():
+            return None
+        self._async_pending = None
+        payload = fut.result()
+        st = self.async_state
+        kind = payload.get("kind")
+        if kind == "pool":
+            resp = payload["resp"]
+            t0 = time.monotonic()
+            hit = self.swapper.swap_from_pool(payload["family"])
+            dt = (time.monotonic() - t0) * 1000.0
+            plan = {
+                "swapped": bool(hit), "rolled_back": False,
+                "gain_percent": None, "cache_hit": True,
+                "pool_hit": payload["family"], "slot_swap_ms": dt,
+                "local_compile_ms": 0.0, "measure_time_ms": 0.0,
+                "async": True,
+                "service": {k: resp[k] for k in
+                            ("family", "new_config", "profile_time_ms",
+                             "compile_time_ms", "shm_name") if k in resp},
+            }
+            plan["overhead_ms"] = (
+                float(resp.get("profile_time_ms") or 0) + dt)
+            self._release_shm(payload["msg"], resp)
+            st["installs"] += 1
+            st["install_ms"].append(dt)
+            st["last_plan"] = plan
+            return plan
+        if kind == "kernel":
+            resp = payload["resp"]
+            t0 = time.monotonic()
+            swapped = payload["gain_percent"] >= 0.0
+            if swapped:
+                self.swapper.swap(payload["kernel"])
+            dt = (time.monotonic() - t0) * 1000.0
+            plan = {
+                "baseline_us": payload["base_us"],
+                "candidate_us": payload["cand_us"],
+                "post_us": None,
+                "gain_percent": payload["gain_percent"],
+                "swapped": swapped, "rolled_back": False,
+                "cache_hit": payload["compile_ms"] < 50.0,
+                "local_compile_ms": payload["compile_ms"],
+                "measure_time_ms": payload["measure_ms"],
+                "slot_swap_ms": dt, "async": True,
+                "service": {k: resp[k] for k in
+                            ("family", "new_config", "profile_time_ms",
+                             "compile_time_ms", "shm_name") if k in resp},
+            }
+            plan["overhead_ms"] = (
+                float(resp.get("profile_time_ms") or 0) +
+                float(resp.get("compile_time_ms") or 0) +
+                float(plan.get("measure_time_ms") or 0))
+            self._release_shm(payload["msg"], resp)
+            st["installs"] += 1
+            st["install_ms"].append(dt)
+            st["last_plan"] = plan
+            if swapped:
+                self._submit_bg(
+                    lambda: self._bg_post_check(payload["base_us"], plan))
+            return plan
+        st["last_error"] = payload.get("error") or payload.get("resp_type")
+        return None
+
+    def _bg_post_check(self, base_us: float, plan: Dict[str, Any]):
+        """Asynchronous G4 post-verification: re-measure the installed slot
+        on the background worker and roll back if it regressed."""
+        try:
+            post_us = self.swapper.measure_kernel(
+                self.swapper.current, max(_g4_iters() // 2, 3))
+            plan["post_us"] = post_us
+            if post_us >= base_us:
+                self.swapper.swap(self.swapper.slots[0])
+                plan["rolled_back"] = True
+                plan["swapped"] = False
+        except Exception as e:  # noqa: BLE001 - surfaced via async_state
+            plan["post_check_error"] = repr(e)
+        return plan
+
     def launch(self):
         self.launch_count += 1
+        if os.environ.get("PACT_ASYNC_PGO") == "1" and \
+                self._async_pending is not None:
+            self.install_at_boundary()
         return self.swapper.launch()

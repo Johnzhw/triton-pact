@@ -103,6 +103,25 @@ struct PACTAutoNumWarpsPass
       if (val >= 2 && val <= 8)
         stagesPerBlock = val;
     }
+    // V11-3 (B2'): with NO explicit knob, align the assumption with the
+    // value P6 will actually pin for this kernel family instead of the
+    // historical constant 3.  For the decode_paged family P6 writes the
+    // dot-free floor 2 on Ampere (V9-A1: AssignLatencies only pipelines
+    // such loops when P6 sets tt.num_stages; the conservative floor is 2),
+    // so assuming 3 there overstated the SMEM term and skewed the warp
+    // decision inside the D128 flip window (tile ∈ (3462, 5193] B:
+    // assumption 3 → 8 warps, OVERRIDE=2 → 4 warps — BEH-1b evidence).
+    // prefill_paged keeps 3 (P6 keeps the native default there).
+    // PACT_P11_LEGACY_ASSUMPTION=1 restores the constant-3 v9/v10
+    // behaviour bit-for-bit (rollback switch, part of the red line).
+    if (!std::getenv("PACT_MAX_PIPELINE_STAGES") &&
+        !std::getenv("PACT_OVERRIDE_STAGES") &&
+        !std::getenv("PACT_P11_LEGACY_ASSUMPTION")) {
+      if (auto attr = mod->getAttrOfType<StringAttr>("pact.kernel_type")) {
+        if (attr.getValue() == "decode_paged")
+          stagesPerBlock = 2;
+      }
+    }
     // The canonical paged-attention tile has exactly two annotated K/V loads.
     // Requiring >=4 loads silently disabled P11 for the primary target shape.
     int64_t regsPerThread = pact::PactDecisionConstants::kUnknownRegsPerThread;

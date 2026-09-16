@@ -67,9 +67,19 @@ class HotSwapper:
         self.grid = grid
 
     def launch_with(self, args, grid=None):
+        # V11-0: raw args must go through the same binder normalization the
+        # kernel was compiled with (specialization drops/reorders params);
+        # feeding the raw tuple to the CompiledKernel launcher mismatched
+        # the C-side extraction and segfaulted ~25% of EngineCore runs
+        # (launchKernel→extractI64; bisect: compile side 10/10 clean,
+        # raw launch 2/2 crash — suite/results/v11/race_fix_v11.md).
+        from triton.runtime import driver
+        device = driver.active.get_current_device()
+        _cache, _k, _target, _backend, binder = self.jit_fn.device_caches[device]
+        bound, _spec, _opts = binder(*args, **self.kwargs)
         k = self.current
-        g = _normalize_grid(grid or self.grid, self.bound_args)
-        return k[g](*args)
+        g = _normalize_grid(grid or self.grid, bound)
+        return k[g](*bound.values())
 
     def swap(self, kernel) -> int:
         with self._lock:

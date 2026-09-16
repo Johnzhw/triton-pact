@@ -72,6 +72,13 @@ def decide(facts: Dict[str, Any], batch: int, seq_len: int,
         options_override["num_warps"] = 2
     elif family == "latency":
         extra_env["PACT_OVERRIDE_STAGES"] = "2"
+    elif family == "deep":
+        extra_env["PACT_OVERRIDE_STAGES"] = "5"
+    elif family == "short":
+        extra_env["PACT_OVERRIDE_STAGES"] = "1"
+    elif family == "w1":
+        extra_env["PACT_OVERRIDE_WARPS"] = "1"
+        options_override["num_warps"] = 1
     hints = facts_to_hints(facts)
     if hints:
         d = Path(hints_dir or (Path.home() / ".triton" / "pact_hw"))

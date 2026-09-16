@@ -15,7 +15,8 @@ from typing import Dict, Optional
 
 from triton.pact.runtime.workload_sniffer import bucket_bs
 
-KNOWN_FAMILIES = ("theory", "occupancy", "latency", "vanilla")
+KNOWN_FAMILIES = ("theory", "occupancy", "latency", "vanilla",
+                  "deep", "short", "w1")
 
 
 def _occ_bucket(permille: Optional[int]) -> str:

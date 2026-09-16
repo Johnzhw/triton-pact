@@ -105,6 +105,12 @@ class HotSwapper:
             samples.append(start.elapsed_time(end) * 1000.0)
         return statistics.median(samples)
 
+    def measure_kernel(self, kernel, iters: int = 10) -> float:
+        """Public wrapper over the G4 pair measurement (V12-P1: the async
+        frame measures base/candidate on the background worker before the
+        launch-boundary swap)."""
+        return self._measure(kernel, iters)
+
     def g4_install(self, kernel, measure_iters: int = 10,
                    min_gain_percent: float = 0.0) -> Dict[str, Any]:
         """Install `kernel` into slot 1, swap, rollback on regression."""

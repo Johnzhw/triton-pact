@@ -130,6 +130,7 @@ static int computeOptimalNumStages(int64_t tileBytes, int64_t estIterations,
   input.smEfficiencyPermille = extra.smEfficiencyPermille;
   input.stallPenaltyPerExtraStage = extra.stallPenaltyPerExtraStage;
   input.smEffBonusPerExtraStage = extra.smEffBonusPerExtraStage;
+  input.kvWorkingSetBytes = extra.kvWorkingSetBytes;
 
   auto decision = pact::selectNumStages(input);
 
@@ -143,7 +144,13 @@ static int computeOptimalNumStages(int64_t tileBytes, int64_t estIterations,
                << ", bestOcc=" << decision.bestOccupancy
                << ", occ=" << decision.occupancy
                << ", tile=" << tileBytes << "B, iters=" << estIterations
-               << ", TPP=" << tilesPerPage << " [informational])\n";
+               << ", TPP=" << tilesPerPage
+               << ", kv=" << decision.kvWorkingSetBytes
+               << "B, l2=" << decision.l2Bytes << "B"
+               << (decision.l2Cold
+                       ? (decision.l2Deepened ? ", l2cold=deep" : ", l2cold=kept")
+                       : "")
+               << " [informational])\n";
   return decision.numStages;
 }
 
@@ -200,6 +207,14 @@ struct PACTAutoNumStagesPass
     if (auto attr = mod->getAttrOfType<mlir::IntegerAttr>(
             "pact.hw.measured_iterations"))
       hwIters = attr.getInt();
+    // S1: optional KV-heads hint.  The paged loads are per-KV-head tiles
+    // (heads are split across the grid), so the IR alone cannot see how many
+    // heads stream through L2; the PGO hint scales the working-set estimate.
+    // Default 1 keeps the pre-S1 shapes classified exactly as before.
+    int64_t kvHeads = 1;
+    if (auto attr = mod->getAttrOfType<mlir::IntegerAttr>("pact.hw.kv_heads"))
+      if (attr.getInt() > 0)
+        kvHeads = attr.getInt();
 
     mod.walk([&](scf::ForOp forOp) {
       int64_t tileBytes = 0;
@@ -207,6 +222,8 @@ struct PACTAutoNumStagesPass
       int pageSize = 16;
       int tileTokens = 16;
       bool hasPagedLoad = false;
+      int64_t headDim = 0;   // S1: pact.head_dim_size annotation
+      int64_t kvElemBytes = 0; // S1: widest paged-load element seen
       int64_t estIterations = estimateTripCount(forOp);
       bool haveIterationEstimate = estIterations > 0;
       // V9-A1: dot-free loops need an explicit tt.num_stages attribute to be
@@ -246,6 +263,10 @@ struct PACTAutoNumStagesPass
         if (auto attr =
                 loadOp->getAttrOfType<mlir::IntegerAttr>("pact.tile_tokens"))
           tileTokens = attr.getInt();
+        if (auto attr = loadOp->getAttrOfType<mlir::IntegerAttr>(
+                "pact.head_dim_size"))
+          headDim = std::max(headDim, attr.getInt());
+        kvElemBytes = std::max(kvElemBytes, elemBytes);
 
         // M9c: exact shared-memory footprint, including swizzle padding. The
         // physical footprint is the size of the shared layout's "offset" input
@@ -273,6 +294,16 @@ struct PACTAutoNumStagesPass
                      << "B)\n";
         tileBytes = exactSMEMBytes;
       }
+
+      // S1 L2-residency working set: the K+V bytes one sequence streams
+      // through this loop.  S = iterations × tokens-per-iteration; the ×2 is
+      // K+V; the kv_heads hint scales the per-head tiles to the sequence's
+      // full stream.  0 (no static trip count or no head-dim annotation)
+      // classifies as "hot" and leaves the decision unchanged.
+      hw.kvWorkingSetBytes =
+          haveIterationEstimate && headDim > 0 && kvElemBytes > 0
+              ? estIterations * tileTokens * headDim * kvElemBytes * 2 * kvHeads
+              : 0;
 
       int optimal = computeOptimalNumStages(
           tileBytes, estIterations, haveIterationEstimate, pageSize,

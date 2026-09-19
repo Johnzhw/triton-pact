@@ -86,6 +86,16 @@ struct SelectStagesInput {
   // the occupancy ranking unchanged.  C++ does not hard-code 0.30 / 0.50.
   double stallPenaltyPerExtraStage = 0.0;
   double smEffBonusPerExtraStage = 0.0;
+  // S1 L2-residency input: the KV working set the loop streams (K+V bytes of
+  // one sequence, scaled by the kv_heads hint when provided).  0 (default)
+  // means "unknown" and leaves the selection bit-identical to the pre-S1
+  // occupancy scan.  A positive value not exceeding the detected L2 capacity
+  // (hot path) also leaves the scan unchanged — v12/v13 ncu evidence shows
+  // the PACT gains live on the L2-hit path, so the current choice is already
+  // optimal there.  Only a working set strictly larger than L2 (streaming
+  // from DRAM) biases the Ampere scan toward deeper pipelines within the
+  // computed feasible set.
+  int64_t kvWorkingSetBytes = 0;
 };
 
 struct SelectStagesResult {
@@ -97,6 +107,12 @@ struct SelectStagesResult {
   int smemBound = 2;
   int iterBound = 2;
   bool defaultKept = true;
+  // S1 diagnostics (informational; the l2Cold fields mirror the inputs that
+  // were actually used so logs can audit the residency decision).
+  int64_t kvWorkingSetBytes = 0;
+  int64_t l2Bytes = 0;
+  bool l2Cold = false;         // working set strictly exceeded L2
+  bool l2Deepened = false;     // cold path adopted a deeper pipeline
 };
 
 // num_stages decision.
@@ -107,6 +123,12 @@ struct SelectStagesResult {
 //   choose s maximizing the L2 occupancy; ties prefer the stage count closest
 //   to defaultStages (then the smaller one).  Short sequences therefore
 //   converge to low stages through the equations instead of an `<=16` rule.
+//   S1 cold path (kvWorkingSetBytes > l2Bytes > 0, Ampere only): the loop
+//   streams K/V from DRAM, so among feasible s in [3,5] take the deepest one
+//   whose score stays within the computed one-CTA discretization granularity
+//   of the scan's best — deeper cp.async pipelines hide DRAM latency, and any
+//   depth that the capacity equations say costs more than the model-error
+//   bound is vetoed.
 // Hopper (SM >= 90, pipeline-first):
 //   choose the largest s whose occupancy is within the computed discretization
 //   granularity (numWarps/maxWarpsPerSM) of the best occupancy.

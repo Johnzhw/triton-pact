@@ -123,6 +123,15 @@ SelectStagesResult selectNumStages(const SelectStagesInput &input) {
           ? clamp01(static_cast<double>(*input.smEfficiencyPermille) / 1000.0)
           : 0.0;
 
+  // S1 L2-residency classification.  l2Bytes == 0 (unknown backend/AMD) or
+  // kvWorkingSetBytes == 0 (no static estimate) both mean "hot": the scan
+  // below then runs exactly as it did before S1 — this is the
+  // default-path-unchanged guarantee, not a silent heuristic.
+  result.kvWorkingSetBytes = input.kvWorkingSetBytes;
+  result.l2Bytes = sm.l2Bytes;
+  result.l2Cold = input.kvWorkingSetBytes > 0 && sm.l2Bytes > 0 &&
+                  input.kvWorkingSetBytes > sm.l2Bytes;
+
   auto scoreFor = [&](int s) {
     double occ = occupancyFor(input.tileBytes * s, regsPerThread, s,
                               input.numWarps);
@@ -173,6 +182,26 @@ SelectStagesResult selectNumStages(const SelectStagesInput &input) {
   } else {
     result.occupancy = scoreFor(bestStages);
     chosen = bestStages;
+    // S1 cold path: the K/V working set exceeds L2, so the loop streams from
+    // DRAM.  Within the computed feasible set prefer a deeper pipeline (up to
+    // 5) — deeper cp.async staging hides DRAM latency.  The acceptance gate
+    // mirrors the Hopper pipeline-first policy: a depth is adopted when its
+    // score stays within the capacity equations' one-CTA discretization
+    // granularity of the scan's best (the computed model-error bound, not a
+    // hand-tuned ratio); anything worse is vetoed.
+    if (result.l2Cold) {
+      double tolerance = modelGranularity(input.numWarps);
+      int deepMax = std::min(result.feasibleMax, 5);
+      for (int s = deepMax; s >= 3; --s) {
+        double occ = scoreFor(s);
+        if (occ >= bestOcc - tolerance) {
+          chosen = s;
+          result.occupancy = occ;
+          result.l2Deepened = (s != bestStages);
+          break;
+        }
+      }
+    }
   }
 
   result.numStages = chosen;

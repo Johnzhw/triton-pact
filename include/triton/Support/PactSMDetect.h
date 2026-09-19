@@ -39,6 +39,12 @@ struct SMResources {
   // Intentionally unread by the current heuristics until official per-SKU
   // capacity data (CU count, LDS, VGPR/AGPR, matrix cores) is available.
   int numCUs;
+  // L2 cache capacity in bytes (S1 L2-residency input for P6).  Family
+  // minimums follow the CUDA C Programming Guide's per-compute-capability
+  // convention (SM86 = GA10x family value).  0 means "unknown" (conservative
+  // table, AMD pending) — downstream residency logic must treat that as
+  // "hot path" and leave the decision unchanged.
+  int64_t l2Bytes;
 
   // === PACT derived parameters ===
   int effectiveSmemPerBlock; // usable SMEM considering block table overhead

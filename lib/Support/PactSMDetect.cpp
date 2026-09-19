@@ -44,6 +44,7 @@ SMResources conservativeResources(int version) {
       /*maxThreadsPerSM*/ 1024,
       /*waveSize*/ 32,
       /*numCUs*/ 0,
+      /*l2Bytes*/ 0, // unknown target: residency logic stays disabled
       /*effectiveSmemPerBlock*/ 16 * 1024,
       /*pipelineThreshold*/ 256,
       /*occupancyCliffStages*/ 2,
@@ -66,6 +67,7 @@ SMResources resourcesFor(int sm) {
         /*maxThreadsPerSM*/ 2048,
         /*waveSize*/ 32,
         /*numCUs*/ 0,
+        /*l2Bytes*/ (int64_t)126 * 1024 * 1024, // Blackwell family (B200)
         /*effectiveSmemPerBlock*/ 48 * 1024,
         /*pipelineThreshold*/ 64,
         /*occupancyCliffStages*/ 5,
@@ -84,6 +86,7 @@ SMResources resourcesFor(int sm) {
         /*maxThreadsPerSM*/ 2048,
         /*waveSize*/ 32,
         /*numCUs*/ 0,
+        /*l2Bytes*/ (int64_t)50 * 1024 * 1024, // Hopper family (H100)
         /*effectiveSmemPerBlock*/ 48 * 1024,
         /*pipelineThreshold*/ 64,
         /*occupancyCliffStages*/ 5,
@@ -102,6 +105,9 @@ SMResources resourcesFor(int sm) {
         /*maxThreadsPerSM*/ 1536,
         /*waveSize*/ 32,
         /*numCUs*/ 0,
+        // Ada family minimum (AD107 = 24MB; AD102 reaches 72MB).  The family
+        // convention keeps the lower bound for cold detection.
+        /*l2Bytes*/ (int64_t)24 * 1024 * 1024,
         /*effectiveSmemPerBlock*/ 24 * 1024,
         /*pipelineThreshold*/ 128,
         /*occupancyCliffStages*/ 3,
@@ -121,6 +127,10 @@ SMResources resourcesFor(int sm) {
         /*maxThreadsPerSM*/ 1536,
         /*waveSize*/ 32,
         /*numCUs*/ 0,
+        // GA10x family value (CUDA guide convention; GA102 reaches 6MB).
+        // This is the project's established SM86 figure — v12 ncu evidence
+        // (ANALYSIS.md §2c) measured the hot/cold knee against 4MB.
+        /*l2Bytes*/ (int64_t)4 * 1024 * 1024,
         /*effectiveSmemPerBlock*/ 24 * 1024,
         /*pipelineThreshold*/ 128,
         /*occupancyCliffStages*/ 3,
@@ -140,6 +150,9 @@ SMResources resourcesFor(int sm) {
         /*maxThreadsPerSM*/ 2048,
         /*waveSize*/ 32,
         /*numCUs*/ 0,
+        // GA100 L2 (A100 40/80GB; the whitepaper's L2+L2.5 aggregate
+        // semantics — the single flat figure used by the CUDA guide).
+        /*l2Bytes*/ (int64_t)40 * 1024 * 1024,
         /*effectiveSmemPerBlock*/ 48 * 1024,
         /*pipelineThreshold*/ 128,
         /*occupancyCliffStages*/ 4,
@@ -158,6 +171,9 @@ SMResources resourcesFor(int sm) {
 SMResources resourcesForAMD(const std::string &arch) {
   auto amd = [](int waveSize, int64_t ldsPerCU) {
     SMResources r = conservativeResources(/*version=*/0);
+    // l2Bytes stays 0 (unknown): the S1 L2-residency policy is NVIDIA-only
+    // until official per-SKU CDNA cache data is available (matches the
+    // AMD-keeps-default rule in selectNumStages).
     r.waveSize = waveSize;
     r.smemPerSM = (int)ldsPerCU;
     r.maxWarpsPerSM = 16;      // conservative waves-per-CU accounting

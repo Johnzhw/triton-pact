@@ -40,6 +40,18 @@ class InferenceSession:
             "submits": 0, "installs": 0, "install_ms": [],
             "last_plan": None, "last_error": None,
         }
+        if os.environ.get("PACT_COMPILE_SUBPROC") == "1":
+            # V13 Phase1: boot the compile worker in THIS untimed init
+            # window — a cold Popen during the first background cycle
+            # forks the multi-GB process and freezes every thread for
+            # ~270ms (measured; posix_spawn avoids it only when the
+            # process already exists).
+            try:
+                from triton.pact.controller.compile_worker import \
+                    get_compile_subprocess
+                get_compile_subprocess().warm_start()
+            except Exception:
+                pass
 
     def step(self, batch: int, seq_len: int,
              current_config: Optional[Dict] = None,
@@ -304,6 +316,44 @@ class InferenceSession:
                         "msg": msg}
             extra_env = resp.get("extra_env") or {"PACT_ENABLE": "1"}
             options = resp.get("options_override") or None
+            if os.environ.get("PACT_COMPILE_SUBPROC") == "1":
+                # V13 Phase1: the MLIR/ptxas section runs in the dedicated
+                # subprocess (user-space CPU — no GIL, no driver lock, no
+                # MLIR thread to terminate under long concurrency).  The
+                # local compile_candidate below is then a disk-cache hit
+                # and the G4 pair measurement runs here on the background
+                # worker (the V12 regime, window worst 0.5ms).
+                r = self._subproc_compile(extra_env, options)
+                if r is None or r.get("status") != "ok":
+                    return {"kind": "error",
+                            "error": f"subproc compile: "
+                                     f"{getattr(self, '_csub_err', None)}",
+                            "msg": msg, "resp": resp}
+                t_c = time.monotonic()
+                kernel = self.swapper.compile_candidate(extra_env, options)
+                compile_ms = (time.monotonic() - t_c) * 1000.0
+                if getattr(kernel, "_init_handles", None) and not getattr(
+                        kernel, "function", None):
+                    try:
+                        kernel._init_handles()
+                    except Exception:
+                        pass
+                iters = _g4_iters()
+                base_us = self.swapper.measure_kernel(
+                    self.swapper.slots[0], iters)
+                cand_us = self.swapper.measure_kernel(kernel, iters)
+                t_meas = time.monotonic()
+                return {
+                    "kind": "kernel", "kernel": kernel, "resp": resp,
+                    "msg": msg, "base_us": base_us, "cand_us": cand_us,
+                    "gain_percent": 100.0 * (base_us - cand_us) /
+                    max(base_us, 1e-6),
+                    "compile_ms": compile_ms,
+                    "measure_ms": (t_meas - t_c - compile_ms / 1000.0)
+                    * 1000.0,
+                    "subproc": True,
+                    "worker_ms": r.get("worker_ms"),
+                }
             t_compile = time.monotonic()
             kernel = self.swapper.compile_candidate(extra_env, options)
             compile_ms = (time.monotonic() - t_compile) * 1000.0
@@ -338,6 +388,38 @@ class InferenceSession:
                     "msg": msg, "resp": resp}
         finally:
             self.in_flight = False
+
+    def _subproc_compile(self, extra_env, options) -> Optional[Dict]:
+        """V13 Phase1 (PACT_COMPILE_SUBPROC=1): ship the compile+measure
+        section to the resident worker process.  Called on the frame's
+        background thread only — pipe waits do not hold the GIL."""
+        try:
+            from triton.pact.controller.compile_worker import (
+                _describe, get_compile_subprocess)
+            svc = get_compile_subprocess()
+            self._csub = svc
+            jit_fn = self.swapper.jit_fn
+            spec = {
+                "jit_module": getattr(getattr(jit_fn, "fn", None),
+                                      "__module__", None)
+                or type(jit_fn).__module__,
+                "jit_attr": getattr(getattr(jit_fn, "fn", None),
+                                    "__name__", None) or "kernel",
+                "args_desc": _describe(self.swapper.args),
+                "kwargs": dict(self.swapper.kwargs),
+                "grid": list(self.swapper.grid),
+                "extra_env": dict(extra_env),
+                "baseline_env": {"PACT_ENABLE": "0"},
+                "options_override": options,
+                "iters": _g4_iters(),
+            }
+            r = svc.run(spec)
+            if r is None:
+                self._csub_err = svc.last_error
+            return r
+        except Exception as e:  # noqa: BLE001 - drained by install
+            self._csub_err = repr(e)[:200]
+            return None
 
     def install_at_boundary(self) -> Optional[Dict]:
         """Consume a finished background cycle at a launch boundary (R3 safe
@@ -398,6 +480,8 @@ class InferenceSession:
                 "local_compile_ms": payload["compile_ms"],
                 "measure_time_ms": payload["measure_ms"],
                 "slot_swap_ms": dt, "async": True,
+                "subproc": payload.get("subproc", False),
+                "worker_ms": payload.get("worker_ms"),
                 "service": {k: resp[k] for k in
                             ("family", "new_config", "profile_time_ms",
                              "compile_time_ms", "shm_name") if k in resp},

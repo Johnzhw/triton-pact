@@ -83,15 +83,26 @@ def probe_cupti(lib_path: Optional[str] = None) -> Dict:
     }
 
 
+_PROBE_CACHE: Dict[Optional[str], Dict] = {}
+
+
 def collect_or_unavailable(launch_fn: Optional[Callable] = None,
                            lib_path: Optional[str] = None) -> Dict:
     """Online path: never invents occupancy/stall numbers.
 
     launch_fn is reserved for a future Range-Profiler session around a
     replica launch.  Until that path is validated on this SM, we only
-    return the availability probe.
+    return the availability probe.  V13 Phase1: the probe result is
+    cached per lib_path — cuptiProfilerInitialize costs ~270ms of
+    loader/init work and SM86 is deterministically unavailable, so every
+    RPC used to pay it (the true identity of the "GIL spike" window_max;
+    thread-stack-caught in the 4000-forward run).  The returned dict is
+    value-identical to the uncached behaviour.
     """
-    probe = probe_cupti(lib_path)
+    probe = _PROBE_CACHE.get(lib_path)
+    if probe is None:
+        probe = probe_cupti(lib_path)
+        _PROBE_CACHE[lib_path] = probe
     if not probe.get("available"):
         return {
             "active_warp_ratio_permille": None,

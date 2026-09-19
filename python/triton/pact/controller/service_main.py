@@ -27,6 +27,16 @@ class CompilerService:
         self.table = FamilyTable.load()
         self.server = PactSocketServer(socket_path, self.handle)
         self.socket_path = socket_path
+        # V13 Phase1: warm the CUPTI availability probe HERE (untimed
+        # init window).  cuptiProfilerInitialize holds the driver/loader
+        # lock for ~300ms; doing it on the first RPC froze the serving
+        # threads' kernel launches (thread-stack-caught in the
+        # 4000-forward run).  The cached result makes every later RPC
+        # lock-free; RPC responses stay value-identical.
+        try:
+            collect_or_unavailable()
+        except Exception:
+            pass
 
     def handle(self, req: Dict[str, Any]) -> Dict[str, Any]:
         if req.get("type") == "release_shm":

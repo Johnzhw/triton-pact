@@ -158,6 +158,17 @@ class AsyncKernelSwitch:
                 self.pool.dry_launch(k, dargs, kwargs)
             except Exception:
                 pass
+            # V13 Phase0 (prepared-module regime): the variant vocabulary
+            # lives in the single module prepared at the first forward;
+            # nothing to load here — the boundary submit switches nodes
+            # inside that module.
+            if os.environ.get("PACT_GRAPH_SERVICE") == "1":
+                try:
+                    from triton.pact.runtime.graph_service import \
+                        get_service
+                    get_service()  # touch: state sink stays armed
+                except Exception:
+                    pass
             return (name, key)
         except Exception as e:  # noqa: BLE001 - surfaced via state
             self.state["last_bg_error"] = repr(e)

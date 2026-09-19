@@ -129,6 +129,15 @@ class InferenceSession:
               float(resp.get("compile_time_ms") or 0) +
               float(plan.get("measure_time_ms") or 0))
         plan["overhead_ms"] = ov
+        if os.environ.get("PACT_GRAPH_SERVICE") == "1" and \
+                plan.get("swapped"):
+            # V13 Phase0: under a captured graph the slot exchange above is
+            # invisible to replay — offer the merged module and queue the
+            # node retarget here (this sync path runs on the lazy-arm
+            # background thread, never inside a forward/replay).
+            self._gs_offer(kernel, resp.get("family"))
+            plan["graph_retarget"] = self._gs_submit(
+                kernel, resp.get("family"))
         if resp.get("shm_name"):
             self.client.try_request(
                 {"msg_id": msg["msg_id"], "type": "release_shm",
@@ -168,6 +177,60 @@ class InferenceSession:
                 self.client.try_request(
                     {"msg_id": msg["msg_id"], "type": "release_shm",
                      "shm_name": resp["shm_name"]}, timeout=2.0)
+            except Exception:
+                pass
+
+    # ---- V13 Phase0: in-graph retarget (async frame stays intact) --------
+    def _gs(self):
+        """The in-graph retarget service, or None when not armed.  Under a
+        captured graph the real install is the node SetParams; the slot
+        exchange below stays as the eager-path semantics."""
+        if os.environ.get("PACT_GRAPH_SERVICE") != "1":
+            return None
+        try:
+            from triton.pact.runtime.graph_service import get_service
+            return get_service()
+        except Exception:
+            return None
+
+    def _gs_offer(self, kernel, variant) -> bool:
+        """Prepared-module regime (V13 Phase0): the whole variant
+        vocabulary was compiled and loaded into the single module at the
+        first forward (graph_service.prepare), so "offering" degenerates
+        to a readiness check on the module."""
+        svc = self._gs()
+        if svc is None or kernel is None or not variant:
+            return False
+        try:
+            from triton.pact.runtime.graph_service import FAMILY_ALIAS
+            v = FAMILY_ALIAS.get(str(variant), str(variant))
+            name = getattr(self, "_gs_jit_name", None) or \
+                str(kernel.metadata.name)
+            ok = svc.has_variant(name, v)
+            if ok:
+                self._gs_jit_name = name
+            return ok
+        except Exception:
+            return False
+
+    def _gs_submit(self, kernel, variant) -> bool:
+        """Boundary-safe (us-scale): queue the retarget, consumed at the
+        next replay boundary."""
+        svc = self._gs()
+        name = getattr(self, "_gs_jit_name", None)
+        if svc is None or kernel is None or not variant or not name:
+            return False
+        try:
+            return svc.submit_retarget(name, str(variant))
+        except Exception:
+            return False
+
+    def _gs_rollback(self) -> None:
+        svc = self._gs()
+        name = getattr(self, "_gs_jit_name", None)
+        if svc is not None and name:
+            try:
+                svc.rollback(name)
             except Exception:
                 pass
 
@@ -233,6 +296,10 @@ class InferenceSession:
             fam = resp.get("family")
             if fam and getattr(self.swapper, "pool_contains", None) and \
                     self.swapper.pool_contains(fam):
+                if os.environ.get("PACT_GRAPH_SERVICE") == "1":
+                    # graph-mode installs retarget the captured node — the
+                    # pooled kernel must reach the merged module first
+                    self._gs_offer(self.swapper.pool_kernel(fam), fam)
                 return {"kind": "pool", "family": fam, "resp": resp,
                         "msg": msg}
             extra_env = resp.get("extra_env") or {"PACT_ENABLE": "1"}
@@ -252,6 +319,10 @@ class InferenceSession:
             base_us = self.swapper.measure_kernel(self.swapper.slots[0],
                                                   iters)
             cand_us = self.swapper.measure_kernel(kernel, iters)
+            if os.environ.get("PACT_GRAPH_SERVICE") == "1":
+                # link+load the variant into the merged module while still
+                # on the background worker (never inside a forward/replay)
+                self._gs_offer(kernel, fam)
             t_meas = time.monotonic()
             return {
                 "kind": "kernel", "kernel": kernel, "resp": resp, "msg": msg,
@@ -300,6 +371,12 @@ class InferenceSession:
             plan["overhead_ms"] = (
                 float(resp.get("profile_time_ms") or 0) + dt)
             self._release_shm(payload["msg"], resp)
+            graph_ok = self._gs_submit(
+                self.swapper.pool_kernel(payload["family"]),
+                payload["family"]) if os.environ.get(
+                    "PACT_GRAPH_SERVICE") == "1" else None
+            if graph_ok is not None:
+                plan["graph_retarget"] = bool(graph_ok)
             st["installs"] += 1
             st["install_ms"].append(dt)
             st["last_plan"] = plan
@@ -330,6 +407,9 @@ class InferenceSession:
                 float(resp.get("compile_time_ms") or 0) +
                 float(plan.get("measure_time_ms") or 0))
             self._release_shm(payload["msg"], resp)
+            if os.environ.get("PACT_GRAPH_SERVICE") == "1":
+                plan["graph_retarget"] = self._gs_submit(
+                    payload["kernel"], resp.get("family"))
             st["installs"] += 1
             st["install_ms"].append(dt)
             st["last_plan"] = plan
@@ -349,6 +429,7 @@ class InferenceSession:
             plan["post_us"] = post_us
             if post_us >= base_us:
                 self.swapper.swap(self.swapper.slots[0])
+                self._gs_rollback()  # graph nodes back to the captured func
                 plan["rolled_back"] = True
                 plan["swapped"] = False
         except Exception as e:  # noqa: BLE001 - surfaced via async_state

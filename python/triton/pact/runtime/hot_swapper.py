@@ -171,6 +171,13 @@ class HotSwapper:
     def pool_contains(self, name: str) -> bool:
         return bool(getattr(self, "_pool", None)) and name in self._pool
 
+    def pool_kernel(self, name: str):
+        """V13 Phase0: read-only pool access so the graph service can
+        link+load the pooled variant into its merged module — under a
+        captured graph a slot exchange alone never reaches the node."""
+        pool = getattr(self, "_pool", None)
+        return pool.get(name) if pool else None
+
     def swap_from_pool(self, name: str) -> bool:
         """R2 fast path: slot-pointer exchange to a pooled variant.
         Returns False on a miss (caller falls back to the compile slow

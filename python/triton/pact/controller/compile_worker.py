@@ -66,23 +66,6 @@ def _rebuild(desc: list):
     return tuple(args)
 
 
-def _measure(jit_fn, kernel, bound, grid, iters: int) -> float:
-    import torch
-    samples = []
-    kernel[grid](*bound.values())
-    torch.cuda.synchronize()
-    for _ in range(iters):
-        start = torch.cuda.Event(enable_timing=True)
-        end = torch.cuda.Event(enable_timing=True)
-        start.record()
-        kernel[grid](*bound.values())
-        end.record()
-        torch.cuda.synchronize()
-        samples.append(start.elapsed_time(end) * 1000.0)
-    samples.sort()
-    return samples[len(samples) // 2]
-
-
 def worker_loop(in_file, out_file) -> None:  # pragma: no cover - subprocess
     """Line-protocol loop: one JSON spec per line, one JSON result per
     line.  Serves as `python -m triton.pact.controller.compile_worker

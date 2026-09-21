@@ -63,6 +63,10 @@ VARIANT_ENVS: Dict[str, Dict[str, str]] = {
     "deep": {"PACT_ENABLE": "1", "PACT_OVERRIDE_STAGES": "5"},
     "short": {"PACT_ENABLE": "1", "PACT_OVERRIDE_STAGES": "1"},
     "w1": {"PACT_ENABLE": "1", "PACT_OVERRIDE_WARPS": "1"},
+    # V14-B (S1): unlock the deep-pipeline range; P6's L2-residency gate
+    # itself keeps hot shapes at the theory decision, so this module entry
+    # is the graph-side spelling of the "cold" auto family.
+    "cold": {"PACT_ENABLE": "1", "PACT_MAX_PIPELINE_STAGES": "5"},
 }
 FAMILY_ALIAS: Dict[str, str] = {
     "baseline": "__vanilla", "vanilla": "__vanilla",

@@ -18,6 +18,10 @@ def facts_to_hints(facts: Dict[str, Any]) -> Dict[str, int]:
         "active_warp_ratio_permille": "pact.hw.active_warp_ratio_permille",
         "stall_memory_permille": "pact.hw.stall_memory_permille",
         "sm_efficiency_permille": "pact.hw.sm_efficiency_permille",
+        # V14-B: scales the S1 L2-residency working set to the sequence's
+        # full K+V stream (paged loads are per-KV-head tiles; the IR alone
+        # cannot see how many heads stream through L2).
+        "kv_heads": "pact.hw.kv_heads",
     }
     for src, dst in mapping.items():
         val = facts.get(src)
@@ -36,7 +40,8 @@ def decide(facts: Dict[str, Any], batch: int, seq_len: int,
            table: Optional[FamilyTable] = None,
            hints_dir: Optional[Path] = None,
            head_dim: Optional[int] = None,
-           gqa: Optional[int] = None) -> Dict[str, Any]:
+           gqa: Optional[int] = None,
+           kv_heads: Optional[int] = None) -> Dict[str, Any]:
     """Facts + family table -> one extra_env for a single JIT.
 
     v8: the table may return ``"vanilla"`` (the fit's vanilla-anchored winner
@@ -45,6 +50,10 @@ def decide(facts: Dict[str, Any], batch: int, seq_len: int,
     advantage in recompiling a PACT variant that measured slower.  Callers
     that know the kernel geometry pass head_dim/gqa so the d{D}g{gqa}|
     prefixed entries are addressable.
+
+    V14-B: ``kv_heads`` (derivable as Hq/GQA from the geometry) enters the
+    S1 residency hints; the ``cold`` family just lifts the stage cap —
+    P6's L2-residency gate itself keeps hot shapes at the theory decision.
     """
     table = table or FamilyTable.load()
     family = table.lookup(
@@ -79,6 +88,12 @@ def decide(facts: Dict[str, Any], batch: int, seq_len: int,
     elif family == "w1":
         extra_env["PACT_OVERRIDE_WARPS"] = "1"
         options_override["num_warps"] = 1
+    elif family == "cold":
+        # S1 auto family: unlock deep pipelines; the C++ residency gate
+        # decides per shape (hot shapes compile identically to theory).
+        extra_env["PACT_MAX_PIPELINE_STAGES"] = "5"
+    if kv_heads and int(kv_heads) > 0:
+        facts = {**facts, "kv_heads": int(kv_heads)}
     hints = facts_to_hints(facts)
     if hints:
         d = Path(hints_dir or (Path.home() / ".triton" / "pact_hw"))

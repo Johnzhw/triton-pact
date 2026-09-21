@@ -107,7 +107,8 @@ def decide(facts: Dict[str, Any], batch: int, seq_len: int,
            hints_dir: Optional[Path] = None,
            head_dim: Optional[int] = None,
            gqa: Optional[int] = None,
-           cfg: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+           cfg: Optional[Dict[str, Any]] = None,
+           kv_heads: Optional[int] = None) -> Dict[str, Any]:
     """Same contract as online_decider.decide, with the learned policy first.
 
     The caller (service_main) may pass the kernel geometry ``cfg``
@@ -119,15 +120,24 @@ def decide(facts: Dict[str, Any], batch: int, seq_len: int,
     (explicit head_dim/gqa arguments still win).  Previously the service
     path looked the plain keys up only, so prefixed entries were
     unaddressable there (the v7 dead-key lesson in residual form).
+
+    V14-B: kv_heads (explicit or derived Hq//GQA from cfg) reaches the
+    hints so the S1 residency working set covers all KV heads.
     """
     from triton.pact.decider.online_decider import decide as table_decide
     if cfg is None:
         return table_decide(facts, batch, seq_len, table=table,
-                            hints_dir=hints_dir, head_dim=head_dim, gqa=gqa)
+                            hints_dir=hints_dir, head_dim=head_dim, gqa=gqa,
+                            kv_heads=kv_heads)
     if head_dim is None and cfg.get("D"):
         head_dim = int(cfg["D"])
     if gqa is None and cfg.get("GQA"):
         gqa = int(cfg["GQA"])
+    if kv_heads is None and cfg.get("Hq") and cfg.get("GQA"):
+        try:
+            kv_heads = int(cfg["Hq"]) // int(cfg["GQA"])
+        except (TypeError, ValueError, ZeroDivisionError):
+            kv_heads = None
     policy = LearnedPolicy.load()
     if policy is not None:
         try:
@@ -140,11 +150,11 @@ def decide(facts: Dict[str, Any], batch: int, seq_len: int,
                             "options_override": {}, "hints": {}}
                 out = table_decide(facts, batch, seq_len, table=table,
                                    hints_dir=hints_dir, head_dim=head_dim,
-                                   gqa=gqa)
+                                   gqa=gqa, kv_heads=kv_heads)
                 out["family"] = variant
                 out["extra_env"] = dict(env)
                 return out
         except Exception:
             pass
     return table_decide(facts, batch, seq_len, table=table, hints_dir=hints_dir,
-                        head_dim=head_dim, gqa=gqa)
+                        head_dim=head_dim, gqa=gqa, kv_heads=kv_heads)

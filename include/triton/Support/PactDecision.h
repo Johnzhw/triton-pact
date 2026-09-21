@@ -119,17 +119,18 @@ struct SelectStagesResult {
 //
 // Feasible set (computed, not hard-coded):
 //   s in [2, min(user max, smemBudget/tileBytes, estIterations)]
-// Ampere (SM 80-89, occupancy-first):
-//   choose s maximizing the L2 occupancy; ties prefer the stage count closest
-//   to defaultStages (then the smaller one).  Short sequences therefore
+// Pre-Hopper NVIDIA (SM < 90, occupancy-first — includes Ada, whose
+//   l2Bytes table entry can classify cold shapes): choose s maximizing
+//   the L2 occupancy; ties prefer the stage count closest to
+//   defaultStages (then the smaller one).  Short sequences therefore
 //   converge to low stages through the equations instead of an `<=16` rule.
-//   S1 cold path (kvWorkingSetBytes > l2Bytes > 0, Ampere only): the loop
+//   S1 cold path (kvWorkingSetBytes > l2Bytes > 0, SM < 90 only): the loop
 //   streams K/V from DRAM, so among feasible s in [3,5] take the deepest one
 //   whose score stays within the computed one-CTA discretization granularity
 //   of the scan's best — deeper cp.async pipelines hide DRAM latency, and any
 //   depth that the capacity equations say costs more than the model-error
 //   bound is vetoed.
-// Hopper (SM >= 90, pipeline-first):
+// Hopper+ (SM >= 90, pipeline-first):
 //   choose the largest s whose occupancy is within the computed discretization
 //   granularity (numWarps/maxWarpsPerSM) of the best occupancy.
 // AMD / Unknown backend: keep defaultStages (CDNA capacity data pending).

@@ -1,4 +1,4 @@
-"""Offline family table: (B,S,occ,stall) buckets -> {theory, occupancy, latency, vanilla}.
+"""Offline family table: (B,S,occ,stall) buckets -> family vocabulary.
 
 v8: ``vanilla`` is a first-class family value -- the decider maps it to
 ``PACT_ENABLE=0`` (no recompile advantage, keep the default kernel).  Keys may
@@ -6,6 +6,12 @@ carry a ``d{D}g{gqa}|`` prefix; lookup prefers the prefixed entry when the
 caller supplies head_dim/gqa and falls back to the unprefixed grammar.  In v7
 the fit emitted prefixed keys that no runtime caller could address (dead
 entries); the prefix is now part of the documented grammar.
+
+V14-B: the vocabulary adds ``cold`` (S1 auto family: lifts the stage cap,
+P6's L2-residency gate itself keeps hot shapes at the theory decision).
+The aobo inline path can emit it today via its cold-aware reselection;
+table/learned entries for it land with a future re-fit that measures the
+cold variant directly.
 """
 from __future__ import annotations
 
@@ -16,7 +22,7 @@ from typing import Dict, Optional
 from triton.pact.runtime.workload_sniffer import bucket_bs
 
 KNOWN_FAMILIES = ("theory", "occupancy", "latency", "vanilla",
-                  "deep", "short", "w1")
+                  "deep", "short", "w1", "cold")
 
 
 def _occ_bucket(permille: Optional[int]) -> str:

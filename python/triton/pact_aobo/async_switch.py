@@ -89,7 +89,17 @@ class AsyncKernelSwitch:
             if len(self._ev_pairs) >= self._ev_pairs.maxlen:
                 s, t = self._ev_pairs.popleft()
                 try:
-                    self.state["last_launch_us"] = s.elapsed_time(t) * 1000.0
+                    us = s.elapsed_time(t) * 1000.0
+                    self.state["last_launch_us"] = us
+                    # V15-R1: smoothed observation (EMA alpha=0.2, the
+                    # same formula as the pgo service replica column).
+                    # ADD-ONLY: facts_to_hints does not read this key;
+                    # the instantaneous last_launch_us keeps feeding
+                    # decide_inline unchanged.
+                    prev = self.state.get("launch_us_ema")
+                    self.state["launch_us_ema"] = \
+                        us if prev is None else \
+                        0.2 * us + 0.8 * prev
                 except Exception:
                     pass
         except Exception:

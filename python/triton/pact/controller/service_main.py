@@ -50,6 +50,18 @@ class CompilerService:
         if self.replica_launch is not None:
             try:
                 facts.update(replica_median_us(self.replica_launch, iters=3))
+                # V15-R1: smoothed column alongside the instantaneous
+                # median (EMA alpha=0.2, same formula as the aobo
+                # _observe mirror).  ADD-ONLY: no existing key or
+                # decision input changes; whether the decider consumes
+                # it is a future re-fit question.
+                m = facts.get("replica_median_us")
+                if isinstance(m, (int, float)):
+                    prev = getattr(self, "_replica_ema", None)
+                    ema = m if prev is None else \
+                        0.2 * m + 0.8 * prev
+                    self._replica_ema = ema
+                    facts["replica_median_us_ema"] = round(ema, 3)
             except Exception as e:
                 facts["replica_error"] = str(e)
         facts.update(collect_or_unavailable(

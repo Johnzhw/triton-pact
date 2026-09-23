@@ -310,7 +310,12 @@ def _demo_entry():
     # worst-case sanity: compile window must not contain a compile-length gap
     worst = report["forward_band_compile_window"]["max_ms"]
     compile_ms = max(report["bg_compile_ms"] or [0])
-    ok = bool(compile_ms) and worst < compile_ms / 2
+    # V16 audit fix: the cold-compile verdict (compile ~300ms -> 150ms
+    # threshold) collapses when the triton disk cache is HOT (compile
+    # drops to ms-scale and any 1ms jitter trips it).  Add the absolute
+    # arm the claim always meant: a compile-length BLOCK is hundreds of
+    # ms; window forwards must stay below max(compile/2, 5ms).
+    ok = bool(compile_ms) and worst < max(compile_ms / 2, 5.0)
     print("ASYNC_OK" if ok else "ASYNC_VIOLATION")
     return 0 if ok else 1
 

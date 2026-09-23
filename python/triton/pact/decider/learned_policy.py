@@ -30,8 +30,19 @@ FEATURE_ORDER = ("logS", "logD", "logP", "B")
 
 
 def features(cfg: Dict[str, Any]) -> list:
-    return [math.log2(cfg["S"]), math.log2(cfg["D"]),
-            math.log2(cfg.get("P", 16)), cfg.get("B", 1)]
+    # V16-T6 learning upgrade: add two generalization features --
+    # GQA ratio and the STATIC KV working-set proxy log2(S*D*Hk*2*2)
+    # (bytes of one sequence's K+V in bf16) -- so a fitted winner table
+    # can separate hot/cold regimes the way S1's residency gate does
+    # without any runtime counter.  Older 4-feature models still load;
+    # their prototypes simply have shorter vectors and knn distance is
+    # computed with zip() truncation (documented compatibility note).
+    s = cfg["S"]
+    d = cfg["D"]
+    gqa = cfg.get("GQA", 1) or 1
+    ws = s * d * (cfg.get("Hq", gqa) // gqa) * 2 * 2
+    return [math.log2(s), math.log2(d), math.log2(cfg.get("P", 16)),
+            cfg.get("B", 1), gqa, round(math.log2(max(ws, 1)), 3)]
 
 
 class LearnedPolicy:

@@ -35,6 +35,9 @@ def features(cfg: Dict[str, Any]) -> list:
 
 
 class LearnedPolicy:
+    # path -> ((mtime_ns, size), LearnedPolicy) -- see load()
+    _cache: Dict[str, tuple] = {}
+
     def __init__(self, data: Dict):
         self.kind = data.get("kind")
         self.variants = data.get("variants") or {}
@@ -49,8 +52,22 @@ class LearnedPolicy:
         path = path or os.environ.get("PACT_FAMILY_MODEL")
         if not path or not Path(path).is_file():
             return None
+        # V16-T2b: the aobo decide path called this every forward, paying
+        # a file read + json parse each time; cache on (mtime, size) so a
+        # swapped model file is still picked up immediately
         try:
-            return cls(json.loads(Path(path).read_text()))
+            st = os.stat(path)
+            key = (path, st.st_mtime_ns, st.st_size)
+        except OSError:
+            key = None
+        cached = cls._cache.get(path) if key else None
+        if cached is not None and cached[0] == key:
+            return cached[1]
+        try:
+            obj = cls(json.loads(Path(path).read_text()))
+            if key is not None:
+                cls._cache[path] = (key, obj)
+            return obj
         except Exception:
             return None
 

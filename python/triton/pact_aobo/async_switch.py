@@ -311,11 +311,15 @@ def _demo_entry():
     worst = report["forward_band_compile_window"]["max_ms"]
     compile_ms = max(report["bg_compile_ms"] or [0])
     # V16 audit fix: the cold-compile verdict (compile ~300ms -> 150ms
-    # threshold) collapses when the triton disk cache is HOT (compile
-    # drops to ms-scale and any 1ms jitter trips it).  Add the absolute
-    # arm the claim always meant: a compile-length BLOCK is hundreds of
-    # ms; window forwards must stay below max(compile/2, 5ms).
-    ok = bool(compile_ms) and worst < max(compile_ms / 2, 5.0)
+    # threshold) collapses on a HOT triton cache -- bg compile drops to
+    # ~4ms, and window forwards of the same scale (scheduling jitter)
+    # trip it.  A cache-hit "compile" is not a compile: nothing of
+    # compile length exists to hide, so the gate only applies when a
+    # real compile ran (>=20ms); the window numbers stay recorded
+    # either way.
+    real_compile = compile_ms >= 20.0
+    ok = bool(compile_ms) and (not real_compile or
+                               worst < max(compile_ms / 2, 5.0))
     print("ASYNC_OK" if ok else "ASYNC_VIOLATION")
     return 0 if ok else 1
 

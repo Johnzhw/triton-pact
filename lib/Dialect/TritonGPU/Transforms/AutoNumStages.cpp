@@ -203,6 +203,19 @@ struct PACTAutoNumStagesPass
     if (auto attr = mod->getAttrOfType<mlir::IntegerAttr>(
             "pact.hw.sm_efficiency_permille"))
       hw.smEfficiencyPermille = (int)attr.getInt();
+    // V16-T6: activate the measured-counter coefficients.  v15 wired the
+    // permilles into the hint attrs but left both coefficients at the
+    // 0.0 default ("supplied by the caller" -- no caller ever did), so
+    // the runtime truths never reached the stage scoring.  v1
+    // calibration, aligned with the decider's counter_adjust rule:
+    // a stall-heavy, throughput-starved kernel benefits from deeper
+    // pipelining -> the bonus term (which multiplies (1 - smEffFrac))
+    // scales with the measured stall fraction.  Absent hints keep both
+    // coefficients at zero, so fixtures without hints (lit, dump_ir)
+    // stay bit-identical.
+    if (hw.stallMemoryPermille && hw.stallMemoryPermille.value() > 0)
+      hw.smEffBonusPerExtraStage =
+          0.05 * hw.stallMemoryPermille.value() / 1000.0;
     int64_t hwIters = -1;
     if (auto attr = mod->getAttrOfType<mlir::IntegerAttr>(
             "pact.hw.measured_iterations"))

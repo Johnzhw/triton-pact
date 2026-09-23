@@ -332,12 +332,19 @@ struct PTXInstrExecution {
 // PTX code with some trivial C++ code.
 
 struct PTXCpAsyncLoadInstr : PTXInstrBase<PTXCpAsyncLoadInstr> {
-  explicit PTXCpAsyncLoadInstr(PTXBuilder *builder,
-                               triton::CacheModifier modifier)
+  // V16-T7: forward the load's eviction policy into the async copy --
+  // the plain ld.global path already honored it while the async path
+  // silently dropped it (catalog item #2, the A3 revival).
+  explicit PTXCpAsyncLoadInstr(
+      PTXBuilder *builder, triton::CacheModifier modifier,
+      triton::EvictionPolicy evict = triton::EvictionPolicy::NORMAL)
       : PTXInstrBase(builder, "cp.async") {
     o(triton::stringifyCacheModifier(modifier).str());
     o("shared");
     o("global");
+    o("L2::evict_first",
+      evict == triton::EvictionPolicy::EVICT_FIRST);
+    o("L2::evict_last", evict == triton::EvictionPolicy::EVICT_LAST);
   }
 };
 

@@ -61,17 +61,29 @@ VARIANT_ENVS: Dict[str, Dict[str, str]] = {
     "occ": {"PACT_ENABLE": "1", "PACT_OVERRIDE_WARPS": "2"},
     "lat": {"PACT_ENABLE": "1", "PACT_OVERRIDE_STAGES": "2"},
     "deep": {"PACT_ENABLE": "1", "PACT_OVERRIDE_STAGES": "5"},
-    "short": {"PACT_ENABLE": "1", "PACT_OVERRIDE_STAGES": "1"},
+    # V16-T3: pin 1 was silently rejected by P6's [2,8] domain (fake
+    # config since day one); 2 is the honest "shallowest pipeline"
+    "short": {"PACT_ENABLE": "1", "PACT_OVERRIDE_STAGES": "2"},
     "w1": {"PACT_ENABLE": "1", "PACT_OVERRIDE_WARPS": "1"},
     # V14-B (S1): unlock the deep-pipeline range; P6's L2-residency gate
     # itself keeps hot shapes at the theory decision, so this module entry
     # is the graph-side spelling of the "cold" auto family.
     "cold": {"PACT_ENABLE": "1", "PACT_MAX_PIPELINE_STAGES": "5"},
 }
+# V16-T4 lazy prepare: the capture-borne vocabulary is just the baseline
+# pair + the theory default; every other family is compiled ON DEMAND as
+# a SEPARATE single-entry cubin and swapped via the E3 path (source-node
+# SetParams + whole-graph cudaGraphExecUpdate -- validated on the chain
+# graph, 60us).  PACT_GRAPH_VOCAB=full restores the 9-entry eager module.
+MINI_VOCAB = ("__base", "__vanilla", "theory")
 FAMILY_ALIAS: Dict[str, str] = {
     "baseline": "__vanilla", "vanilla": "__vanilla",
     "occupancy": "occ", "latency": "lat",
 }
+
+
+def _vocab_mode() -> str:
+    return "full" if os.environ.get("PACT_GRAPH_VOCAB") == "full" else "mini"
 
 
 def get_service() -> "GraphKernelService":
@@ -104,6 +116,7 @@ class GraphKernelService:
         self._mods: Dict[str, Any] = {}         # jit name -> CUmodule
         self._kerns: Dict[Tuple[str, str], Any] = {}  # CompiledKernel ref
         self._jit_args: Dict[str, tuple] = {}   # jit -> (args, kwargs, grid)
+        self._jit_fns: Dict[str, Any] = {}      # jit -> jit_fn (offer path)
         self._variants: Dict[Tuple[str, str], dict] = {}
         # (jit, variant) -> {"fn": CUfunction, "warps": int, "shared": int}
         self._bindings: Dict[int, list] = {}    # id(graph) -> [_NodeBinding]
@@ -193,9 +206,12 @@ class GraphKernelService:
         t0 = time.monotonic()
         try:
             from triton.pact.compiler.explicit_compiler import compile_explicit
-            vocab = dict(variants or VARIANT_ENVS)
+            base_vocab = dict(variants or VARIANT_ENVS)
+            if variants is None and _vocab_mode() == "mini":
+                base_vocab = {k: VARIANT_ENVS[k] for k in MINI_VOCAB
+                              if k in VARIANT_ENVS}
             kerns: Dict[str, Any] = {}
-            for vname, env in vocab.items():
+            for vname, env in base_vocab.items():
                 k, _ = compile_explicit(jit_fn, args, kwargs, dict(env))
                 kerns[vname] = k
             blob = self._merge_ptxas(cu, kerns, name)
@@ -217,6 +233,7 @@ class GraphKernelService:
                     self._kerns[(name, vname)] = k
                 self._jit_args[name] = (tuple(args), dict(kwargs),
                                         tuple(grid))
+                self._jit_fns[name] = jit_fn
             # settle the lazy loads NOW (one raw launch per function on
             # cloned outputs, off any serving path)
             for vname, k in kerns.items():
@@ -224,6 +241,7 @@ class GraphKernelService:
                                   args, kwargs, grid)
             with _LOCK:
                 self.state["prepared"] = name
+                self.state["vocab_mode"] = _vocab_mode()
                 self.state["variants"] = sorted(kerns)
                 self.state["prepare_ms"] = round(
                     (time.monotonic() - t0) * 1000.0, 1)
@@ -271,6 +289,20 @@ class GraphKernelService:
         for i, (vname, k) in enumerate(kerns.items()):
             parts.append(entry_of(k, f"__{vname}", f"V{i}"))
         merged = "\n".join(parts) + "\n"
+        # V16-T4 R1 (Foundry cubin persistence, scoped to the ptxas step):
+        # the merged PTX hash + sm arch identifies the cubin; a pool hit
+        # skips the ptxas subprocess entirely (compile_explicit keeps its
+        # own triton cache, so a restart pays load+materialize only)
+        import hashlib
+        pkey = hashlib.sha256(merged.encode()).hexdigest()[:16]
+        pool_dir = Path(os.environ.get("PACT_GRAPH_POOL_DIR")
+                        or (Path.home() / ".triton" / "pact_graph_pool"))
+        cached = pool_dir / f"{name}_{pkey}_sm{maj}{mnr}.cubin"
+        if cached.exists():
+            try:
+                return cached.read_bytes()
+            except Exception:
+                pass
         with tempfile.TemporaryDirectory(prefix="pact_gs_") as td:
             src = Path(td) / "m.ptx"
             src.write_text(merged)
@@ -283,7 +315,13 @@ class GraphKernelService:
                 raise RuntimeError("ptxas rc="
                                    f"{r.returncode}: "
                                    f"{r.stderr.decode(errors='ignore')[:200]}")
-            return cub.read_bytes()
+            blob = cub.read_bytes()
+        try:
+            pool_dir.mkdir(parents=True, exist_ok=True)
+            (pool_dir / cached.name).write_bytes(blob)
+        except Exception:
+            pass  # pool is an accelerator, never a gate
+        return blob
 
     def _materialize(self, cu, kernel, fn, args, kwargs, grid) -> None:
         """One raw launch on cloned tensors to settle the lazy load."""
@@ -359,6 +397,56 @@ class GraphKernelService:
         v = FAMILY_ALIAS.get(variant, variant)
         with _LOCK:
             return (jit_name, v) in self._variants
+
+    def offer(self, jit_name: str, variant: str) -> bool:
+        """V16-T4: compile + load ONE more variant ON DEMAND as its own
+        single-entry cubin in a SEPARATE module ("cross" variant).  Runs
+        on background frames (ms..s: compile_explicit + pool ptxas +
+        cuModuleLoadDataEx + materialize); never at a replay boundary.
+        Swapping to a cross variant goes through the E3 path (source-node
+        SetParams + whole-graph cudaGraphExecUpdate), so the module the
+        captured nodes were born in never has to grow."""
+        variant = FAMILY_ALIAS.get(variant, variant)
+        with _LOCK:
+            if (jit_name, variant) in self._variants:
+                return True
+            jit_fn = self._jit_fns.get(jit_name)
+            args_kw = self._jit_args.get(jit_name)
+            env = VARIANT_ENVS.get(variant)
+        if jit_fn is None or args_kw is None or env is None:
+            return False
+        args, kwargs, grid = args_kw
+        t0 = time.monotonic()
+        try:
+            cu = self._driver()
+            from triton.pact.compiler.explicit_compiler import compile_explicit
+            k, _ = compile_explicit(jit_fn, args, kwargs, dict(env))
+            blob = self._merge_ptxas(cu, {variant: k}, jit_name)
+            err, mod = cu.cuModuleLoadDataEx(blob, 0, [], [])
+            if err != cu.CUresult.CUDA_SUCCESS:
+                raise RuntimeError(f"cuModuleLoadDataEx(offer) {err}")
+            err, fn = cu.cuModuleGetFunction(
+                mod, f"{jit_name}__{variant}".encode())
+            if err != cu.CUresult.CUDA_SUCCESS:
+                raise RuntimeError(f"GetFunction(offer {variant}) {err}")
+            self._materialize(cu, k, fn, args, kwargs, grid)
+            with _LOCK:
+                self._variants[(jit_name, variant)] = {
+                    "fn": fn,
+                    "warps": int(k.metadata.num_warps),
+                    "shared": int(k.metadata.shared),
+                    "cross": mod,      # non-None => separate module
+                }
+                self._kerns[(jit_name, variant)] = k
+                self.state["offers"] += 1
+                self.state["last_offer_ms"] = round(
+                    (time.monotonic() - t0) * 1e3, 1)
+                self.state.setdefault("offered", []).append(variant)
+            self._publish()
+            return True
+        except Exception as e:  # noqa: BLE001
+            self._err(f"offer({variant})", e)
+            return False
 
     # -- graph binding ---------------------------------------------------
     def bind_graph(self, graph, jit_name: str) -> int:
@@ -456,12 +544,16 @@ class GraphKernelService:
             return False
         t0 = time.monotonic()
         applied = 0
+        use_e3 = bool(v.get("cross"))
+        if use_e3:
+            from cuda.bindings import runtime as _rt
         with _LOCK:
             items = [(gid, nodes) for gid, nodes in self._bindings.items()
                      if self._jits.get(gid) == jit_name and
                      self._graph_active.get(gid) != variant]
         for gid, nodes in items:
             gexec = self._exec_of(gid)
+            graph_raw = self._keep[gid].raw_cuda_graph() if use_e3 else None
             for nb in nodes:
                 params = cu.CUDA_KERNEL_NODE_PARAMS()
                 params.func = v["fn"]
@@ -498,13 +590,28 @@ class GraphKernelService:
                             "variant": [32 * v["warps"], v["shared"]],
                             "kp_same": True,
                         })
-                (rc,) = cu.cuGraphExecKernelNodeSetParams(
-                    gexec, nb.node, params)
+                if use_e3:
+                    # V16-T4 E3 path: mutate the SOURCE-graph node (func
+                    # from a separate module), then one whole-graph
+                    # cudaGraphExecUpdate adopts it into torch's own exec
+                    (rc,) = cu.cuGraphKernelNodeSetParams(nb.node, params)
+                else:
+                    (rc,) = cu.cuGraphExecKernelNodeSetParams(
+                        gexec, nb.node, params)
                 if rc != 0:
                     self._err(f"SetParams({variant})",
                               RuntimeError(f"rc={rc}"))
                 else:
                     applied += 1
+            if use_e3 and applied:
+                rc_u = _rt.cudaGraphExecUpdate(
+                    int(gexec), int(graph_raw))[0]
+                with _LOCK:
+                    self.state["e3_updates"] = \
+                        int(self.state.get("e3_updates") or 0) + 1
+                    if rc_u != 0:
+                        self._err(f"ExecUpdate({variant})",
+                                  RuntimeError(f"rc={rc_u}"))
             if applied:
                 with _LOCK:
                     self._graph_active[gid] = variant
@@ -538,6 +645,16 @@ class GraphKernelService:
         applied = 0
         for gid, nodes in items:
             gexec = self._exec_of(gid)
+            # if the graph currently runs a CROSS variant, the source
+            # nodes point into a separate module: pointing back at __base
+            # is a cross-module change too -- take the E3 path (source
+            # SetParams + whole-graph ExecUpdate), never a cross-module
+            # exec SetParams (the known silent-corruption shape)
+            cur_v = self._graph_active.get(gid)
+            cur_meta = self._variants.get((jit_name, cur_v)) \
+                if cur_v else None
+            use_e3 = bool(cur_meta and cur_meta.get("cross"))
+            graph_raw = self._keep[gid].raw_cuda_graph() if use_e3 else None
             for nb in nodes:
                 params = cu.CUDA_KERNEL_NODE_PARAMS()
                 params.func = v["fn"]
@@ -555,10 +672,20 @@ class GraphKernelService:
                     params.gridDimZ = int(cur.gridDimZ)
                     params.blockDimY = int(cur.blockDimY)
                     params.blockDimZ = int(cur.blockDimZ)
-                (rc,) = cu.cuGraphExecKernelNodeSetParams(
-                    gexec, nb.node, params)
+                if use_e3:
+                    from cuda.bindings import runtime as _rt
+                    (rc,) = cu.cuGraphKernelNodeSetParams(nb.node, params)
+                else:
+                    (rc,) = cu.cuGraphExecKernelNodeSetParams(
+                        gexec, nb.node, params)
                 if rc == 0:
                     applied += 1
+            if use_e3 and applied:
+                rc_u = _rt.cudaGraphExecUpdate(
+                    int(gexec), int(graph_raw))[0]
+                if rc_u != 0:
+                    self._err("ExecUpdate(rollback)",
+                              RuntimeError(f"rc={rc_u}"))
             if applied:
                 with _LOCK:
                     self._graph_active.pop(gid, None)

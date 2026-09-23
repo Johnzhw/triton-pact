@@ -147,13 +147,22 @@ class HotSwapper:
                      ) -> Dict[str, float]:
         """Compile the named variant set in an idle window and keep the
         kernels resident.  A later swap_from_pool(name) is a pure slot
-        exchange — no compile, no module load on the switch path."""
+        exchange — no compile, no module load on the switch path.
+
+        V16-T3: additions go through the VariantRegistry (per-domain
+        LRU cap, default 32, PACT_VARIANT_CAP); evicted names have their
+        handles dropped here -- the triton disk cache keeps the cubin,
+        so a later re-warm of an evicted name is a ms-level re-hit."""
         import time
+        from triton.pact.runtime.variant_registry import default_registry
         if not hasattr(self, "_pool"):
             self._pool: Dict[str, Any] = {}
+        reg = default_registry()
+        domain = (self._registry_model_tag(), self._registry_geo_key())
         spent = {}
         for name, extra_env in variants.items():
             if name in self._pool:
+                reg.hit(domain, reg.variant_key(name, extra_env))
                 continue
             t0 = time.monotonic()
             k, _ = compile_explicit(self.jit_fn, self.args, self.kwargs,
@@ -164,9 +173,24 @@ class HotSwapper:
                     k._init_handles()
                 except Exception:
                     pass
+            key = reg.variant_key(name, extra_env)
+            for _ev_key, ev_meta in reg.register(domain, key, {"name": name}):
+                ev_name = (ev_meta or {}).get("name")
+                if ev_name and ev_name in self._pool and ev_name != name:
+                    del self._pool[ev_name]
             self._pool[name] = k
             spent[name] = (time.monotonic() - t0) * 1000.0
         return spent
+
+    def _registry_model_tag(self) -> str:
+        import os
+        return os.environ.get("PACT_MODEL_TAG") or "default"
+
+    def _registry_geo_key(self) -> str:
+        kw = self.kwargs or {}
+        return "|".join(str(kw.get(k, "")) for k in
+                        ("NUM_TOKENS", "NUM_HEADS", "NUM_KV_HEADS",
+                         "HEAD_DIM", "PAGE_SIZE", "MAX_SEQ_LEN"))
 
     def pool_contains(self, name: str) -> bool:
         return bool(getattr(self, "_pool", None)) and name in self._pool

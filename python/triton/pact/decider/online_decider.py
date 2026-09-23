@@ -36,6 +36,90 @@ def facts_to_hints(facts: Dict[str, Any]) -> Dict[str, int]:
     return hints
 
 
+def _family_env(family: str) -> tuple:
+    """Family name -> (extra_env additions, options_override).
+
+    V16-T3: 'short' used to pin PACT_OVERRIDE_STAGES=1, which P6's
+    [2,8] validity domain silently REJECTS (AutoNumStages.cpp pins are
+    clamped away; the reported config said 1 while the binary was P6's
+    own pick) -- a fake config since day one.  The intent "shallowest
+    pipeline" is pin 2, fixed here; every other family is unchanged.
+    """
+    extra_env: Dict[str, str] = {}
+    options_override: Dict[str, Any] = {}
+    if family == "occupancy":
+        extra_env["PACT_OVERRIDE_WARPS"] = "2"
+        options_override["num_warps"] = 2
+    elif family == "latency":
+        extra_env["PACT_OVERRIDE_STAGES"] = "2"
+    elif family == "deep":
+        extra_env["PACT_OVERRIDE_STAGES"] = "5"
+    elif family == "short":
+        extra_env["PACT_OVERRIDE_STAGES"] = "2"
+    elif family == "w1":
+        extra_env["PACT_OVERRIDE_WARPS"] = "1"
+        options_override["num_warps"] = 1
+    elif family == "cold":
+        # S1 auto family: unlock deep pipelines; the C++ residency gate
+        # decides per shape (hot shapes compile identically to theory).
+        extra_env["PACT_MAX_PIPELINE_STAGES"] = "5"
+    return extra_env, options_override
+
+
+_WARPS_DOMAIN = (1, 2, 4, 8)
+
+
+def normalize_preset(spec) -> Dict[str, Any]:
+    """V16-T3 generative-preset entry: a family NAME (compat) or a
+    parameterized dict -> the same shape decide() returns for envs.
+
+    Dict keys (all optional, validated/clamped, values outside the
+    domains are dropped with the rest kept):
+      stages     int in [2, 8]  -> PACT_OVERRIDE_STAGES
+      warps      int in {1,2,4,8} -> PACT_OVERRIDE_WARPS + num_warps
+      max_stages int in [2, 8]  -> PACT_MAX_PIPELINE_STAGES (cold-style)
+      enable     bool           -> PACT_ENABLE (default 1)
+    This is what lets deciders emit OUT-OF-VOCABULARY variants (user
+    point 2: no fixed candidate cap) while the named families remain
+    the compatibility anchors.
+    """
+    if isinstance(spec, str):
+        extra_env = {"PACT_ENABLE": "0"} if spec == "vanilla" else {
+            "PACT_ENABLE": "1",
+            "PACT_ENABLE_AUTO_NUM_STAGES": "1",
+            "PACT_ENABLE_AUTO_NUM_WARPS": "1",
+        }
+        add, opt = _family_env(spec) if spec != "vanilla" else ({}, {})
+        extra_env.update(add)
+        return {"family": spec, "extra_env": extra_env,
+                "options_override": opt}
+    if not isinstance(spec, dict):
+        raise TypeError(f"preset must be str or dict, got {type(spec)}")
+    enable = bool(spec.get("enable", True))
+    extra_env: Dict[str, str] = {"PACT_ENABLE": "1" if enable else "0"}
+    options_override: Dict[str, Any] = {}
+    if not enable:
+        return {"family": spec.get("name", "vanilla-preset"),
+                "extra_env": extra_env, "options_override": options_override}
+    extra_env["PACT_ENABLE_AUTO_NUM_STAGES"] = "1"
+    extra_env["PACT_ENABLE_AUTO_NUM_WARPS"] = "1"
+    stages = spec.get("stages")
+    if isinstance(stages, int) and 2 <= stages <= 8:
+        extra_env["PACT_OVERRIDE_STAGES"] = str(stages)
+    warps = spec.get("warps")
+    if isinstance(warps, int) and warps in _WARPS_DOMAIN:
+        extra_env["PACT_OVERRIDE_WARPS"] = str(warps)
+        options_override["num_warps"] = warps
+    max_stages = spec.get("max_stages")
+    if isinstance(max_stages, int) and 2 <= max_stages <= 8:
+        extra_env["PACT_MAX_PIPELINE_STAGES"] = str(max_stages)
+    name = spec.get("name") or "s{}w{}".format(
+        extra_env.get("PACT_OVERRIDE_STAGES", "a"),
+        extra_env.get("PACT_OVERRIDE_WARPS", "a"))
+    return {"family": name, "extra_env": extra_env,
+            "options_override": options_override}
+
+
 def decide(facts: Dict[str, Any], batch: int, seq_len: int,
            table: Optional[FamilyTable] = None,
            hints_dir: Optional[Path] = None,
@@ -62,36 +146,16 @@ def decide(facts: Dict[str, Any], batch: int, seq_len: int,
         facts.get("stall_memory_permille"),
         head_dim=head_dim, gqa=gqa,
     )
-    options_override: Dict[str, Any] = {}
+    preset = normalize_preset(family)
+    extra_env: Dict[str, str] = preset["extra_env"]
+    options_override: Dict[str, Any] = preset["options_override"]
     if family == "vanilla":
-        extra_env = {"PACT_ENABLE": "0"}
         return {
             "family": family,
             "extra_env": extra_env,
             "options_override": options_override,
             "hints": {},
         }
-    extra_env = {
-        "PACT_ENABLE": "1",
-        "PACT_ENABLE_AUTO_NUM_STAGES": "1",
-        "PACT_ENABLE_AUTO_NUM_WARPS": "1",
-    }
-    if family == "occupancy":
-        extra_env["PACT_OVERRIDE_WARPS"] = "2"
-        options_override["num_warps"] = 2
-    elif family == "latency":
-        extra_env["PACT_OVERRIDE_STAGES"] = "2"
-    elif family == "deep":
-        extra_env["PACT_OVERRIDE_STAGES"] = "5"
-    elif family == "short":
-        extra_env["PACT_OVERRIDE_STAGES"] = "1"
-    elif family == "w1":
-        extra_env["PACT_OVERRIDE_WARPS"] = "1"
-        options_override["num_warps"] = 1
-    elif family == "cold":
-        # S1 auto family: unlock deep pipelines; the C++ residency gate
-        # decides per shape (hot shapes compile identically to theory).
-        extra_env["PACT_MAX_PIPELINE_STAGES"] = "5"
     if kv_heads and int(kv_heads) > 0:
         facts = {**facts, "kv_heads": int(kv_heads)}
     hints = facts_to_hints(facts)

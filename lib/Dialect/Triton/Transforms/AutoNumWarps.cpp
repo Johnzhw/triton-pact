@@ -124,6 +124,35 @@ struct PACTAutoNumWarpsPass
     }
     // The canonical paged-attention tile has exactly two annotated K/V loads.
     // Requiring >=4 loads silently disabled P11 for the primary target shape.
+    // V16-T8b channel generalization: kernels WITHOUT the paged
+    // annotation (norm/gemm/softmax families) fall back to the largest
+    // tensor load as the tile signal, so P11 serves every operator
+    // class the same way P6 already does.  Paged kernels keep the
+    // annotated path bit-for-bit (this block only runs when the paged
+    // walk found nothing).
+    if (numPagedLoads == 0) {
+      mod.walk([&](Operation *op) {
+        auto ld = dyn_cast<triton::LoadOp>(op);
+        if (!ld)
+          return WalkResult::advance();
+        auto ty = dyn_cast<RankedTensorType>(ld.getType());
+        if (!ty || ty.getShape().empty())
+          return WalkResult::advance();
+        int64_t rows = ty.getShape()[0];
+        int64_t cols = ty.getShape().size() > 1 ? ty.getShape()[1] : 1;
+        int64_t elem = std::max(
+            (int64_t)1, (int64_t)(ty.getElementTypeBitWidth() / 8));
+        int64_t bytes = rows * cols * elem;
+        if (bytes > maxTileBytes)
+          maxTileBytes = bytes;
+        numPagedLoads++;
+        return WalkResult::advance();
+      });
+      if (numPagedLoads > 0)
+        llvm::errs() << "[PACT P11] generic tile fallback: loads="
+                     << numPagedLoads << " maxTileB=" << maxTileBytes
+                     << "\n";
+    }
     int64_t regsPerThread = pact::PactDecisionConstants::kUnknownRegsPerThread;
     if (auto attr = mod->getAttrOfType<IntegerAttr>("pact.hw.regs_per_thread"))
       if (attr.getInt() > 0)

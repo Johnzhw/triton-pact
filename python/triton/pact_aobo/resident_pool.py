@@ -90,6 +90,29 @@ class ResidentPool:
             return list(self._geo)
 
     # ---- pool management -------------------------------------------------
+    def _registry_domain(self) -> tuple:
+        import os
+        return (os.environ.get("PACT_MODEL_TAG") or "default",
+                "|".join(str(x) for x in _geo_key(self.kwargs)))
+
+    def _register_variant(self, name: str, extra_env=None) -> None:
+        """V16-T3: route the addition through the VariantRegistry; reap
+        LRU-evicted handles from every geometry EXCEPT a geometry's own
+        active name (that one is swapped out before a later addition
+        could reap it)."""
+        from triton.pact.runtime.variant_registry import default_registry
+        reg = default_registry()
+        domain = self._registry_domain()
+        key = reg.variant_key(name, extra_env or {})
+        for _ev_key, ev_meta in reg.register(domain, key, {"name": name}):
+            ev_name = (ev_meta or {}).get("name")
+            if not ev_name or ev_name == name:
+                continue
+            with self._lock:
+                for gk, sub in self._geo.items():
+                    if ev_name != sub.get("active"):
+                        sub["kernels"].pop(ev_name, None)
+
     def prewarm(self, variants: Dict[str, Dict[str, str]]) -> Dict[str, float]:
         """Compile the named variant set NOW (blocking; call in an idle
         window).  Returns per-variant wall-ms.  Existing names are no-ops."""
@@ -103,12 +126,20 @@ class ResidentPool:
                                     dict(extra_env))
             with self._lock:
                 self._geo[self._cur_key]["kernels"][name] = k
+            try:
+                self._register_variant(name, extra_env)
+            except Exception:
+                pass
             spent[name] = (time.monotonic() - t0) * 1000.0
         return spent
 
     def add_kernel(self, name: str, kernel) -> None:
         with self._lock:
             self._geo[self._cur_key]["kernels"].setdefault(name, kernel)
+        try:
+            self._register_variant(name)
+        except Exception:
+            pass
 
     def __contains__(self, name: str) -> bool:
         with self._lock:

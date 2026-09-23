@@ -30,6 +30,19 @@ class InferenceSession:
         self.done_buckets = set()
         self.in_flight = False
         self.launch_count = 0
+        # V16-T6 L1 trigger (PROTON_SURVEY_V16 §4): cuda-event EMA
+        # deviation re-arms an L0-done bucket.  OFF unless
+        # PACT_TRIGGER_L1=1; tau/k/cooldown tunable.  The EMA itself has
+        # been computed service-side since v15 (replica_median_us_ema,
+        # add-only, unconsumed) -- this is its first consumer.
+        self._l1_enabled = os.environ.get("PACT_TRIGGER_L1") == "1"
+        self._l1_tau = float(os.environ.get("PACT_TRIGGER_L1_TAU") or 0.20)
+        self._l1_k = int(os.environ.get("PACT_TRIGGER_L1_K") or 3)
+        self._l1_cooldown = float(
+            os.environ.get("PACT_TRIGGER_L1_COOLDOWN") or 30.0)
+        self._ema_baseline: Dict[str, float] = {}
+        self._l1_streak = 0
+        self._l1_last_s = 0.0
         # V12-P1 (PACT_ASYNC_PGO=1): async frame state — a single daemon
         # background worker owns the decide/compile/measure cycle; the swap
         # is consumed at a launch boundary.  All-zero until the env is set.
@@ -65,13 +78,51 @@ class InferenceSession:
                                    current_config=current_config,
                                    geometry=geometry)
 
+    def _l1_observe(self, resp: Optional[Dict]) -> None:
+        """Track the service-reported replica EMA: first settled value per
+        bucket becomes the baseline; consecutive over-tau deviations build
+        the streak that later re-arms the bucket."""
+        if not self._l1_enabled or not isinstance(resp, dict):
+            return
+        facts = (resp.get("facts") or {}) if "facts" in resp else \
+            ((resp.get("service") or {}).get("facts") or {})
+        ema = facts.get("replica_median_us_ema")
+        if not isinstance(ema, (int, float)) or ema <= 0:
+            return
+        key = f"{self.prev_bucket}"
+        base = self._ema_baseline.get(key)
+        if base is None:
+            self._ema_baseline[key] = float(ema)
+            self._l1_streak = 0
+            return
+        if abs(ema - base) / base > self._l1_tau:
+            self._l1_streak += 1
+        else:
+            self._l1_streak = 0
+            # slow baseline drift-in when healthy (ema of emas, coarse)
+            self._ema_baseline[key] = 0.7 * base + 0.3 * float(ema)
+
+    def _l1_ready(self) -> bool:
+        """Streak >= k AND cooldown elapsed since the last L1 re-arm."""
+        if not self._l1_enabled or self._l1_streak < self._l1_k:
+            return False
+        now = time.monotonic()
+        if now - self._l1_last_s < self._l1_cooldown:
+            return False
+        self._l1_last_s = now
+        self._l1_streak = 0     # re-arm consumes the streak
+        return True
+
     def maybe_request(self, batch: int, seq_len: int,
                       current_config: Optional[Dict] = None,
                       geometry: Optional[Dict] = None) -> Optional[Dict]:
         fire, bucket = should_trigger(self.prev_bucket, batch, seq_len)
+        l1 = False
         if bucket in self.done_buckets:
-            return None
-        if not fire or self.in_flight:
+            l1 = self._l1_ready()   # L1 re-arm of an L0-done bucket
+            if not l1:
+                return None
+        if not (fire or l1) or self.in_flight:
             return None
         self.in_flight = True
         n_regs = 0
@@ -95,6 +146,7 @@ class InferenceSession:
         }
         resp = self.client.try_request(msg, timeout=120.0)
         self.in_flight = False
+        self._l1_observe(resp)
         if resp is None or resp.get("type") != "kernel_ready":
             return resp
         self.prev_bucket = bucket
@@ -258,9 +310,12 @@ class InferenceSession:
         While a submitted cycle is unconsumed, further triggers are skipped
         (bucket dedup still applies once the cycle lands)."""
         fire, bucket = should_trigger(self.prev_bucket, batch, seq_len)
+        l1 = False
         if bucket in self.done_buckets:
-            return None
-        if not fire or self.in_flight:
+            l1 = self._l1_ready()   # V16-T6 L1 re-arm
+            if not l1:
+                return None
+        if not (fire or l1) or self.in_flight:
             return None
         self.in_flight = True
         fut = self._submit_bg(
@@ -303,6 +358,7 @@ class InferenceSession:
                 "current_config": cfg,
             }
             resp = self.client.try_request(msg, timeout=120.0)
+            self._l1_observe(resp)
             if resp is None or resp.get("type") != "kernel_ready":
                 return {"kind": "no_kernel",
                         "resp_type": (resp or {}).get("type", "none")}

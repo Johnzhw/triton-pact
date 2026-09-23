@@ -206,10 +206,11 @@ class InferenceSession:
             return None
 
     def _gs_offer(self, kernel, variant) -> bool:
-        """Prepared-module regime (V13 Phase0): the whole variant
-        vocabulary was compiled and loaded into the single module at the
-        first forward (graph_service.prepare), so "offering" degenerates
-        to a readiness check on the module."""
+        """V13 Phase0 (full-vocab era): offering degenerated to a readiness
+        check.  V16-T4 lazy vocab: the misses are real now -- compile +
+        load the variant on demand as its own single-entry cubin
+        (graph_service.offer; ms..s, we run on background frames only)
+        and report readiness once loaded."""
         svc = self._gs()
         if svc is None or kernel is None or not variant:
             return False
@@ -219,6 +220,8 @@ class InferenceSession:
             name = getattr(self, "_gs_jit_name", None) or \
                 str(kernel.metadata.name)
             ok = svc.has_variant(name, v)
+            if not ok and hasattr(svc, "offer"):
+                ok = svc.offer(name, v)
             if ok:
                 self._gs_jit_name = name
             return ok

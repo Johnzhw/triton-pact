@@ -1062,7 +1062,8 @@ struct AsyncCopyGlobalToLocalOpConversion
         auto cpSizeVal = 4;
         CacheModifier mod = CacheModifier::CA;
         PTXBuilder ptxBuilder;
-        auto &copyAsyncOp = *ptxBuilder.create<PTXCpAsyncLoadInstr>(mod);
+        auto &copyAsyncOp = *ptxBuilder.create<PTXCpAsyncLoadInstr>(
+            mod, op.getEvict());
         auto *dstOp = ptxBuilder.newAddrOperand(shmemAddr, "r");
         auto *srcOp = ptxBuilder.newAddrOperand(srcElem, "l");
         auto *copySz = ptxBuilder.newConstantOperand(cpSizeVal);
@@ -1089,7 +1090,8 @@ struct AsyncCopyGlobalToLocalOpConversion
 
       PTXBuilder ptxBuilder;
       auto &copyAsyncOp =
-          *ptxBuilder.create<PTXCpAsyncLoadInstr>(srcCacheModifier);
+          *ptxBuilder.create<PTXCpAsyncLoadInstr>(srcCacheModifier,
+                                                op.getEvict());
       auto *dstOperand = ptxBuilder.newAddrOperand(shmemAddr, "r");
       auto *srcOperand = ptxBuilder.newAddrOperand(srcElem, "l");
       auto *copySize = ptxBuilder.newConstantOperand(nBytes);

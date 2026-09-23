@@ -27,11 +27,20 @@ class _InitParams(ctypes.Structure):
 
 
 class _CounterAvailParams(ctypes.Structure):
+    # Field order MUST mirror CUpti_Profiler_GetCounterAvailability_Params
+    # (cupti_profiler_target.h): structSize, pPriv, ctx,
+    # counterAvailabilityImageSize, pCounterAvailabilityImage -- size
+    # BEFORE image.  V16-T0 (2026-09-23): this struct had the last two
+    # fields swapped; both layouts are 40 bytes so CUPTI accepted the
+    # structSize, but shot-1 wrote the real size at offset 24 while we
+    # read offset 32 -> image_size was ALWAYS 0.  The V15 P-b verdict
+    # "counter path unreachable on WSL2" was this bug, not the platform
+    # (a standalone C++ two-shot on the same host returns 9184 bytes).
     _fields_ = [("structSize", ctypes.c_size_t),
                 ("pPriv", ctypes.c_void_p),
                 ("ctx", ctypes.c_void_p),
-                ("pCounterAvailabilityImage", ctypes.c_void_p),
-                ("counterAvailabilityImageSize", ctypes.c_size_t)]
+                ("counterAvailabilityImageSize", ctypes.c_size_t),
+                ("pCounterAvailabilityImage", ctypes.c_void_p)]
 
 
 def _ensure_cuda_context():
@@ -105,7 +114,7 @@ def probe_cupti(lib_path: Optional[str] = None) -> Dict:
     # Two-shot availability query.  ctx=NULL is accepted on some toolchains
     # as "current context"; a non-zero rc is still just unavailable.
     cap = _CounterAvailParams(ctypes.sizeof(_CounterAvailParams), None, None,
-                              None, 0)
+                              0, None)
     avail.restype = ctypes.c_int
     rc = avail(ctypes.byref(cap))
     return {
@@ -134,7 +143,9 @@ def counter_availability_image(lib_path: Optional[str] = None) -> Dict:
     """P-b spike step 1: fetch the counter-availability image (two-shot
     per the CUPTI docs: NULL buffer first to learn the size, then a real
     buffer), with the REAL current context (ctx=NULL gave rc=3 on this
-    stack).  Returns the image bytes + honest rc trail; never raises.
+    stack).  V16-T0 fixed the swapped size/image field order that made
+    shot-1 report image_size=0 on a healthy stack.  Returns the image
+    bytes + honest rc trail; never raises.
     """
     path = lib_path or _find_libcupti()
     if not path:
@@ -157,10 +168,11 @@ def counter_availability_image(lib_path: Optional[str] = None) -> Dict:
         return out
     ctx = _current_context()
     out["ctx"] = hex(ctx) if ctx else None
-    # shot 1: NULL image -> size
+    # shot 1: NULL image -> size (V16-T0: size field precedes the image
+    # pointer in the real struct; the old swapped layout read a stale 0)
     cap = _CounterAvailParams(ctypes.sizeof(_CounterAvailParams), None,
                               ctypes.c_void_p(ctx) if ctx else None,
-                              None, 0)
+                              0, None)
     avail.restype = ctypes.c_int
     rc1 = avail(ctypes.byref(cap))
     size = int(cap.counterAvailabilityImageSize or 0)
@@ -172,7 +184,7 @@ def counter_availability_image(lib_path: Optional[str] = None) -> Dict:
     buf = ctypes.create_string_buffer(size)
     cap2 = _CounterAvailParams(ctypes.sizeof(_CounterAvailParams), None,
                                ctypes.c_void_p(ctx) if ctx else None,
-                               ctypes.cast(buf, ctypes.c_void_p), size)
+                               size, ctypes.cast(buf, ctypes.c_void_p))
     rc2 = avail(ctypes.byref(cap2))
     out["shot2_rc"] = rc2
     if rc2 != 0:

@@ -68,6 +68,71 @@ def _family_env(family: str) -> tuple:
 
 _WARPS_DOMAIN = (1, 2, 4, 8)
 
+# ---- V16-T7a: runtime-truth-informed family adjustment ------------------
+# The four CUPTI permilles (V16-T0 truths, see cupti_collector) describe
+# the CURRENT kernel -- measured on the baseline replica inside the
+# trigger cycle -- and steer the NEXT variant choice.  This is the
+# closed feedback loop the paper narrative promises: hardware counters
+# -> decider -> parametric compile.  Thresholds anchored on V16-T0
+# measured points (memory-bound streaming/decode shapes: warp 700-840,
+# stall 2300-2900, sm 2-18, l2 380-500; resident-friendly matmuls:
+# warp 166, stall 2, sm 109, l2 893).  PACT_COUNTER_DECIDE=0 disables.
+_COUNTER_THRESH = {
+    "stall_heavy": 1500,     # permille of per-issue warps-stalled ratio x10
+    "l2_missy": 400,         # l2 sector hit rate permille below this = cold
+    "warp_rich": 800,        # warps resident but (see sm_starved) issue-poor
+    "sm_starved": 150,       # sm throughput permille
+    "stall_light": 300,
+    "l2_resident": 700,
+}
+
+
+def counter_adjust(family: str, facts: Dict[str, Any]) -> Dict[str, Any]:
+    """Returns {'family': adjusted, 'counter_adjusted': {...}|None}.
+    Conservative: only ever moves theory/vanilla (the defaults); a fit
+    table's explicit winner is never overridden.  Missing counters ->
+    no-op."""
+    def _p(k):
+        v = facts.get(k)
+        try:
+            return int(v) if v is not None else None
+        except (TypeError, ValueError):
+            return None
+
+    stall = _p("stall_memory_permille")
+    warp = _p("active_warp_ratio_permille")
+    sm = _p("sm_efficiency_permille")
+    l2 = _p("l2_hit_permille")
+    if stall is None or l2 is None:
+        return {"family": family, "counter_adjusted": None}
+    th = _COUNTER_THRESH
+    if family in ("theory", "vanilla"):
+        if stall >= th["stall_heavy"] and l2 <= th["l2_missy"]:
+            # long-scoreboard-bound with a cold L2: deepen the pipeline
+            # range and let P6's residency gate pick the depth
+            return {"family": "cold",
+                    "counter_adjusted": {"from": family, "to": "cold",
+                                         "reason": f"stall={stall} "
+                                         f"l2={l2} -> deepen"}}
+        if warp is not None and sm is not None and \
+                warp >= th["warp_rich"] and sm <= th["sm_starved"]:
+            # warps resident but issue-starved: try fewer warps per CTA
+            return {"family": "occ",
+                    "counter_adjusted": {"from": family, "to": "occ",
+                                         "reason": f"warp={warp} rich "
+                                         f"sm={sm} starved -> fewer warps"}}
+        if stall <= th["stall_light"] and l2 >= th["l2_resident"]:
+            # latency regime, cache-resident: shallow pipeline wins
+            return {"family": "lat",
+                    "counter_adjusted": {"from": family, "to": "lat",
+                                         "reason": f"stall={stall} light "
+                                         f"l2={l2} resident -> shallow"}}
+    return {"family": family, "counter_adjusted": None}
+
+
+def _counter_gate_on() -> bool:
+    return os.environ.get("PACT_COUNTER_DECIDE", "1") != "0"
+
 
 def normalize_preset(spec) -> Dict[str, Any]:
     """V16-T3 generative-preset entry: a family NAME (compat) or a
@@ -146,6 +211,10 @@ def decide(facts: Dict[str, Any], batch: int, seq_len: int,
         facts.get("stall_memory_permille"),
         head_dim=head_dim, gqa=gqa,
     )
+    counter_note = None
+    if _counter_gate_on():
+        adj = counter_adjust(family, facts)
+        family, counter_note = adj["family"], adj["counter_adjusted"]
     preset = normalize_preset(family)
     extra_env: Dict[str, str] = preset["extra_env"]
     options_override: Dict[str, Any] = preset["options_override"]
@@ -155,6 +224,7 @@ def decide(facts: Dict[str, Any], batch: int, seq_len: int,
             "extra_env": extra_env,
             "options_override": options_override,
             "hints": {},
+            "counter_adjusted": counter_note,
         }
     if kv_heads and int(kv_heads) > 0:
         facts = {**facts, "kv_heads": int(kv_heads)}
@@ -172,4 +242,5 @@ def decide(facts: Dict[str, Any], batch: int, seq_len: int,
         "extra_env": extra_env,
         "options_override": options_override,
         "hints": hints,
+        "counter_adjusted": counter_note,
     }

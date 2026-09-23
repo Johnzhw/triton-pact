@@ -113,6 +113,7 @@ class CompilerService:
             },
             "extra_env": decision["extra_env"],
             "options_override": decision["options_override"],
+            "counter_adjusted": decision.get("counter_adjusted"),
             "facts": {k: v for k, v in facts.items() if k != "lib"},
             "profile_time_ms": profile_ms,
             "compile_time_ms": compile_ms,

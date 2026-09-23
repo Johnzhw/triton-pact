@@ -627,6 +627,20 @@ class GraphKernelService:
                 self._active[jit_name] = variant
             else:
                 self._pending[jit_name] = variant  # re-try next boundary
+        if applied:
+            # V16-T5 L1: post-swap structural audit (source-graph mirror
+            # read-back; E3 path only, intra-module is exec-opaque)
+            try:
+                from triton.pact.runtime.graph_swap_validator import \
+                    audit_after_apply
+                audit = audit_after_apply(self, jit_name, variant)
+                with _LOCK:
+                    self.state["last_audit"] = {
+                        "variant": variant, "ok": audit.get("ok"),
+                        "nodes": audit.get("audited_nodes"),
+                        "note": audit.get("note")}
+            except Exception as e:  # noqa: BLE001
+                self._err("audit", e)
         self._publish()
         return applied > 0
 

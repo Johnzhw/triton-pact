@@ -24,7 +24,7 @@ VARIANTS: Dict[str, Dict[str, str]] = {
     "lat": {"PACT_ENABLE": "1", "PACT_OVERRIDE_STAGES": "2"},
     "deep": {"PACT_ENABLE": "1", "PACT_OVERRIDE_STAGES": "5"},
     # V12-Q1: coverage for shapes where the original families regress
-    "short": {"PACT_ENABLE": "1", "PACT_OVERRIDE_STAGES": "1"},
+    "short": {"PACT_ENABLE": "1", "PACT_OVERRIDE_STAGES": "2"},  # V16-T3: pin 1 rejected by P6 [2,8] (fake config) -- wiki closure audit find
     "w1": {"PACT_ENABLE": "1", "PACT_OVERRIDE_WARPS": "1"},
     # V14-B (S1): unlock the deep-pipeline range; P6's L2-residency gate
     # decides per shape (hot shapes compile identically to theory).

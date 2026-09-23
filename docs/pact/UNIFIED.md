@@ -51,5 +51,12 @@ hold-out accuracy gate passes; lookup then returns `theory`.
 - Dual-process demo: S=256→4096 swaps, launch loop not blocked.
 - CUPTI: `cuptiProfilerInitialize rc=999` → unavailable, no fabricated
   occupancy (`results/cupti_probe_v5.json`).
+  【V16-T0 更正 2026-09-23】rc=999 根因=无 CUDA context（P-a 已修）；
+  v5"SM86 v4 rc=38 Metric API 退役"与 v15 P-b"WSL2 计数器不可达
+  （image size=0）"均为误归因——size=0 是 `_CounterAvailParams` 末两
+  字段（image/size）写反所致（两种布局同 40 字节，rc=0 不报错，读错
+  偏移恒 0）。修复后同机 availability image=9184B，且 host-eval 会话
+  四指标真值可达（`suite/results/v16/cupti_probe_v16.json`、
+  `cupti_counters_v16.json`）。
 - NVIDIA SM80/86/89/90 + P11 4→2, AMD gfx942 hsaco, gfx936
   ConvertWarpPipeline: `results/verification_dynamic_v5.json`.

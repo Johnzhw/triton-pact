@@ -1038,7 +1038,7 @@ struct AsyncCopyGlobalToLocalOpConversion
     Value threadPred = ttg::emitRedundantThreadPredicate(freeVarMasks, rewriter,
                                                          loc, targetInfo);
 
-    auto emitCpAsync = [&b, threadPred, ptrTy, hasMask = bool(llMask)](
+    auto emitCpAsync = [&b, threadPred, ptrTy, &op, hasMask = bool(llMask)](
                            RewriterBase &rewriter, Location loc,
                            ArrayRef<Value> vals, Value shmemAddr, int startIdx,
                            VectorType vecTy,

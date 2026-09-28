@@ -87,7 +87,9 @@ _COUNTER_THRESH = {
 }
 
 
-def counter_adjust(family: str, facts: Dict[str, Any]) -> Dict[str, Any]:
+def counter_adjust(family: str, facts: Dict[str, Any],
+                     thresholds: Optional[Dict[str, int]] = None
+                     ) -> Dict[str, Any]:
     """Returns {'family': adjusted, 'counter_adjusted': {...}|None}.
     Conservative: only ever moves theory/vanilla (the defaults); a fit
     table's explicit winner is never overridden.  Missing counters ->
@@ -105,7 +107,11 @@ def counter_adjust(family: str, facts: Dict[str, Any]) -> Dict[str, Any]:
     l2 = _p("l2_hit_permille")
     if stall is None or l2 is None:
         return {"family": family, "counter_adjusted": None}
-    th = _COUNTER_THRESH
+    # V17 S1-2: optional threshold override (calibration grid); the
+    # default path is bit-for-bit the frozen constants
+    th = dict(_COUNTER_THRESH)
+    if thresholds:
+        th.update(thresholds)
     if family in ("theory", "vanilla"):
         if stall >= th["stall_heavy"] and l2 <= th["l2_missy"]:
             # long-scoreboard-bound with a cold L2: deepen the pipeline

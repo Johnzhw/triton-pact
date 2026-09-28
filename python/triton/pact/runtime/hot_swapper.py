@@ -165,6 +165,10 @@ class HotSwapper:
         from triton.pact.runtime.variant_registry import default_registry
         if not hasattr(self, "_pool"):
             self._pool: Dict[str, Any] = {}
+        if not hasattr(self, "evict_protected"):
+            # V17 S2-4 B2: names the LRU wanted to evict but a bound
+            # graph still runs (rollback+skip, never crash)
+            self.evict_protected: list = []
         reg = default_registry()
         domain = (self._registry_model_tag(), self._registry_geo_key())
         spent = {}
@@ -185,10 +189,48 @@ class HotSwapper:
             for _ev_key, ev_meta in reg.register(domain, key, {"name": name}):
                 ev_name = (ev_meta or {}).get("name")
                 if ev_name and ev_name in self._pool and ev_name != name:
+                    if self._graph_runs_family(ev_name):
+                        # V17 S2-4 B2: a bound graph still points at this
+                        # family -- force the graphs back to __base and
+                        # SKIP this eviction (keep the handle resident;
+                        # recorded, never crashes)
+                        self._rollback_bound_graph()
+                        if ev_name not in self.evict_protected:
+                            self.evict_protected.append(ev_name)
+                        reg.hit(domain, _ev_key)
+                        continue
                     del self._pool[ev_name]
             self._pool[name] = k
             spent[name] = (time.monotonic() - t0) * 1000.0
         return spent
+
+    def _graph_runs_family(self, family: str) -> bool:
+        """V17 S2-4 B2: True when any bound CUDA graph currently RUNS this
+        family (the service is the single owner of that state; an unarmed
+        process has an empty active map, which answers False on its own)."""
+        try:
+            from triton.pact.runtime.graph_service import (
+                get_service, FAMILY_ALIAS)
+            svc = get_service()
+            jit = getattr(self.jit_fn, "__name__", None) \
+                or self.jit_fn.fn.__name__
+            v = FAMILY_ALIAS.get(family, family)
+            return any(svc._jits.get(g) == jit and gv == v
+                       for g, gv in svc._graph_active.items())
+        except Exception:
+            return False
+
+    def _rollback_bound_graph(self) -> None:
+        """V17 S2-4 B2: point every bound graph of this jit back at __base
+        (the PTX-identical capture baseline) before protecting a handle."""
+        try:
+            from triton.pact.runtime.graph_service import get_service
+            svc = get_service()
+            jit = getattr(self.jit_fn, "__name__", None) \
+                or self.jit_fn.fn.__name__
+            svc.rollback(jit)
+        except Exception:
+            pass
 
     def _registry_model_tag(self) -> str:
         import os

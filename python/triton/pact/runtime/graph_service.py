@@ -460,6 +460,14 @@ class GraphKernelService:
         t0 = time.monotonic()
         try:
             cu = self._driver()
+            # a caller on a fresh background thread has NO current CUDA
+            # context -- driver-API cuModuleLoadDataEx below would fail
+            # with CUDA_ERROR_INVALID_CONTEXT (201); bind the primary
+            # context with one runtime-API op first (V17 坑 29, seen in
+            # both the A0 EngineCore offer thread and the journey demos'
+            # async cycles)
+            import torch
+            torch.zeros(1, device="cuda")
             from triton.pact.compiler.explicit_compiler import compile_explicit
             k, _ = compile_explicit(jit_fn, args, kwargs, dict(env))
             blob = self._merge_ptxas(cu, {variant: k}, jit_name)

@@ -26,6 +26,11 @@ from typing import Any, Dict, Optional, Tuple
 
 from triton.pact.decider.family_table import FamilyTable
 
+# V17 S1-3 ②: every previously-silent exception branch counts here and
+# keeps the last message; the JSON sinks surface it across processes.
+_SWALLOWED: Dict[str, Any] = {"predict_errors": 0, "load_errors": 0,
+                              "schema_refused": 0, "last_error": None}
+
 FEATURE_ORDER = ("logS", "logD", "logP", "B")
 
 
@@ -57,6 +62,16 @@ class LearnedPolicy:
         self.k = int(data.get("k", 3))
         self.max_dist = data.get("max_dist")
         self.default_pick = data.get("default", "theory")
+        # V17 S1-3 ①: explicit feature-schema versioning replaces the
+        # silent zip() truncation of _predict_knn.  4 = pre-T6 models,
+        # 6 = V16-T6 (adds GQA + log2 KV working-set).  A missing field
+        # is INFERRED from the prototype width and counted; with
+        # PACT_STRICT_SCHEMA=1 a mismatch refuses to load instead.
+        self.feature_schema_version = data.get("feature_schema_version")
+        if self.feature_schema_version is None and self.prototypes:
+            w = len(self.prototypes[0].get("feat") or [])
+            self.feature_schema_version = w
+        self.schema_padded = 0   # count of padded predictions (visibility)
 
     @classmethod
     def load(cls, path: Optional[str] = None) -> Optional["LearnedPolicy"]:
@@ -76,10 +91,18 @@ class LearnedPolicy:
             return cached[1]
         try:
             obj = cls(json.loads(Path(path).read_text()))
+            # V17 S1-3 ①: strict mode refuses schema-mismatched models
+            # outright instead of padding at predict time
+            if os.environ.get("PACT_STRICT_SCHEMA") == "1" and \
+                    obj.feature_schema_version not in (None, 4, 6):
+                _SWALLOWED["schema_refused"] += 1
+                return None
             if key is not None:
                 cls._cache[path] = (key, obj)
             return obj
-        except Exception:
+        except Exception as e:  # noqa: BLE001 - counted, never silent
+            _SWALLOWED["load_errors"] += 1
+            _SWALLOWED["last_error"] = str(e)[:120]
             return None
 
     def _predict_tree(self, x):
@@ -96,9 +119,26 @@ class LearnedPolicy:
 
     def _predict_knn(self, x):
         import statistics
+        # V17 S1-3 ①: EXPLICIT pad instead of zip() truncation.  A model
+        # with fewer features than the runtime vector pads its prototype
+        # columns with the per-column MEAN over prototypes (a neutral
+        # centre for the L1 distance), and every padded prediction is
+        # counted; more features than runtime is a hard mismatch ->
+        # default pick (counted).  Silent dimension dropping is gone.
+        want = len(x)
+        feats = [p["feat"] for p in self.prototypes]
+        width = len(feats[0]) if feats else want
+        if width < want:
+            cols = list(zip(*feats))
+            means = [sum(c) / len(c) for c in cols]
+            feats = [list(f) + means[width:] for f in feats]
+            self.schema_padded += 1
+        elif width > want:
+            self.schema_padded += 1
+            return self.default_pick, 1.0
         ds = []
-        for p in self.prototypes:
-            d = sum(abs(a - b) for a, b in zip(x, p["feat"]))
+        for p, f in zip(self.prototypes, feats):
+            d = sum(abs(a - b) for a, b in zip(x, f))
             ds.append((d, p.get("gains", {})))
         ds.sort(key=lambda t: t[0])
         # V9: outside the offline-measured neighbourhood, fall back to the
@@ -182,7 +222,8 @@ def decide(facts: Dict[str, Any], batch: int, seq_len: int,
                 out["family"] = variant
                 out["extra_env"] = dict(env)
                 return out
-        except Exception:
-            pass
+        except Exception as e:  # noqa: BLE001 - counted, never silent
+            _SWALLOWED["predict_errors"] += 1
+            _SWALLOWED["last_error"] = str(e)[:120]
     return table_decide(facts, batch, seq_len, table=table, hints_dir=hints_dir,
                         head_dim=head_dim, gqa=gqa, kv_heads=kv_heads)

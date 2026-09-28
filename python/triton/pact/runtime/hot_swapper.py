@@ -91,17 +91,25 @@ class HotSwapper:
             return self.active
 
     def _measure(self, kernel, iters: int) -> float:
+        """V17 S0-1 ②: event-pair timing with ZERO device-level sync.
+        Per-iteration cuda events are recorded back-to-back and read only
+        after event.synchronize() on the LAST event -- a device-wide
+        torch.cuda.synchronize() here used to stall every other stream
+        (the decode stream included) once per measured iteration."""
         import torch
-        samples = []
-        self.launch(kernel)
-        torch.cuda.synchronize()
+        self.launch(kernel)          # settle, ordered before the first start
+        pairs = []
         for _ in range(iters):
             start = torch.cuda.Event(enable_timing=True)
             end = torch.cuda.Event(enable_timing=True)
             start.record()
             self.launch(kernel)
             end.record()
-            torch.cuda.synchronize()
+            pairs.append((start, end))
+        samples = []
+        last_end = pairs[-1][1]
+        last_end.synchronize()       # wait for the batch, not the device
+        for start, end in pairs:
             samples.append(start.elapsed_time(end) * 1000.0)
         return statistics.median(samples)
 

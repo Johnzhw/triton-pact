@@ -736,6 +736,15 @@ def counter_session(launch_fn: Callable,
             return {"ok": False, "reason": f"symbol missing: {sym}"}
         getattr(cupti, sym).restype = ctypes.c_int
     trail: Dict[str, int] = {}
+    # V17 S2-1: full phase-cost breakdown (ms since session entry); rides
+    # in trail so every return path (ok and fail) carries it
+    import time as _t
+    _ph_t0 = _t.monotonic()
+
+    def _ph(name: str) -> None:
+        trail.setdefault("phase_ms", {})[name] = round(
+            (_t.monotonic() - _ph_t0) * 1000.0, 2)
+
     names = list(metric_names or COUNTER_METRICS.values())
 
     # context FIRST (P-a lesson): initialize without an active context
@@ -745,6 +754,7 @@ def counter_session(launch_fn: Callable,
     trail["init_rc"] = cupti.cuptiProfilerInitialize(ctypes.byref(ip))
     if trail["init_rc"] != 0:
         return {"ok": False, "reason": "initialize", "trail": trail}
+    _ph("init")
 
     ctx = _current_context()
     avail = _availability_bytes(path, cupti)
@@ -776,6 +786,7 @@ def counter_session(launch_fn: Callable,
     if rc != 0:
         return {"ok": False, "reason": "host initialize", "trail": trail,
                 "chip_used": bool(chip)}
+    _ph("host_init")
     host_obj = hp.pHostObject
 
     # metric support: try all at once; on rejection probe one-by-one on
@@ -821,6 +832,7 @@ def counter_session(launch_fn: Callable,
         if rc4 != 0:
             return {"ok": False, "reason": f"add subset rc={rc4}", "trail": trail}
         names = supported
+    _ph("add_metrics")
 
     sp = _HostConfigImageSizeParams(ctypes.sizeof(_HostConfigImageSizeParams),
                                     None, host_obj, 0)
@@ -836,11 +848,13 @@ def counter_session(launch_fn: Callable,
         ctypes.byref(gp))
     if trail["config_image_rc"] != 0:
         return {"ok": False, "reason": "config image", "trail": trail}
+    _ph("config_image")
 
     # the prefix NVPW builds from the SAME metric set the config uses
     prefix = _nvperf_prefix(avail_ptr, names, trail)
     if prefix is None:
         return {"ok": False, "reason": "counter data prefix (NVPW)", "trail": trail}
+    _ph("nvperf_prefix")
     prefix_arr = (ctypes.c_uint8 * len(prefix)).from_buffer_copy(prefix)
     prefix_ptr = ctypes.cast(prefix_arr, ctypes.POINTER(ctypes.c_uint8))
 
@@ -882,6 +896,7 @@ def counter_session(launch_fn: Callable,
         ctypes.byref(sip))
     if trail["scratch_init_rc"] != 0:
         return {"ok": False, "reason": "scratch init", "trail": trail}
+    _ph("counter_data_init")
 
     def fail(reason):
         dp = _HostDeinitParams(ctypes.sizeof(_HostDeinitParams), None, host_obj)
@@ -903,11 +918,13 @@ def counter_session(launch_fn: Callable,
     trail["begin_session_rc"] = cupti.cuptiProfilerBeginSession(ctypes.byref(bsp))
     if trail["begin_session_rc"] != 0:
         return fail("begin session")
+    _ph("begin_session")
     scp = _SetConfigParams(_SetConfigParams_STRUCT_SIZE, None,
                            _ctx_arg,
                            ctypes.cast(cfg_buf, ctypes.POINTER(ctypes.c_uint8)),
                            sp.configImageSize, 1, 1, 0, 0)
     trail["set_config_rc"] = cupti.cuptiProfilerSetConfig(ctypes.byref(scp))
+    _ph("set_config")
     if trail["set_config_rc"] != 0:
         cupti.cuptiProfilerEndSession(ctypes.byref(
             _CtxParams(ctypes.sizeof(_CtxParams), None,
@@ -973,6 +990,7 @@ def counter_session(launch_fn: Callable,
             _CtxParams(ctypes.sizeof(_CtxParams), None,
                        _ctx_arg)))
         return fail(f"launch_fn raised: {e}")
+    _ph("collect_passes")
     dp2 = _CtxParams(ctypes.sizeof(_CtxParams), None,
                      _ctx_arg)
     trail["disable_rc"] = cupti.cuptiProfilerDisableProfiling(ctypes.byref(dp2))
@@ -980,6 +998,7 @@ def counter_session(launch_fn: Callable,
                       _ctx_arg, 0, 0)
     trail["flush_rc"] = cupti.cuptiProfilerFlushCounterData(ctypes.byref(fp))
     trail["ranges_dropped"] = int(fp.numRangesDropped)
+    _ph("flush")
     cupti.cuptiProfilerUnsetConfig(ctypes.byref(
         _CtxParams(ctypes.sizeof(_CtxParams), None,
                    _ctx_arg)))
@@ -987,6 +1006,7 @@ def counter_session(launch_fn: Callable,
         _CtxParams(ctypes.sizeof(_CtxParams), None,
                    _ctx_arg)))
 
+    _ph("end_session")
     values = (ctypes.c_double * len(names))()
     name_arr = (ctypes.c_char_p * len(names))(*[n.encode() for n in names])
     metrics = {}
@@ -1026,8 +1046,10 @@ def counter_session(launch_fn: Callable,
         if rc != 0:
             trail["evaluate_rc"] = rc
             break
+    _ph("evaluate")
     dp3 = _HostDeinitParams(ctypes.sizeof(_HostDeinitParams), None, host_obj)
     cupti.cuptiProfilerHostDeinitialize(ctypes.byref(dp3))
+    _ph("host_deinit")
     if trail["evaluate_rc"] != 0:
         return {"ok": False, "reason": "evaluate", "trail": trail,
                 "metric_names": names}

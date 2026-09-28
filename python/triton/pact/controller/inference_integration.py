@@ -43,6 +43,13 @@ class InferenceSession:
         self._ema_baseline: Dict[str, float] = {}
         self._l1_streak = 0
         self._l1_last_s = 0.0
+        # V17 S0-1 ①: maybe_request runs on BOTH the inline decode thread
+        # and the async background worker, so the L1 read-modify-write
+        # sequence races (streak double-count / baseline tear).  R2 §2.4
+        # allows single-writer OR lock; the lock keeps the v9 sync
+        # contract untouched (single-writer would have to own the
+        # maybe_request dispatch itself).
+        self._l1_lock = threading.Lock()
         # V12-P1 (PACT_ASYNC_PGO=1): async frame state — a single daemon
         # background worker owns the decide/compile/measure cycle; the swap
         # is consumed at a launch boundary.  All-zero until the env is set.
@@ -81,7 +88,8 @@ class InferenceSession:
     def _l1_observe(self, resp: Optional[Dict]) -> None:
         """Track the service-reported replica EMA: first settled value per
         bucket becomes the baseline; consecutive over-tau deviations build
-        the streak that later re-arms the bucket."""
+        the streak that later re-arms the bucket.  V17 S0-1: the whole
+        read-modify-write runs under _l1_lock (two caller threads)."""
         if not self._l1_enabled or not isinstance(resp, dict):
             return
         facts = (resp.get("facts") or {}) if "facts" in resp else \
@@ -89,29 +97,32 @@ class InferenceSession:
         ema = facts.get("replica_median_us_ema")
         if not isinstance(ema, (int, float)) or ema <= 0:
             return
-        key = f"{self.prev_bucket}"
-        base = self._ema_baseline.get(key)
-        if base is None:
-            self._ema_baseline[key] = float(ema)
-            self._l1_streak = 0
-            return
-        if abs(ema - base) / base > self._l1_tau:
-            self._l1_streak += 1
-        else:
-            self._l1_streak = 0
-            # slow baseline drift-in when healthy (ema of emas, coarse)
-            self._ema_baseline[key] = 0.7 * base + 0.3 * float(ema)
+        with self._l1_lock:
+            key = f"{self.prev_bucket}"
+            base = self._ema_baseline.get(key)
+            if base is None:
+                self._ema_baseline[key] = float(ema)
+                self._l1_streak = 0
+                return
+            if abs(ema - base) / base > self._l1_tau:
+                self._l1_streak += 1
+            else:
+                self._l1_streak = 0
+                # slow baseline drift-in when healthy (ema of emas)
+                self._ema_baseline[key] = 0.7 * base + 0.3 * float(ema)
 
     def _l1_ready(self) -> bool:
-        """Streak >= k AND cooldown elapsed since the last L1 re-arm."""
-        if not self._l1_enabled or self._l1_streak < self._l1_k:
-            return False
-        now = time.monotonic()
-        if now - self._l1_last_s < self._l1_cooldown:
-            return False
-        self._l1_last_s = now
-        self._l1_streak = 0     # re-arm consumes the streak
-        return True
+        """Streak >= k AND cooldown elapsed since the last L1 re-arm
+        (check-and-consume under _l1_lock)."""
+        with self._l1_lock:
+            if not self._l1_enabled or self._l1_streak < self._l1_k:
+                return False
+            now = time.monotonic()
+            if now - self._l1_last_s < self._l1_cooldown:
+                return False
+            self._l1_last_s = now
+            self._l1_streak = 0     # re-arm consumes the streak
+            return True
 
     def maybe_request(self, batch: int, seq_len: int,
                       current_config: Optional[Dict] = None,

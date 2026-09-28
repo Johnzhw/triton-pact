@@ -130,12 +130,46 @@ class GraphKernelService:
         self._boundary: Optional[Callable[[], None]] = None
         self._target_jit: Optional[str] = None
         self._skip: set = set()          # id(graph) that failed to bind
+        # V17 S3-2 ②: consecutive-apply backoff + give-up blacklist
+        self._fail_streak: Dict[Tuple[str, str], int] = {}
+        self._blacklist: set = set()     # (jit, variant) abandoned
+        # V17 S3-3 ①: func handles this service itself loaded (module
+        # membership test for bind/apply -- the substring name match let
+        # triton-loaded same-name handles through, the capture-fallback
+        # danger shape)
+        self._known_funcs: Dict[int, str] = {}
+        # V17 S3-2 D1: deterministic fault injection (PACT_FAULT_INJECT=1)
+        self._fi_on = os.environ.get("PACT_FAULT_INJECT") == "1"
+        self._fi_kinds = set(
+            (os.environ.get("PACT_FAULT_INJECT_KINDS")
+             or "setparams,execupdate").split(","))
+        try:
+            self._fi_every = max(
+                int(os.environ.get("PACT_FAULT_INJECT_EVERY") or 7), 1)
+        except ValueError:
+            self._fi_every = 7
+        self._fi_counts: Dict[str, int] = {}
         self.state: Dict[str, Any] = {
             "offers": 0, "loads": 0, "binds": 0, "nodes": 0,
             "retargets": 0, "rollbacks": 0, "last_recode_ms": None,
             "last_offer_ms": None, "active": None, "errors": [],
             "replay_calls": 0, "bound_graphs": 0, "skipped_graphs": 0,
+            "skipped_nodes": 0, "bind_rejected": 0,
+            "exec_update_failures": 0, "auto_rollbacks": 0,
+            "canaries": 0, "submit_rejects": 0, "blacklisted": [],
         }
+
+    def _fi(self, kind: str) -> bool:
+        """V17 S3-2 D1 hook: deterministic fault injection.  Every K-th
+        call of the given kind (setparams / execupdate) pretends a driver
+        failure (rc=1 / rc=700) so the failure branches are exercised on
+        the REAL service; PACT_FAULT_INJECT=1 gates the whole thing (the
+        default path never enters here beyond one bool check)."""
+        if not self._fi_on or kind not in self._fi_kinds:
+            return False
+        n = self._fi_counts.get(kind, 0) + 1
+        self._fi_counts[kind] = n
+        return n % self._fi_every == 0
 
     # ------------------------------------------------------------------
     def _driver(self):
@@ -231,6 +265,7 @@ class GraphKernelService:
                         "shared": int(k.metadata.shared),
                     }
                     self._kerns[(name, vname)] = k
+                    self._known_funcs[int(fn)] = f"{name}::{vname}"
                 self._jit_args[name] = (tuple(args), dict(kwargs),
                                         tuple(grid))
                 self._jit_fns[name] = jit_fn
@@ -389,6 +424,12 @@ class GraphKernelService:
         ctypes_vals += [ctypes.addressof(gs), ctypes.addressof(ps)]
         arr = (ctypes.c_void_p * len(ctypes_vals))(*ctypes_vals)
         GraphKernelService._ABI_KEEP.append((keep, gs, ps, arr))
+        # V17 S3-2 ④: bounded keep-alive (was an unbounded leak: every
+        # prepare/offer/materialize/canary call pinned its staging arrays
+        # forever).  Launches these backed are issued synchronously right
+        # after the pack, so retaining a generous tail is safe.
+        if len(GraphKernelService._ABI_KEEP) > 64:
+            del GraphKernelService._ABI_KEEP[:-64]
         return ctypes.addressof(arr)
 
     _ABI_KEEP: list = []
@@ -438,6 +479,7 @@ class GraphKernelService:
                     "cross": mod,      # non-None => separate module
                 }
                 self._kerns[(jit_name, variant)] = k
+                self._known_funcs[int(fn)] = f"{jit_name}::{variant}"
                 self.state["offers"] += 1
                 self.state["last_offer_ms"] = round(
                     (time.monotonic() - t0) * 1e3, 1)
@@ -466,6 +508,8 @@ class GraphKernelService:
         if int(err) != 0:
             raise RuntimeError(f"cudaGraphGetNodes {err}")
         found: List[_NodeBinding] = []
+        with _LOCK:
+            known = set(self._known_funcs)
         for i in range(int(num)):
             node = nodes[i]
             err, ntype = rt.cudaGraphNodeGetType(node)
@@ -482,6 +526,17 @@ class GraphKernelService:
             if err2 != cu.CUresult.CUDA_SUCCESS or not fname:
                 continue
             if jit_name not in fname.decode(errors="ignore"):
+                continue
+            # V17 S3-3 ①: a name match is NOT enough -- accept only
+            # handles this service itself loaded (module membership).  A
+            # name-matching function from triton's own loader (the
+            # capture-fallback shape, dynamic_bridge capture_launch
+            # returned False) is rejected and counted: retargeting it is
+            # the cross-module silent-corruption shape of v13.
+            if fhandle not in known:
+                with _LOCK:
+                    self.state["bind_rejected"] = \
+                        int(self.state["bind_rejected"] or 0) + 1
                 continue
             found.append(_NodeBinding(
                 node=cu_node,
@@ -524,6 +579,12 @@ class GraphKernelService:
         variant = FAMILY_ALIAS.get(variant, variant)
         if not self.has_variant(jit_name, variant):
             return False
+        if (jit_name, variant) in self._blacklist:
+            # V17 S3-2 ②: abandoned after 3 consecutive failed applies
+            with _LOCK:
+                self.state["submit_rejects"] = \
+                    int(self.state["submit_rejects"] or 0) + 1
+            return False
         with _LOCK:
             self._pending[jit_name] = variant
         return True
@@ -539,11 +600,11 @@ class GraphKernelService:
         cu = self._driver()
         with _LOCK:
             v = self._variants.get((jit_name, variant))
+            known = set(self._known_funcs)
         if v is None:
             self._err(f"apply({variant})", RuntimeError("variant not loaded"))
             return False
         t0 = time.monotonic()
-        applied = 0
         use_e3 = bool(v.get("cross"))
         if use_e3:
             from cuda.bindings import runtime as _rt
@@ -551,10 +612,24 @@ class GraphKernelService:
             items = [(gid, nodes) for gid, nodes in self._bindings.items()
                      if self._jits.get(gid) == jit_name and
                      self._graph_active.get(gid) != variant]
+        total_applied = 0
+        graphs_ok = True
         for gid, nodes in items:
             gexec = self._exec_of(gid)
             graph_raw = self._keep[gid].raw_cuda_graph() if use_e3 else None
+            applied_g = 0
+            eligible = 0
+            touched = []
             for nb in nodes:
+                # V17 S3-3 ②: only nodes BORN from this service's module
+                # (bind-time membership snapshot); anything else is a
+                # different specialization loaded elsewhere -- skip+count
+                if int(nb.func_before) not in known:
+                    with _LOCK:
+                        self.state["skipped_nodes"] = \
+                            int(self.state.get("skipped_nodes") or 0) + 1
+                    continue
+                eligible += 1
                 params = cu.CUDA_KERNEL_NODE_PARAMS()
                 params.func = v["fn"]
                 params.gridDimX, params.gridDimY, params.gridDimZ = 0, 0, 0
@@ -594,42 +669,101 @@ class GraphKernelService:
                     # V16-T4 E3 path: mutate the SOURCE-graph node (func
                     # from a separate module), then one whole-graph
                     # cudaGraphExecUpdate adopts it into torch's own exec
-                    (rc,) = cu.cuGraphKernelNodeSetParams(nb.node, params)
+                    rc = 1 if self._fi("setparams") else \
+                        cu.cuGraphKernelNodeSetParams(nb.node, params)[0]
                 else:
-                    (rc,) = cu.cuGraphExecKernelNodeSetParams(
-                        gexec, nb.node, params)
+                    rc = 1 if self._fi("setparams") else \
+                        cu.cuGraphExecKernelNodeSetParams(
+                            gexec, nb.node, params)[0]
                 if rc != 0:
                     self._err(f"SetParams({variant})",
                               RuntimeError(f"rc={rc}"))
                 else:
-                    applied += 1
-            if use_e3 and applied:
-                rc_u = _rt.cudaGraphExecUpdate(
-                    int(gexec), int(graph_raw))[0]
-                with _LOCK:
-                    self.state["e3_updates"] = \
-                        int(self.state.get("e3_updates") or 0) + 1
+                    applied_g += 1
+                    touched.append(nb)
+            # a graph counts as switched only when EVERY ELIGIBLE node was
+            # rewritten (partial application = exec/state divergence;
+            # born-outside nodes were skipped above and don't count)
+            ok_g = eligible > 0 and applied_g == eligible
+            # the CURRENT variant (what the exec is still running if this
+            # apply fails halfway) -- needed by every restore path below
+            with _LOCK:
+                cur_v = self._graph_active.get(gid)
+                v_cur = self._variants.get((jit_name, cur_v)) \
+                    if cur_v else None
+            if v_cur is None:
+                v_cur = self._variants.get((jit_name, "__base"))
+            if use_e3:
+                if ok_g:
+                    rc_u = 700 if self._fi("execupdate") else \
+                        _rt.cudaGraphExecUpdate(
+                            int(gexec), int(graph_raw))[0]
+                    with _LOCK:
+                        self.state["e3_updates"] = \
+                            int(self.state.get("e3_updates") or 0) + 1
                     if rc_u != 0:
                         self._err(f"ExecUpdate({variant})",
                                   RuntimeError(f"rc={rc_u}"))
-            if applied:
+                        with _LOCK:
+                            self.state["exec_update_failures"] = \
+                                int(self.state.get("exec_update_failures")
+                                    or 0) + 1
+                        # V17 S3-2 ①: the exec still runs the CURRENT
+                        # function while the source nodes now point at
+                        # the variant -- rewrite the source back to the
+                        # CURRENT variant (not the bind snapshot: the
+                        # graph may have been on an in-module family)
+                        # and do NOT set _graph_active
+                        self._restore_nodes(cu, touched, v_cur,
+                                            source=True)
+                        ok_g = False
+                elif applied_g:
+                    # partial SetParams: the source is half-switched --
+                    # restore the touched nodes to the CURRENT variant
+                    self._restore_nodes(cu, touched, v_cur, source=True)
+            elif not ok_g and applied_g:
+                # intra-module partial: point the touched EXEC nodes back
+                # at the CURRENT variant
+                self._restore_nodes(cu, touched, v_cur, gexec=gexec,
+                                    source=False)
+            if ok_g:
                 with _LOCK:
                     self._graph_active[gid] = variant
+            else:
+                graphs_ok = False
+            total_applied += applied_g
         with _LOCK:
-            if applied:
+            if graphs_ok and total_applied:
                 self.state["retargets"] += 1
                 self.state["active"] = f"{jit_name}::{variant}"
                 self._active[jit_name] = variant
                 self.state["last_recode_ms"] = round(
                     (time.monotonic() - t0) * 1000.0, 4)
+                self._fail_streak.pop((jit_name, variant), None)
             elif not items:
                 # idempotent re-submit: every bound graph already runs it
                 self._active[jit_name] = variant
             else:
-                self._pending[jit_name] = variant  # re-try next boundary
-        if applied:
+                # V17 S3-2 ②: backoff + give-up — 3 consecutive failed
+                # applies blacklist the variant instead of retrying forever
+                key = (jit_name, variant)
+                streak = self._fail_streak.get(key, 0) + 1
+                self._fail_streak[key] = streak
+                if streak >= 3:
+                    self._blacklist.add(key)
+                    self.state["blacklisted"] = sorted(
+                        f"{j}::{w}" for j, w in self._blacklist)
+                    self.state["audit_failures"] = (
+                        self.state.get("audit_failures") or [])[-7:] + [
+                        {"variant": variant, "n": streak,
+                         "note": "give-up: 3 consecutive failed applies"}]
+                    self._pending.pop(jit_name, None)
+                else:
+                    self._pending[jit_name] = variant  # re-try next boundary
+        if graphs_ok and total_applied:
             # V16-T5 L1: post-swap structural audit (source-graph mirror
             # read-back; E3 path only, intra-module is exec-opaque)
+            audit = None
             try:
                 from triton.pact.runtime.graph_swap_validator import \
                     audit_after_apply
@@ -641,8 +775,131 @@ class GraphKernelService:
                         "note": audit.get("note")}
             except Exception as e:  # noqa: BLE001
                 self._err("audit", e)
+            if audit is not None and audit.get("ok") is not True:
+                # V17 S3-4 ④: audit failure -> automatic rollback to the
+                # PTX-identical capture baseline + blacklist the variant
+                self.rollback(jit_name)
+                with _LOCK:
+                    self.state["auto_rollbacks"] = \
+                        int(self.state.get("auto_rollbacks") or 0) + 1
+                    self._blacklist.add((jit_name, variant))
+                    self.state["blacklisted"] = sorted(
+                        f"{j}::{w}" for j, w in self._blacklist)
+                    self.state["audit_failures"] = (
+                        self.state.get("audit_failures") or [])[-7:] + [
+                        {"variant": variant,
+                         "note": "auto-rollback on audit failure"}]
+            # V17 S3-4 ②: per-swap flip-anchor canary (opt-in,
+            # PACT_SWAP_CANARY=1; side stream, budget-bound)
+            if os.environ.get("PACT_SWAP_CANARY") == "1":
+                can = self._canary(jit_name, variant)
+                with _LOCK:
+                    self.state["last_canary"] = can
+                    self.state["canaries"] = \
+                        int(self.state.get("canaries") or 0) + 1
+                if can.get("anomaly"):
+                    with _LOCK:
+                        self.state["audit_failures"] = (
+                            self.state.get("audit_failures") or [])[-7:] + [
+                            {"variant": variant,
+                             "note": f"canary anomaly: "
+                                     f"{str(can)[:120]}"}]
+                        self._blacklist.add((jit_name, variant))
+                        self.state["blacklisted"] = sorted(
+                            f"{j}::{w}" for j, w in self._blacklist)
+                    self.rollback(jit_name)
         self._publish()
-        return applied > 0
+        return graphs_ok and total_applied > 0
+
+    def _restore_nodes(self, cu, touched, v, gexec=None,
+                       source: bool = True) -> None:
+        """V17 S3-2 ①: point the touched nodes back at the CURRENT
+        variant `v` so the graph mirrors the (unchanged) exec again --
+        source-node SetParams for the E3 form, exec SetParams for the
+        intra-module form.  Best-effort: failures land in state errors,
+        never in the replay path."""
+        if v is None:
+            return
+        for nb in touched:
+            try:
+                params = cu.CUDA_KERNEL_NODE_PARAMS()
+                params.func = v["fn"]
+                params.gridDimX, params.gridDimY, params.gridDimZ = 0, 0, 0
+                params.blockDimX = 32 * v["warps"]
+                params.blockDimY = 1
+                params.blockDimZ = 1
+                params.sharedMemBytes = v["shared"]
+                params.kernelParams = nb.kernel_params
+                params.extra = 0
+                err, cur = cu.cuGraphKernelNodeGetParams(nb.node)
+                if err == cu.CUresult.CUDA_SUCCESS:
+                    params.gridDimX = int(cur.gridDimX)
+                    params.gridDimY = int(cur.gridDimY)
+                    params.gridDimZ = int(cur.gridDimZ)
+                    params.blockDimY = int(cur.blockDimY)
+                    params.blockDimZ = int(cur.blockDimZ)
+                if source:
+                    (rc,) = cu.cuGraphKernelNodeSetParams(nb.node, params)
+                else:
+                    (rc,) = cu.cuGraphExecKernelNodeSetParams(
+                        gexec, nb.node, params)
+                if rc != 0:
+                    self._err("restore_nodes",
+                              RuntimeError(f"rc={rc}"))
+            except Exception as e:  # noqa: BLE001
+                self._err("restore_nodes", e)
+
+    def _canary(self, jit_name: str, variant: str) -> Dict[str, Any]:
+        """V17 S3-4 ②: per-swap flip-anchor canary.  Launches the base
+        and the variant once each on a SIDE stream with the prepare-time
+        args (fresh output buffers) and records output-diff stats plus
+        anomaly flags (NaN/Inf/all-zero/launch-rc).  Numerical difference
+        between honest variant configs is EXPECTED and never gated on;
+        the anomaly flags are the corruption signal (the v13 silent-bad
+        shape).  Budget: two dummy launches, us-scale each, one
+        side-stream sync — the decode stream never gains a sync point."""
+        import torch
+        args, kwargs, grid = self._jit_args.get(
+            jit_name, (None, None, None))
+        vb = self._variants.get((jit_name, "__base"))
+        vv = self._variants.get((jit_name, variant))
+        kb = self._kerns.get((jit_name, "__base"))
+        kv = self._kerns.get((jit_name, variant))
+        if not args or not kwargs or not grid or vb is None or vv is None \
+                or kb is None or kv is None:
+            return {"skipped": "missing args/variants"}
+        try:
+            out_b = torch.empty_like(args[0])
+            out_v = torch.empty_like(args[0])
+            stream = torch.cuda.Stream()
+            rcs = []
+            with torch.cuda.stream(stream):
+                for out, vmeta, kern in ((out_b, vb, kb), (out_v, vv, kv)):
+                    vals = (out,) + tuple(args[1:])
+                    na = self._abi_args(kern, vals, kwargs)
+                    (rc,) = self._cu.cuLaunchKernel(
+                        vmeta["fn"], int(grid[0]), int(grid[1]),
+                        int(grid[2]), 32 * int(vmeta["warps"]), 1, 1,
+                        int(vmeta["shared"]), stream.cuda_stream, na, 0)
+                    rcs.append(int(rc))
+            stream.synchronize()
+            d = (out_b.float() - out_v.float()).abs()
+            res = {
+                "variant": variant,
+                "rc": rcs,
+                "max_abs_diff": round(float(d.max().item()), 6),
+                "mismatch_frac": round(
+                    float((out_b != out_v).float().mean().item()), 6),
+                "nan": bool(torch.isnan(out_v).any().item()),
+                "inf": bool(torch.isinf(out_v).any().item()),
+                "allzero": bool(int((out_v == 0).sum().item())
+                                == out_v.numel()),
+            }
+            res["anomaly"] = (res["nan"] or res["inf"] or res["allzero"]
+                              or any(r != 0 for r in rcs))
+            return res
+        except Exception as e:  # noqa: BLE001 - diagnostic only
+            return {"error": str(e)[:120], "anomaly": False}
 
     def rollback(self, jit_name: str) -> bool:
         """Point every node back at the module's __base function (the
@@ -657,6 +914,7 @@ class GraphKernelService:
                      if self._jits.get(gid) == jit_name and
                      self._graph_active.get(gid) != "__base"]
         applied = 0
+        all_ok = True
         for gid, nodes in items:
             gexec = self._exec_of(gid)
             # if the graph currently runs a CROSS variant, the source
@@ -669,7 +927,20 @@ class GraphKernelService:
                 if cur_v else None
             use_e3 = bool(cur_meta and cur_meta.get("cross"))
             graph_raw = self._keep[gid].raw_cuda_graph() if use_e3 else None
+            applied_g = 0
+            eligible = 0
+            touched = []
             for nb in nodes:
+                # V17 S3-3 ② (rollback side): never touch nodes that were
+                # not born from this service's module -- writing our __base
+                # handle into a triton-loaded node IS the cross-module
+                # silent-corruption shape
+                if int(nb.func_before) not in self._known_funcs:
+                    with _LOCK:
+                        self.state["skipped_nodes"] = \
+                            int(self.state.get("skipped_nodes") or 0) + 1
+                    continue
+                eligible += 1
                 params = cu.CUDA_KERNEL_NODE_PARAMS()
                 params.func = v["fn"]
                 params.gridDimX, params.gridDimY, params.gridDimZ = 0, 0, 0
@@ -688,23 +959,48 @@ class GraphKernelService:
                     params.blockDimZ = int(cur.blockDimZ)
                 if use_e3:
                     from cuda.bindings import runtime as _rt
-                    (rc,) = cu.cuGraphKernelNodeSetParams(nb.node, params)
+                    rc = 1 if self._fi("setparams") else \
+                        cu.cuGraphKernelNodeSetParams(nb.node, params)[0]
                 else:
-                    (rc,) = cu.cuGraphExecKernelNodeSetParams(
-                        gexec, nb.node, params)
+                    rc = 1 if self._fi("setparams") else \
+                        cu.cuGraphExecKernelNodeSetParams(
+                            gexec, nb.node, params)[0]
                 if rc == 0:
-                    applied += 1
-            if use_e3 and applied:
-                rc_u = _rt.cudaGraphExecUpdate(
-                    int(gexec), int(graph_raw))[0]
+                    applied_g += 1
+                    touched.append(nb)
+            ok_g = eligible > 0 and applied_g == eligible
+            if not ok_g and applied_g:
+                # V17 S3-2 ① (rollback side): partially rewritten nodes go
+                # back to the CURRENT variant (the cross one we are
+                # rolling back FROM)
+                self._restore_nodes(cu, touched, cur_meta or v,
+                                    gexec=gexec, source=use_e3)
+            if use_e3 and ok_g:
+                from cuda.bindings import runtime as _rt
+                rc_u = 700 if self._fi("execupdate") else \
+                    _rt.cudaGraphExecUpdate(int(gexec), int(graph_raw))[0]
                 if rc_u != 0:
                     self._err("ExecUpdate(rollback)",
                               RuntimeError(f"rc={rc_u}"))
-            if applied:
+                    with _LOCK:
+                        self.state["exec_update_failures"] = \
+                            int(self.state.get("exec_update_failures")
+                                or 0) + 1
+                    # V17 S3-2 ③: the exec still runs the cross variant --
+                    # _graph_active mirrors the EXEC, so it must stay, and
+                    # the source nodes go back to the cross variant too
+                    # (keep source == state)
+                    self._restore_nodes(cu, touched, cur_meta or v,
+                                        source=True)
+                    ok_g = False
+            if ok_g:
                 with _LOCK:
                     self._graph_active.pop(gid, None)
+            else:
+                all_ok = False
+            applied += applied_g
         with _LOCK:
-            if applied:
+            if all_ok and applied and items:
                 self.state["rollbacks"] += 1
                 self.state["active"] = None
                 self._active.pop(jit_name, None)

@@ -60,6 +60,12 @@ def audit_after_apply(svc, jit_name: str, variant: str,
             failures.append({"gid": gid, "node_count": len(nodes),
                              "expected": expect_nodes[gid]})
         for nb in nodes:
+            # V17 S3-3 ②: nodes not born from this service's module were
+            # skipped by _apply (skipped_nodes counter) -- they are not
+            # ours to audit either; auditing them would false-positive
+            # every mixed graph into an auto-rollback
+            if int(nb.func_before) not in svc._known_funcs:
+                continue
             err, cur = cu.cuGraphKernelNodeGetParams(nb.node)
             if err != 0:
                 failures.append({"gid": gid, "rc_getparams": int(err)})
@@ -83,9 +89,13 @@ def audit_after_apply(svc, jit_name: str, variant: str,
     out = {"ok": not failures, "audited_nodes": audited,
            "failures": failures[:8]}
     if failures:
+        # V17 S3-4 ③: fix the retention dead code (was
+        # (old)[-4:] + [{...}][:1] -- the [:1] of a one-element list
+        # silently collapsed every entry to the same shape and the cap
+        # dropped useful history); plain bounded append, cap 8
         with _LOCK:
             svc.state["audit_failures"] = \
-                (svc.state.get("audit_failures") or [])[-4:] + [
-                    {"variant": variant,
-                     "n": len(failures)}][:1]
+                (svc.state.get("audit_failures") or [])[-7:] + [
+                    {"variant": variant, "n": len(failures),
+                     "failed": [f.get("failed") for f in failures[:4]]}]
     return out

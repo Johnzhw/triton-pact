@@ -75,9 +75,13 @@ VARIANT_ENVS: Dict[str, Dict[str, str]] = {
 # a SEPARATE single-entry cubin and swapped via the E3 path (source-node
 # SetParams + whole-graph cudaGraphExecUpdate -- validated on the chain
 # graph, 60us).  PACT_GRAPH_VOCAB=full restores the 9-entry eager module.
-MINI_VOCAB = ("__base", "__vanilla", "theory")
+# V17 S2-4 B0: theory is PTX-byte-identical to __base (V16 ba6e266), so
+# the mini vocab collapses 3->1 and "theory" becomes an ALIAS -- decider
+# submits keep working, the graph simply never needs a second entry.
+MINI_VOCAB = ("__base",)
 FAMILY_ALIAS: Dict[str, str] = {
     "baseline": "__vanilla", "vanilla": "__vanilla",
+    "theory": "__base",
     "occupancy": "occ", "latency": "lat",
 }
 
@@ -439,21 +443,25 @@ class GraphKernelService:
         with _LOCK:
             return (jit_name, v) in self._variants
 
-    def offer(self, jit_name: str, variant: str) -> bool:
+    def offer(self, jit_name: str, variant: str,
+              env: Optional[Dict[str, str]] = None) -> bool:
         """V16-T4: compile + load ONE more variant ON DEMAND as its own
         single-entry cubin in a SEPARATE module ("cross" variant).  Runs
         on background frames (ms..s: compile_explicit + pool ptxas +
         cuModuleLoadDataEx + materialize); never at a replay boundary.
         Swapping to a cross variant goes through the E3 path (source-node
         SetParams + whole-graph cudaGraphExecUpdate), so the module the
-        captured nodes were born in never has to grow."""
+        captured nodes were born in never has to grow.
+        V17 S2-4 B1: an explicit `env` (a normalize_preset extra_env dict)
+        passes straight through -- VARIANT_ENVS is a compatibility layer,
+        not a gate."""
         variant = FAMILY_ALIAS.get(variant, variant)
         with _LOCK:
             if (jit_name, variant) in self._variants:
                 return True
             jit_fn = self._jit_fns.get(jit_name)
             args_kw = self._jit_args.get(jit_name)
-            env = VARIANT_ENVS.get(variant)
+            env = dict(env) if env is not None else VARIANT_ENVS.get(variant)
         if jit_fn is None or args_kw is None or env is None:
             return False
         args, kwargs, grid = args_kw

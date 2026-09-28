@@ -545,6 +545,14 @@ class GraphKernelService:
                 shared_before=int(params.sharedMemBytes),
                 kernel_params=params.kernelParams))
         with _LOCK:
+            if not found:
+                # V17 S3-2 fix: a graph with ZERO pact nodes (most vLLM
+                # capture-size tiers) must not sit in _bindings as an
+                # empty list -- the ok_g/all-or-nothing logic would count
+                # it as a failed switch on every apply and 3-strike
+                # blacklist the variant (seen live: theory AND deep
+                # blacklisted with e3=2, 0/20 A0 rerun 20260928_083121)
+                return 0
             self._bindings[gid] = found
             self._keep[gid] = graph          # handles must outlive callers
             # the exec handle is fetched lazily (keep_graph=True graphs
@@ -615,6 +623,10 @@ class GraphKernelService:
         total_applied = 0
         graphs_ok = True
         for gid, nodes in items:
+            if not nodes:
+                # empty binding (legacy/no-pact capture tier): a NO-OP,
+                # never a failed switch
+                continue
             gexec = self._exec_of(gid)
             graph_raw = self._keep[gid].raw_cuda_graph() if use_e3 else None
             applied_g = 0
@@ -916,6 +928,9 @@ class GraphKernelService:
         applied = 0
         all_ok = True
         for gid, nodes in items:
+            if not nodes:
+                # empty binding: a NO-OP, never a failed rollback
+                continue
             gexec = self._exec_of(gid)
             # if the graph currently runs a CROSS variant, the source
             # nodes point into a separate module: pointing back at __base
@@ -969,6 +984,10 @@ class GraphKernelService:
                     applied_g += 1
                     touched.append(nb)
             ok_g = eligible > 0 and applied_g == eligible
+            if eligible == 0:
+                # defensive: no eligible node -> no-op graph, never a
+                # failed rollback
+                continue
             if not ok_g and applied_g:
                 # V17 S3-2 ① (rollback side): partially rewritten nodes go
                 # back to the CURRENT variant (the cross one we are

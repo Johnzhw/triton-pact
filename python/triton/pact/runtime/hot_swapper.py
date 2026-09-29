@@ -96,6 +96,10 @@ class HotSwapper:
         after event.synchronize() on the LAST event -- a device-wide
         torch.cuda.synchronize() here used to stall every other stream
         (the decode stream included) once per measured iteration."""
+        from triton.pact.runtime.capture_guard import (
+            wait_out_of_capture, note_race)
+        if not wait_out_of_capture():
+            note_race("measure")
         import torch
         self.launch(kernel)          # settle, ordered before the first start
         pairs = []
@@ -181,6 +185,10 @@ class HotSwapper:
                                     dict(extra_env))
             if getattr(k, "_init_handles", None) and not getattr(
                     k, "function", None):
+                from triton.pact.runtime.capture_guard import (
+                    wait_out_of_capture, note_race)
+                if not wait_out_of_capture():
+                    note_race("prewarm")
                 try:
                     k._init_handles()
                 except Exception:

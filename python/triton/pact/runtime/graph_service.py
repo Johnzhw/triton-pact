@@ -366,6 +366,10 @@ class GraphKernelService:
         """One raw launch on cloned tensors to settle the lazy load."""
         if not args or not kwargs or not grid:
             return
+        from triton.pact.runtime.capture_guard import (
+            wait_out_of_capture, note_race)
+        if not wait_out_of_capture():
+            note_race("materialize")
         import torch
         values = [torch.empty_like(args[0])] + list(args[1:])
         na = self._abi_args(kernel, tuple(values), kwargs)
@@ -467,6 +471,10 @@ class GraphKernelService:
         args, kwargs, grid = args_kw
         t0 = time.monotonic()
         try:
+            from triton.pact.runtime.capture_guard import (
+                wait_out_of_capture, note_race)
+            if not wait_out_of_capture():
+                note_race(f"offer({variant})")
             cu = self._driver()
             # a caller on a fresh background thread has NO current CUDA
             # context -- driver-API cuModuleLoadDataEx below would fail

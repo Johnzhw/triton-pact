@@ -45,15 +45,15 @@ def is_capture_busy() -> bool:
 
 
 def wait_out_of_capture(timeout_s: float = 600.0) -> bool:
-    # 600s: vLLM's mid-run multi-tier lazy capture legitimately
-    # takes tens of seconds; the 30s first cut timed out in the
-    GuideLLM sweep rerun and proceeded INTO the capture window
-    (the very failure this guard exists to prevent).  The flag
-    clears in capture_end's finally even on a failed capture, so
-    the long wait cannot deadlock.
     """Block until no capture is in progress (or timeout).  Returns True
     if the wait succeeded, False on timeout (caller proceeds anyway and
-    records the race -- never deadlocks the serving path)."""
+    records the race -- never deadlocks the serving path).
+
+    600s: vLLM's mid-run multi-tier lazy capture legitimately takes
+    tens of seconds; a 30s first cut timed out in the GuideLLM sweep
+    rerun and proceeded INTO the capture window (the very failure this
+    guard exists to prevent).  The flag clears in capture_end's finally
+    even on a failed capture, so the long wait cannot deadlock."""
     if not _busy.is_set():
         return True
     return _busy.wait(timeout_s)

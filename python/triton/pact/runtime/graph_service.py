@@ -610,6 +610,12 @@ class GraphKernelService:
         boundary — never inside the decode step's operator stream."""
         variant = FAMILY_ALIAS.get(variant, variant)
         if not self.has_variant(jit_name, variant):
+            # V18 G-2/BR-19: an out-of-vocab submit used to return
+            # silently -- count it on the same channel as the blacklist
+            # reject (behaviour unchanged, still False)
+            with _LOCK:
+                self.state["submit_rejects"] = \
+                    int(self.state["submit_rejects"] or 0) + 1
             return False
         if (jit_name, variant) in self._blacklist:
             # V17 S3-2 ②: abandoned after 3 consecutive failed applies

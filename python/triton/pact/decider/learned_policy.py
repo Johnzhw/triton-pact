@@ -42,12 +42,17 @@ def features(cfg: Dict[str, Any]) -> list:
     # without any runtime counter.  Older 4-feature models still load;
     # their prototypes simply have shorter vectors and knn distance is
     # computed with zip() truncation (documented compatibility note).
+    # V18 B3 v7: 7th feature = the GQA x D interaction log2(GQA*D) --
+    # per-KV-head served load (query heads sharing one kv head times
+    # head dim), the axis the V18 24-cell grid showed the winner flips
+    # along independent of S/D alone (GQA16 vs GQA4 at fixed S/D).
     s = cfg["S"]
     d = cfg["D"]
     gqa = cfg.get("GQA", 1) or 1
     ws = s * d * (cfg.get("Hq", gqa) // gqa) * 2 * 2
     return [math.log2(s), math.log2(d), math.log2(cfg.get("P", 16)),
-            cfg.get("B", 1), gqa, round(math.log2(max(ws, 1)), 3)]
+            cfg.get("B", 1), gqa, round(math.log2(max(ws, 1)), 3),
+            round(math.log2(max(gqa * d, 1)), 3)]
 
 
 class LearnedPolicy:
@@ -64,7 +69,8 @@ class LearnedPolicy:
         self.default_pick = data.get("default", "theory")
         # V17 S1-3 ①: explicit feature-schema versioning replaces the
         # silent zip() truncation of _predict_knn.  4 = pre-T6 models,
-        # 6 = V16-T6 (adds GQA + log2 KV working-set).  A missing field
+        # 6 = V16-T6 (adds GQA + log2 KV working-set), 7 = V18 B3 v7
+        # (adds the GQA x D interaction log2(GQA*D)).  A missing field
         # is INFERRED from the prototype width and counted; with
         # PACT_STRICT_SCHEMA=1 a mismatch refuses to load instead.
         self.feature_schema_version = data.get("feature_schema_version")
@@ -94,7 +100,7 @@ class LearnedPolicy:
             # V17 S1-3 ①: strict mode refuses schema-mismatched models
             # outright instead of padding at predict time
             if os.environ.get("PACT_STRICT_SCHEMA") == "1" and \
-                    obj.feature_schema_version not in (None, 4, 6):
+                    obj.feature_schema_version not in (None, 4, 6, 7):
                 _SWALLOWED["schema_refused"] += 1
                 return None
             if key is not None:

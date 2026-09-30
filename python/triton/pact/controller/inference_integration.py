@@ -17,6 +17,19 @@ from triton.pact.runtime.workload_sniffer import should_trigger
 
 _MSG_IDS = itertools.count(1)
 
+# BR-17 (V18 G-1): swallowed exceptions on the decision/measurement path
+# stay swallowed (the bridge must never crash the host) but become
+# COUNTABLE.  A silent _init_handles failure feeds measure_kernel a
+# handle-less kernel and the resulting gain_percent silently steers the
+# swap decision -- invisible without this counter (BR-8 _SWALLOWED
+# precedent).  Read it from probes/bridge state, never changed behavior.
+_SWALLOWED: Dict[str, Any] = {"init_handles": 0, "init_handles_last": ""}
+
+
+def _note_swallowed(site: str, exc: BaseException) -> None:
+    _SWALLOWED[site] = int(_SWALLOWED.get(site, 0)) + 1
+    _SWALLOWED[f"{site}_last"] = repr(exc)[:120]
+
 
 def _g4_iters(default: int = 10) -> int:
     return int(os.environ.get("PACT_G4_ITERS", str(default)))
@@ -406,8 +419,8 @@ class InferenceSession:
                         kernel, "function", None):
                     try:
                         kernel._init_handles()
-                    except Exception:
-                        pass
+                    except Exception as e:  # noqa: BLE001
+                        _note_swallowed("init_handles", e)
                 iters = _g4_iters()
                 base_us = self.swapper.measure_kernel(
                     self.swapper.slots[0], iters)
@@ -433,8 +446,8 @@ class InferenceSession:
                     kernel, "function", None):
                 try:
                     kernel._init_handles()
-                except Exception:
-                    pass
+                except Exception as e:  # noqa: BLE001
+                    _note_swallowed("init_handles", e)
             iters = _g4_iters()
             base_us = self.swapper.measure_kernel(self.swapper.slots[0],
                                                   iters)

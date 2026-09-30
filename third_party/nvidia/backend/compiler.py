@@ -256,7 +256,8 @@ class CUDABackend(BaseBackend):
                              "pact.hw.active_warp_ratio_permille",
                              "pact.hw.stall_memory_permille",
                              "pact.hw.sm_efficiency_permille",
-                             "pact.hw.kv_heads"):
+                             "pact.hw.kv_heads",
+                             "pact.hw.weight_bytes"):
                     if name in hints:
                         mod.set_attr(name, builder.get_int32_attr(int(hints[name])))
             except Exception as e:

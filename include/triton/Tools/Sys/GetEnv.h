@@ -68,6 +68,9 @@ inline const std::set<std::string> CACHE_INVALIDATING_ENV_VARS = {
     "PACT_HW_HINTS_JSON",
     "PACT_SM_VERSION",
     "PACT_AMD_ARCH",
+    // V18 G-1/BR-15: flips P11 stagesPerBlock (2<->3) -> changes the
+    // warp decision -> changes the binary; must invalidate the cache.
+    "PACT_P11_LEGACY_ASSUMPTION",
     // clang-format on
 };
 
@@ -75,6 +78,8 @@ inline const std::set<std::string> CACHE_NEUTRAL_ENV_VARS = {
     // clang-format off
     "TRITON_REPRODUCER_PATH",
     "TRITON_ENABLE_PYTHON_STACKTRACE",
+    // V18 G-1/BR-16: PACT pass logging only, never changes IR.
+    "PACT_VERBOSE",
     // clang-format on
 };
 

@@ -53,10 +53,22 @@ def wait_out_of_capture(timeout_s: float = 600.0) -> bool:
     tens of seconds; a 30s first cut timed out in the GuideLLM sweep
     rerun and proceeded INTO the capture window (the very failure this
     guard exists to prevent).  The flag clears in capture_end's finally
-    even on a failed capture, so the long wait cannot deadlock."""
+    even on a failed capture, so the long wait cannot deadlock.
+
+    V18 C-3/BR-18 FIX: Event.wait() means "wait until SET" -- with the
+    busy flag already set (mid-capture) it returned True IMMEDIATELY,
+    so every guard point sailed straight through the very window it
+    existed to avoid (the C-0 fix worked via the hold state machine +
+    capture-window consumer guard, not this wait).  Poll until CLEARED
+    instead; 5ms cadence is far below any capture window."""
     if not _busy.is_set():
         return True
-    return _busy.wait(timeout_s)
+    deadline = time.monotonic() + timeout_s
+    while _busy.is_set():
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.005)
+    return True
 
 
 def note_race(where: str) -> None:

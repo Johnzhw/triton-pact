@@ -86,6 +86,17 @@ _COUNTER_THRESH = {
     "l2_resident": 700,
 }
 
+# V18 D-1 (PACT_COUNTER_V2, default OFF): the dram-stream proxy is the
+# L2 MISS rate in permille (1000 - l2_hit), inverted per PLAN D-1.  The
+# v2 path turns the three independent v1 rules into a 2-D quadrant
+# decision on (dram_stream x stall) and adds the bandwidth-bound
+# quadrant the v1 rules could never reach (dram high with issue
+# headroom).  Activation requires the env; the v1 path stays
+# bit-for-bit frozen.
+_COUNTER_THRESH_V2 = {
+    "dram_stream_hi": 300,   # miss-rate proxy permille (l2_hit < 700)
+}
+
 
 def counter_adjust(family: str, facts: Dict[str, Any],
                      thresholds: Optional[Dict[str, int]] = None
@@ -112,6 +123,29 @@ def counter_adjust(family: str, facts: Dict[str, Any],
     th = dict(_COUNTER_THRESH)
     if thresholds:
         th.update(thresholds)
+    if family in ("theory", "vanilla") and \
+            os.environ.get("PACT_COUNTER_V2", "0") == "1":
+        # V18 D-1: 2-D (dram-stream x stall) quadrants, v2 semantics
+        dram = 1000 - (l2 if l2 is not None else 1000)
+        if dram >= _COUNTER_THRESH_V2["dram_stream_hi"]:
+            if stall >= th["stall_heavy"]:
+                return {"family": "cold",
+                        "counter_adjusted": {"from": family, "to": "cold",
+                                             "reason": f"v2 dram={dram} "
+                                             f"stall={stall} -> deepen"}}
+            # bandwidth-bound with issue headroom: the v1 chain never
+            # reached this quadrant (it required stall to be heavy too)
+            return {"family": "occ",
+                    "counter_adjusted": {"from": family, "to": "occ",
+                                         "reason": f"v2 dram={dram} "
+                                         f"stall={stall} -> fewer warps"}}
+        if l2 is not None and l2 >= th["l2_resident"] and \
+                stall <= th["stall_light"]:
+            return {"family": "lat",
+                    "counter_adjusted": {"from": family, "to": "lat",
+                                         "reason": f"v2 l2={l2} stall="
+                                         f"{stall} -> shallow"}}
+        return {"family": family, "counter_adjusted": None}
     if family in ("theory", "vanilla"):
         if stall >= th["stall_heavy"] and l2 <= th["l2_missy"]:
             # long-scoreboard-bound with a cold L2: deepen the pipeline

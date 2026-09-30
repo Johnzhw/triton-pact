@@ -129,8 +129,12 @@ SelectStagesResult selectNumStages(const SelectStagesInput &input) {
   // default-path-unchanged guarantee, not a silent heuristic.
   result.kvWorkingSetBytes = input.kvWorkingSetBytes;
   result.l2Bytes = sm.l2Bytes;
+  // V18 T8c: the weights share L2 with the KV stream during a decode
+  // step -- the verdict sees the combined pressure.  weightBytes == 0
+  // (no hint) leaves the arithmetic bit-identical to the S1 form.
+  int64_t residentCompetitor = input.kvWorkingSetBytes + input.weightBytes;
   result.l2Cold = input.kvWorkingSetBytes > 0 && sm.l2Bytes > 0 &&
-                  input.kvWorkingSetBytes > sm.l2Bytes;
+                  residentCompetitor > sm.l2Bytes;
 
   auto scoreFor = [&](int s) {
     double occ = occupancyFor(input.tileBytes * s, regsPerThread, s,

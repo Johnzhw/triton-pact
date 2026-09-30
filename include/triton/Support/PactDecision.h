@@ -96,6 +96,11 @@ struct SelectStagesInput {
   // from DRAM) biases the Ampere scan toward deeper pipelines within the
   // computed feasible set.
   int64_t kvWorkingSetBytes = 0;
+  // V18 T8c: per-layer WEIGHT bytes (qkv + gate_up) that share L2 with
+  // the KV stream during a decode step.  0 (no hint) keeps the residency
+  // verdict bit-identical (x + 0 == x); a positive value makes the
+  // working-set competition explicit: (kvWS + weights) vs L2.
+  int64_t weightBytes = 0;
 };
 
 struct SelectStagesResult {

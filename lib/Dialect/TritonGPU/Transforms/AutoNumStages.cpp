@@ -228,6 +228,12 @@ struct PACTAutoNumStagesPass
     if (auto attr = mod->getAttrOfType<mlir::IntegerAttr>("pact.hw.kv_heads"))
       if (attr.getInt() > 0)
         kvHeads = attr.getInt();
+    // V18 T8c: per-layer weight bytes (qkv + gate_up) competing with the
+    // KV stream for L2.  0 (absent hint) keeps the verdict bit-identical.
+    if (auto attr = mod->getAttrOfType<mlir::IntegerAttr>(
+            "pact.hw.weight_bytes"))
+      if (attr.getInt() > 0)
+        hw.weightBytes = attr.getInt();
 
     mod.walk([&](scf::ForOp forOp) {
       int64_t tileBytes = 0;

@@ -83,8 +83,9 @@ class InferenceSession:
                 from triton.pact.controller.compile_worker import \
                     get_compile_subprocess
                 get_compile_subprocess().warm_start()
-            except Exception:
-                pass
+            except Exception as e:  # BR-17: counted, not silent
+                _SWALLOWED["warm_start"] = _SWALLOWED.get("warm_start", 0) + 1
+                _SWALLOWED["last_warm_start_err"] = str(e)[:100]
 
     def step(self, batch: int, seq_len: int,
              current_config: Optional[Dict] = None,
@@ -155,7 +156,8 @@ class InferenceSession:
             if getattr(cur, "n_regs", None) in (None, 0) and hasattr(cur, "_init_handles"):
                 cur._init_handles()
             n_regs = int(getattr(cur, "n_regs", 0) or 0)
-        except Exception:
+        except Exception:  # BR-17: counted
+            _SWALLOWED["n_regs_init"] = _SWALLOWED.get("n_regs_init", 0) + 1
             n_regs = 0
         cfg = dict(current_config or {"warps": 4, "stages": 3, "V": 0})
         if n_regs > 0:
@@ -265,8 +267,8 @@ class InferenceSession:
                 self.client.try_request(
                     {"msg_id": msg["msg_id"], "type": "release_shm",
                      "shm_name": resp["shm_name"]}, timeout=2.0)
-            except Exception:
-                pass
+            except Exception:  # BR-17: counted
+                _SWALLOWED["release_shm"] = _SWALLOWED.get("release_shm", 0) + 1
 
     # ---- V13 Phase0: in-graph retarget (async frame stays intact) --------
     def _gs(self):
@@ -278,7 +280,8 @@ class InferenceSession:
         try:
             from triton.pact.runtime.graph_service import get_service
             return get_service()
-        except Exception:
+        except Exception:  # BR-17: counted
+            _SWALLOWED["gs_import"] = _SWALLOWED.get("gs_import", 0) + 1
             return None
 
     def _gs_offer(self, kernel, variant) -> bool:
@@ -301,7 +304,9 @@ class InferenceSession:
             if ok:
                 self._gs_jit_name = name
             return ok
-        except Exception:
+        except Exception as e:  # BR-17: counted
+            _SWALLOWED["gs_offer"] = _SWALLOWED.get("gs_offer", 0) + 1
+            _SWALLOWED["last_gs_offer_err"] = str(e)[:100]
             return False
 
     def _gs_submit(self, kernel, variant) -> bool:
@@ -313,7 +318,9 @@ class InferenceSession:
             return False
         try:
             return svc.submit_retarget(name, str(variant))
-        except Exception:
+        except Exception as e:  # BR-17: counted
+            _SWALLOWED["gs_submit"] = _SWALLOWED.get("gs_submit", 0) + 1
+            _SWALLOWED["last_gs_submit_err"] = str(e)[:100]
             return False
 
     def _gs_rollback(self) -> None:
@@ -322,8 +329,8 @@ class InferenceSession:
         if svc is not None and name:
             try:
                 svc.rollback(name)
-            except Exception:
-                pass
+            except Exception:  # BR-17: counted
+                _SWALLOWED["gs_rollback"] = _SWALLOWED.get("gs_rollback", 0) + 1
 
     def decide_async(self, batch: int, seq_len: int,
                      current_config: Optional[Dict] = None,

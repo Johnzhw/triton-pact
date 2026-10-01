@@ -97,10 +97,27 @@ _COUNTER_THRESH_V2 = {
     "dram_stream_hi": 300,   # miss-rate proxy permille (l2_hit < 700)
 }
 
+# V19 N3: SM count for the wave-phase classification (module-level
+# cache; queried once, offline-safe fallback 28 = the local RTX 4080L).
+_SM_COUNT: Optional[int] = None
+
+
+def _sm_count() -> int:
+    global _SM_COUNT
+    if _SM_COUNT is None:
+        try:
+            import torch
+            _SM_COUNT = torch.cuda.get_device_properties(
+                0).multi_processor_count
+        except Exception:  # noqa: BLE001 - offline/test fallback
+            _SM_COUNT = 28
+    return _SM_COUNT
+
+
 
 def counter_adjust(family: str, facts: Dict[str, Any],
-                     thresholds: Optional[Dict[str, int]] = None
-                     ) -> Dict[str, Any]:
+                   thresholds: Optional[Dict[str, int]] = None
+                   ) -> Dict[str, Any]:
     """Returns {'family': adjusted, 'counter_adjusted': {...}|None}.
     Conservative: only ever moves theory/vanilla (the defaults); a fit
     table's explicit winner is never overridden.  Missing counters ->
@@ -111,6 +128,16 @@ def counter_adjust(family: str, facts: Dict[str, Any],
             return int(v) if v is not None else None
         except (TypeError, ValueError):
             return None
+
+    # V19 N3 (PACT_WAVE_DUAL): tail wave = CTAs not an SM multiple ->
+    # partly idle SMs -> bias to the higher-occupancy variant.  Runs
+    # BEFORE the counter quadrants (it is an analytical geometry signal,
+    # available even when the CUPTI counters are not).
+    if family in ("theory", "vanilla") and facts.get("wave_tail") and \
+            os.environ.get("PACT_WAVE_DUAL", "0") == "1":
+        return {"family": "occ",
+                "counter_adjusted": {"from": family, "to": "occ",
+                                     "reason": "wave tail -> occupancy"}}
 
     stall = _p("stall_memory_permille")
     warp = _p("active_warp_ratio_permille")
@@ -251,6 +278,18 @@ def decide(facts: Dict[str, Any], batch: int, seq_len: int,
         facts.get("stall_memory_permille"),
         head_dim=head_dim, gqa=gqa,
     )
+    # V19 N3 (PACT_WAVE_DUAL=1, default off): the wave-phase occupancy
+    # signal.  Tail waves (CTA count not an SM multiple) leave SMs partly
+    # idle -- the analytical trigger HyTiS-style.  Computed HERE from the
+    # geometry the caller already passes, consumed by counter_adjust
+    # below; a kernel-SPEED signal, never a switch/compile/mount cost.
+    if os.environ.get("PACT_WAVE_DUAL", "0") == "1" and kv_heads and gqa:
+        try:
+            hq = int(kv_heads) * int(gqa)
+            facts = {**facts, "wave_tail":
+                     (int(batch) * hq) % _sm_count() != 0}
+        except (TypeError, ValueError):
+            pass
     counter_note = None
     if _counter_gate_on():
         adj = counter_adjust(family, facts)

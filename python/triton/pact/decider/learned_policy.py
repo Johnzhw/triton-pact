@@ -235,7 +235,16 @@ def decide(facts: Dict[str, Any], batch: int, seq_len: int,
     policy = LearnedPolicy.load()
     if policy is not None:
         try:
-            variant, _ = policy.predict(cfg)
+            # V19 N8 (PACT_DECIDER=exp3): the per-bucket bandit picks the
+            # arm INSTEAD of the k-NN prediction (parallel selection, not
+            # a blend -- the bandit's reward stream is what teaches it);
+            # env resolution + the fallback contract stay identical
+            variant = None
+            if os.environ.get("PACT_DECIDER") == "exp3":
+                bandit = _exp3_for(cfg, policy)
+                variant = bandit.select()
+            if variant is None:
+                variant, _ = policy.predict(cfg)
             env = policy.env_for(variant)
             if env is not None:
                 if variant == "vanilla":
@@ -253,3 +262,94 @@ def decide(facts: Dict[str, Any], batch: int, seq_len: int,
             _SWALLOWED["last_error"] = str(e)[:120]
     return table_decide(facts, batch, seq_len, table=table, hints_dir=hints_dir,
                         head_dim=head_dim, gqa=gqa, kv_heads=kv_heads)
+
+
+# ---------------------------------------------------------------------------
+# V19 N8 (PACT_DECIDER=exp3, default OFF): EXP3 online arm selection
+# (BanditSpec, ICML'25) running PARALLEL to the k-NN table.  One bandit
+# per (B,S) bucket (non-stationary loads explore within a bucket, never
+# across); arms = the loaded model's variant set + vanilla.  Reward is
+# the interleaved paired difference from the G4 re-measurement, fed by
+# the service layer (feed_exp3_reward); an SLO-window observation passes
+# reward=None and updates NOTHING (the epsilon-clamp of the plan).
+# ---------------------------------------------------------------------------
+class Exp3Bandit:
+    def __init__(self, arms, gamma=0.1, seed=0):
+        import random
+        self.arms = list(arms) or ["vanilla"]
+        if "vanilla" not in self.arms:
+            self.arms.append("vanilla")
+        self.gamma = float(gamma)
+        self.w = {a: 1.0 for a in self.arms}
+        self.rng = random.Random(seed)
+        self.picks = {a: 0 for a in self.arms}
+        self.updates = 0
+
+    def probs(self):
+        tot = sum(self.w.values())
+        k = len(self.arms)
+        g = self.gamma
+        return {a: (1.0 - g) * self.w[a] / tot + g / k
+                for a in self.arms}
+
+    def select(self):
+        p = self.probs()
+        x = self.rng.random()
+        acc = 0.0
+        for a in self.arms:
+            acc += p[a]
+            if x <= acc:
+                self.picks[a] += 1
+                return a
+        a = self.arms[-1]
+        self.picks[a] += 1
+        return a
+
+    def update(self, arm, reward):
+        """reward = paired ratio (1.0 = parity, >1 = arm faster).
+        None (SLO window / no measurement) updates nothing."""
+        if reward is None or arm not in self.w:
+            return
+        r = min(max((reward - 1.0) / 2.0 + 0.5, 0.0), 1.0)  # -> [0,1]
+        p = self.probs().get(arm) or 1.0
+        k = len(self.arms)
+        self.w[arm] *= __import__("math").exp(
+            self.gamma * (r / p) / k)
+        # drift clamp: no arm weight above 10x the total (EXP3 practice)
+        tot = sum(self.w.values())
+        cap = 10.0 * tot / k
+        self.w = {a: min(v, cap) for a, v in self.w.items()}
+        self.updates += 1
+
+
+_EXP3: dict = {}
+
+
+def _exp3_for(cfg: Dict[str, Any], policy) -> Optional[Exp3Bandit]:
+    from triton.pact.runtime.workload_sniffer import bucket_bs
+    key = bucket_bs(int(cfg.get("B") or 1), int(cfg.get("S") or 0))
+    b = _EXP3.get(key)
+    if b is None:
+        arms = [a for a in (policy.variants or {}) if a != "vanilla"]
+        b = Exp3Bandit(arms, seed=hash(key) & 0xFFFF)
+        _EXP3[key] = b
+    return b
+
+
+def feed_exp3_reward(cfg: Dict[str, Any], arm: str, reward) -> bool:
+    """Service-layer hook: report the G4 paired ratio for the arm EXP3
+    installed in this bucket.  No bandit yet / unknown arm -> False."""
+    from triton.pact.runtime.workload_sniffer import bucket_bs
+    key = bucket_bs(int(cfg.get("B") or 1), int(cfg.get("S") or 0))
+    b = _EXP3.get(key)
+    if b is None:
+        return False
+    b.update(arm, reward)
+    return True
+
+
+def exp3_state() -> Dict[str, Any]:
+    """Observability snapshot (never a decision input elsewhere)."""
+    return {k: {"picks": b.picks, "updates": b.updates,
+                "probs": {a: round(p, 4) for a, p in b.probs().items()}}
+            for k, b in _EXP3.items()}

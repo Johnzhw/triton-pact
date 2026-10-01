@@ -154,12 +154,32 @@ class LearnedPolicy:
         if max_dist is not None and ds and ds[0][0] > max_dist:
             return default, 1.0
         top = ds[: self.k]
+        # V19 B-4 (PACT_KNN_SOFTBAND=1, default OFF): distance prior +
+        # default fallback band.  The neighbour median becomes
+        # distance-weighted (1/(1+d)); an arm whose weighted gain does
+        # not clear the 1.05 gate no longer wins -- an unconfident
+        # extrapolation never risks a regression (the V18 holdout 3/24
+        # shape).  Env off = the frozen median path, bit-for-bit.
+        soft = os.environ.get("PACT_KNN_SOFTBAND") == "1"
         best, best_v = default, 1.0
         for v in top[0][1]:
-            vals = [g.get(v, 1.0) for _, g in top if v in g]
-            if not vals:
-                continue
-            m = statistics.median(vals)
+            if soft:
+                wsum = wtot = 0.0
+                for d, g in top:
+                    if v in g:
+                        w = 1.0 / (1.0 + d)
+                        wsum += w * g[v]
+                        wtot += w
+                if not wtot:
+                    continue
+                m = wsum / wtot
+                if m <= 1.05:
+                    continue          # below the gate: keep the safe default
+            else:
+                vals = [g.get(v, 1.0) for _, g in top if v in g]
+                if not vals:
+                    continue
+                m = statistics.median(vals)
             if m > best_v:
                 best, best_v = v, m
         return best, best_v

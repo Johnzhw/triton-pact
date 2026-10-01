@@ -42,6 +42,7 @@ def audit_after_apply(svc, jit_name: str, variant: str,
         v = svc._variants.get((jit_name, variant))
         items = [(gid, nodes) for gid, nodes in svc._bindings.items()
                  if svc._jits.get(gid) == jit_name]
+        catalogue = dict(svc.state.get("content_hash") or {})
     if v is None:
         return {"ok": False, "reason": "variant not loaded"}
     if not v.get("cross"):
@@ -79,6 +80,14 @@ def audit_after_apply(svc, jit_name: str, variant: str,
                     nb.kernel_params),
                 "grid": (int(cur.gridDimX), int(cur.gridDimY),
                          int(cur.gridDimZ)) != (0, 0, 0),
+                # V19 N4 third layer: the read-back function's identity
+                # must hit the content-hash catalogue (a name-matching
+                # handle from an uncatalogued load is the silent-corruption
+                # shape; failures ride the EXISTING audit->rollback path).
+                # An EMPTY catalogue means N4 booking never ran (legacy
+                # state / test stub) -- skip rather than false-positive.
+                "content_hash": (not catalogue) or (
+                    svc._known_funcs.get(int(cur.func)) in catalogue),
             }
             bad = [k for k, ok in checks.items() if not ok]
             if bad:

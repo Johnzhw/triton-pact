@@ -84,6 +84,15 @@ FAMILY_ALIAS: Dict[str, str] = {
     "theory": "__base",
     "occupancy": "occ", "latency": "lat",
 }
+# V19 N2 (PACT_PARAM_INDIRECTION=1, default off): the parameter-block
+# layout mirrored from the kernel side (authoritative definition in
+# suite/kernels/decode.py:IND_PARAM_BLOCK_LAYOUT).  The indirect ABI
+# replaces ALL ten runtime params (6 pointers + 4 strides) with one
+# 8B slot; variants of the indirect jit form a closed same-ABI family.
+_IND_BLOCK_LAYOUT = (
+    "out", "q", "k_cache", "v_cache", "block_table", "seq_lens",
+    "STRIDE_BLOCK", "STRIDE_KV_HEAD", "STRIDE_PAGE", "STRIDE_HEAD_DIM",
+)
 
 
 def _vocab_mode() -> str:
@@ -142,6 +151,11 @@ class GraphKernelService:
         # triton-loaded same-name handles through, the capture-fallback
         # danger shape)
         self._known_funcs: Dict[int, str] = {}
+        # V19 N2: jit name -> {"slot": 8B device int64 tensor,
+        # "block": int64[10] param block} — service-held for the whole
+        # process life (NEVER in _ABI_KEEP: the tail-64 trim would drop
+        # the very pointers captured graphs dereference)
+        self._indirect: Dict[str, dict] = {}
         # V17 S3-2 D1: deterministic fault injection (PACT_FAULT_INJECT=1)
         self._fi_on = os.environ.get("PACT_FAULT_INJECT") == "1"
         self._fi_kinds = set(
@@ -167,6 +181,8 @@ class GraphKernelService:
             # {cubin_sha256, ptx_sha256, kind}; pure bookkeeping, no
             # behaviour change on any path.
             "content_hash": {}, "hash_misses": 0,
+            # V19 N2: indirect-ABI jit name once prepare_indirect ran
+            "indirect": None,
         }
 
     def _fi(self, kind: str) -> bool:
@@ -222,7 +238,8 @@ class GraphKernelService:
 
     # -- first-forward arm: ONE module, ALL variants ----------------------
     def prepare(self, jit_fn, args, kwargs, grid,
-                variants: Optional[Dict[str, Dict[str, str]]] = None) -> bool:
+                variants: Optional[Dict[str, Dict[str, str]]] = None,
+                clone_first_arg: bool = True) -> bool:
         """Compile the variant vocabulary, assemble ONE multi-entry cubin
         with TRITON'S OWN ptxas (each entry renamed — the 6b(3) single
         loader), load it once and materialize every function.
@@ -294,7 +311,8 @@ class GraphKernelService:
             # cloned outputs, off any serving path)
             for vname, k in kerns.items():
                 self._materialize(cu, k, self._variants[(name, vname)]["fn"],
-                                  args, kwargs, grid)
+                                  args, kwargs, grid,
+                                  clone_first=clone_first_arg)
             with _LOCK:
                 self.state["prepared"] = name
                 self.state["vocab_mode"] = _vocab_mode()
@@ -308,6 +326,102 @@ class GraphKernelService:
             self._err("prepare", e)
             self._publish()
             return False
+
+    # -- V19 N2: indirect-ABI arming + the 8B write channel --------------
+    def prepare_indirect(self, ind_jit_fn, orig_args, kwargs, grid) -> bool:
+        """Arm the vocabulary on the INDIRECT kernel (the *_ind twin whose
+        only runtime parameter is the 8B slot).  The per-GRAPH slots and
+        param blocks are built at capture_launch time (one per captured
+        graph -- vLLM captures one FULL graph PER BATCH TIER and a single
+        shared block would have the later tiers overwrite the earlier
+        tiers' pointers; that exact token-flip was caught by the a0
+        indirect arm).  Here we only record the layout contract and let
+        prepare() run unchanged -- compile/merge/load/materialise/N4
+        catalogue all take the plain path (clone_first_arg=False keeps a
+        bootstrap slot through materialise)."""
+        import torch
+        if len(orig_args) < 6:
+            self._err("prepare_indirect",
+                      ValueError(f"want 6 direct args, got {len(orig_args)}"))
+            return False
+        name = str(getattr(ind_jit_fn, "__name__", None)
+                   or ind_jit_fn.fn.__name__)
+        # bootstrap slot (pinned host, UVA): only used to settle lazy
+        # loads through materialise; every real graph gets its own below
+        block = torch.zeros(len(_IND_BLOCK_LAYOUT), dtype=torch.int64,
+                            pin_memory=True)
+        for i, t in enumerate(orig_args[:6]):
+            block[i] = int(t.data_ptr())
+        for j, key in enumerate(_IND_BLOCK_LAYOUT[6:]):
+            if key not in kwargs:
+                self._err("prepare_indirect",
+                          KeyError(f"missing kwarg {key}"))
+                return False
+            block[6 + j] = int(kwargs[key])
+        # the four STRIDE_* now live IN THE BLOCK: they are not signature
+        # parameters of the indirect twin, and the JIT binder rejects
+        # unknown kwargs -- hand prepare the pruned dict
+        ind_kwargs = {k: v for k, v in kwargs.items()
+                      if k not in _IND_BLOCK_LAYOUT[6:]}
+        slot = torch.zeros(1, dtype=torch.int64, pin_memory=True)
+        slot[0] = block.data_ptr()
+        ok = self.prepare(ind_jit_fn, (slot,), ind_kwargs, grid,
+                          clone_first_arg=False)
+        if ok:
+            with _LOCK:
+                # "slots" grows one entry per captured graph (see
+                # capture_launch); lifetime = service = process
+                self._indirect[name] = {"slots": [slot],
+                                        "blocks": [block]}
+                self.state["indirect"] = name
+                self._publish()
+        return ok
+
+    def _indirect_new_pair(self, args, kwargs):
+        """Build ONE fresh (slot, block) pair in pinned host memory (UVA
+        -- the device dereferences them over PCIe) from a DIRECT-ABI
+        arg pack.  Host stores only: capture-legal, never recorded into
+        the graph, refreshable at any later time."""
+        import torch
+        block = torch.zeros(len(_IND_BLOCK_LAYOUT), dtype=torch.int64,
+                            pin_memory=True)
+        for i, t in enumerate(args[:6]):
+            block[i] = int(t.data_ptr())
+        for j, key in enumerate(_IND_BLOCK_LAYOUT[6:]):
+            block[6 + j] = int(kwargs[key])
+        slot = torch.zeros(1, dtype=torch.int64, pin_memory=True)
+        slot[0] = block.data_ptr()
+        return slot, block
+
+    def indirect_slot(self, jit_name: Optional[str] = None):
+        """V19 N2: the newest 8B slot of the armed indirect jit (or the
+        named one) -- capture-side/probe convenience."""
+        with _LOCK:
+            name = jit_name or self.state.get("indirect")
+            ind = self._indirect.get(name) if name else None
+            return ((ind or {}).get("slots") or [None])[-1]
+
+    def write_param_slot(self, jit_name, block=None, values=None) -> bool:
+        """V19 N2 8B-write channel (the PyGraph move): refresh block
+        entries and/or repoint slots, for EVERY live pair (all captured
+        batch tiers).  Slot and blocks are PINNED HOST memory -- every
+        write is a plain host store, legal inside a capture window and
+        effective for every subsequent launch/replay."""
+        with _LOCK:
+            ind = self._indirect.get(jit_name)
+        if ind is None:
+            return False
+        pairs = list(zip(ind.get("slots") or [],
+                         ind.get("blocks") or []))
+        if values:
+            for key, v in (values or {}).items():
+                idx = _IND_BLOCK_LAYOUT.index(key)
+                for _s, blk in pairs:
+                    blk[idx] = int(v)
+        if block is not None:
+            for s, _blk in pairs:
+                s[0] = int(block.data_ptr())
+        return True
 
     def _merge_ptxas(self, cu, kerns: Dict[str, Any], name: str) -> bytes:
         """Concatenate every renamed entry into one PTX (labels
@@ -379,7 +493,8 @@ class GraphKernelService:
             pass  # pool is an accelerator, never a gate
         return blob
 
-    def _materialize(self, cu, kernel, fn, args, kwargs, grid) -> None:
+    def _materialize(self, cu, kernel, fn, args, kwargs, grid,
+                     clone_first: bool = True) -> None:
         """One raw launch on cloned tensors to settle the lazy load."""
         if not args or not kwargs or not grid:
             return
@@ -388,7 +503,11 @@ class GraphKernelService:
         if not wait_out_of_capture():
             note_race("materialize")
         import torch
-        values = [torch.empty_like(args[0])] + list(args[1:])
+        # V19 N2: an INDIRECT-ABI kernel's args[0] is the 8B slot itself
+        # -- empty_like would forge a garbage slot (wild deref).  The
+        # slot/block are service-held, cloning is both wrong and unneeded
+        first = torch.empty_like(args[0]) if clone_first else args[0]
+        values = [first] + list(args[1:])
         na = self._abi_args(kernel, tuple(values), kwargs)
         stream = torch.cuda.current_stream().cuda_stream
         (rc,) = cu.cuLaunchKernel(
@@ -402,15 +521,32 @@ class GraphKernelService:
     def capture_launch(self, args, kwargs, grid) -> bool:
         """Launch __base raw INSIDE the capture window so the recorded
         node is born pointing at the prepared module.  Capture-legal
-        (plain cuLaunchKernel); falls back to False when unprepared."""
+        (plain cuLaunchKernel); falls back to False when unprepared.
+
+        V19 N2 (indirect mode): when the armed jit is the indirect twin,
+        the caller passes the DIRECT six-tensor args; a FRESH pinned-host
+        (slot, block) pair is built HERE per captured graph -- vLLM
+        captures one FULL graph per batch tier and a shared block would
+        let later tiers overwrite earlier tiers' pointers (a0 indirect
+        arm, token-flip evidence).  The launched kernel's only runtime
+        parameter is the slot, so each tier's node dereferences its own
+        block forever after."""
         with _LOCK:
             name = self.state.get("prepared")
             if not name:
                 return False
             v = self._variants.get((name, "__base"))
             kern = self._kerns.get((name, "__base"))
+            indirect = (self.state.get("indirect") == name
+                        and name in self._indirect)
         if v is None:
             return False
+        if indirect:
+            slot, block = self._indirect_new_pair(args, kwargs)
+            with _LOCK:
+                self._indirect[name]["slots"].append(slot)
+                self._indirect[name]["blocks"].append(block)
+            args = (slot,)
         na = self._abi_args(kern, tuple(args), kwargs)
         import torch
         (rc,) = self._cu.cuLaunchKernel(
@@ -511,7 +647,13 @@ class GraphKernelService:
                 mod, f"{jit_name}__{variant}".encode())
             if err != cu.CUresult.CUDA_SUCCESS:
                 raise RuntimeError(f"GetFunction(offer {variant}) {err}")
-            self._materialize(cu, k, fn, args, kwargs, grid)
+            # V19 N2: an indirect jit's args[0] IS the slot -- the
+            # materialise clone would forge a garbage slot (wild deref,
+            # async illegal access surfacing at the next replay)
+            with _LOCK:
+                _cf = jit_name not in self._indirect
+            self._materialize(cu, k, fn, args, kwargs, grid,
+                              clone_first=_cf)
             with _LOCK:
                 self._variants[(jit_name, variant)] = {
                     "fn": fn,
@@ -1156,9 +1298,29 @@ def install_replay_hook() -> bool:
 
         orig = torch.cuda.CUDAGraph.replay
         svc = get_service()
+        # V19 X1/N16 trail instrumentation (PACT_TRAIL=1, default OFF --
+        # three-principles discipline; probes open it explicitly).
+        # Columns: replay host-submit path, whole-graph GPU span (events
+        # hug the replay call, so the host gap is excluded), and the
+        # boundary-callback host cost.  Rolling median of the last 256
+        # reays lands in svc.state["trail"] -- pure observation, never a
+        # decision input.
+        # (rolling medians of the last 256 replays land in trail)
+        trail_on = os.environ.get("PACT_TRAIL") == "1"
+        _trail = {"host": [], "gpu": [], "bound": []}
 
         def _replay(self, *a, **kw):
+            import time as _time
+            ev_a = ev_b = None
+            t0 = _time.perf_counter() if trail_on else None
+            if trail_on:
+                ev_a = torch.cuda.Event(enable_timing=True)
+                ev_b = torch.cuda.Event(enable_timing=True)
+                ev_a.record()
             r = orig(self, *a, **kw)  # replay first: instantiates the exec
+            if trail_on:
+                ev_b.record()
+                t1 = _time.perf_counter()
             try:
                 with _LOCK:
                     svc.state["replay_calls"] += 1
@@ -1171,6 +1333,21 @@ def install_replay_hook() -> bool:
             except Exception:
                 pass
             svc.after_replay(self)   # retargets land from the NEXT replay
+            if trail_on:
+                t2 = _time.perf_counter()
+                _trail["host"].append((t1 - t0) * 1e6)
+                _trail["gpu"].append(ev_a.elapsed_time(ev_b) * 1e3)
+                _trail["bound"].append((t2 - t1) * 1e6)
+                if len(_trail["host"]) > 256:
+                    for k in _trail:
+                        del _trail[k][:-256]
+                if n % 32 == 0:
+                    import statistics as _st
+                    with _LOCK:
+                        svc.state["trail"] = {
+                            k: round(_st.median(v), 2)
+                            for k, v in _trail.items() if v}
+                        svc.state["trail"]["n"] = len(_trail["host"])
             return r
 
         torch.cuda.CUDAGraph.replay = _replay

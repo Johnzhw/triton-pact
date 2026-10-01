@@ -161,6 +161,12 @@ class GraphKernelService:
             "skipped_nodes": 0, "bind_rejected": 0,
             "exec_update_failures": 0, "auto_rollbacks": 0,
             "canaries": 0, "submit_rejects": 0, "blacklisted": [],
+            # V19 N4: content-hash variant catalogue (third evidence layer
+            # against cross-module silent corruption, after handle
+            # membership + structural audit).  "name::variant" ->
+            # {cubin_sha256, ptx_sha256, kind}; pure bookkeeping, no
+            # behaviour change on any path.
+            "content_hash": {}, "hash_misses": 0,
         }
 
     def _fi(self, kind: str) -> bool:
@@ -258,6 +264,11 @@ class GraphKernelService:
                 raise RuntimeError(f"cuModuleLoadDataEx {err}")
             with _LOCK:
                 self._mods[name] = mod
+                # V19 N4: register every merged entry's content hashes
+                # (all entries share the ONE merged cubin; per-variant
+                # identity comes from its own PTX).
+                import hashlib as _hl
+                _cub_sha = _hl.sha256(blob).hexdigest()[:16]
                 for vname, k in kerns.items():
                     err, fn = cu.cuModuleGetFunction(
                         mod, f"{name}__{vname}".encode())
@@ -270,6 +281,12 @@ class GraphKernelService:
                     }
                     self._kerns[(name, vname)] = k
                     self._known_funcs[int(fn)] = f"{name}::{vname}"
+                    self.state["content_hash"][f"{name}::{vname}"] = {
+                        "cubin_sha256": _cub_sha,
+                        "ptx_sha256": _hl.sha256(
+                            k.asm["ptx"].encode()).hexdigest()[:16],
+                        "kind": "merged",
+                    }
                 self._jit_args[name] = (tuple(args), dict(kwargs),
                                         tuple(grid))
                 self._jit_fns[name] = jit_fn
@@ -504,6 +521,15 @@ class GraphKernelService:
                 }
                 self._kerns[(jit_name, variant)] = k
                 self._known_funcs[int(fn)] = f"{jit_name}::{variant}"
+                # V19 N4: cross variants get their own single-entry cubin
+                # hash (the catalogue must hit EVERY loaded variant)
+                import hashlib as _hl
+                self.state["content_hash"][f"{jit_name}::{variant}"] = {
+                    "cubin_sha256": _hl.sha256(blob).hexdigest()[:16],
+                    "ptx_sha256": _hl.sha256(
+                        k.asm["ptx"].encode()).hexdigest()[:16],
+                    "kind": "cross",
+                }
                 self.state["offers"] += 1
                 self.state["last_offer_ms"] = round(
                     (time.monotonic() - t0) * 1e3, 1)
@@ -562,6 +588,19 @@ class GraphKernelService:
                     self.state["bind_rejected"] = \
                         int(self.state["bind_rejected"] or 0) + 1
                 continue
+            # V19 N4: membership passed -- the third layer cross-checks the
+            # handle's identity against the content-hash catalogue.  A miss
+            # means load bookkeeping broke (state corruption shape); it is
+            # COUNTERED + reported, never allowed to change bind behaviour
+            # (pure-checkin contract: observable, no semantics change).
+            ident = self._known_funcs.get(fhandle)
+            if ident is not None and \
+                    ident not in self.state.get("content_hash", {}):
+                with _LOCK:
+                    self.state["hash_misses"] = \
+                        int(self.state.get("hash_misses") or 0) + 1
+                self._err("content_hash(bind)",
+                          RuntimeError(f"uncatalogued handle {ident}"))
             found.append(_NodeBinding(
                 node=cu_node,
                 func_before=fhandle,

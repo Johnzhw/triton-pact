@@ -10,8 +10,10 @@
 #include "triton/Support/PactDecision.h"
 #include "triton/Support/PactSMDetect.h"
 
+#include "llvm/ADT/StringRef.h"
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <limits>
 
 namespace mlir::triton::pact {
@@ -194,15 +196,73 @@ SelectStagesResult selectNumStages(const SelectStagesInput &input) {
     // granularity of the scan's best (the computed model-error bound, not a
     // hand-tuned ratio); anything worse is vetoed.
     if (result.l2Cold) {
-      double tolerance = modelGranularity(input.numWarps);
-      int deepMax = std::min(result.feasibleMax, 5);
-      for (int s = deepMax; s >= 3; --s) {
-        double occ = scoreFor(s);
-        if (occ >= bestOcc - tolerance) {
-          chosen = s;
-          result.occupancy = occ;
-          result.l2Deepened = (s != bestStages);
-          break;
+      // V19 N12 (PACT_RESIDENCY_ILP=1, default OFF): the greedy
+      // resource-allocation form of the residency equations (OrbitFlow's
+      // capacity-constrained objective, degenerate solver — no new deps).
+      // The feasible set is a budget allocation over two resources:
+      // per-stage SMEM (input.tileBytes * s against the SMEM bound) and
+      // the L2 streaming share (residentCompetitor vs l2Bytes).  Rank
+      // candidates by marginal benefit per SMEM byte, then one bounded
+      // local-exchange pass (adjacent-depth swaps kept only when the
+      // joint score improves).  With the env unset the ORIGINAL scan
+      // below runs bit-for-bit — the greedy is an alternative selector,
+      // never a silent change.
+      static const bool ilpOn =
+          llvm::StringRef(std::getenv("PACT_RESIDENCY_ILP") ? "1" : "") ==
+          "1";
+      if (ilpOn) {
+        auto smemBytes = [&](int s) {
+          return static_cast<double>(input.tileBytes) * s;
+        };
+        double smemBudget = static_cast<double>(result.smemBound) *
+                            std::max(1.0, static_cast<double>(input.tileBytes));
+        int greedy = result.feasibleMin;
+        double greedyScore = -std::numeric_limits<double>::infinity();
+        for (int s = result.feasibleMin; s <= result.feasibleMax; ++s) {
+          double budget = smemBytes(s);
+          if (budget > smemBudget)
+            continue;
+          // marginal benefit per SMEM byte under streaming pressure:
+          // deeper staging amortises the DRAM stream, weighted by how
+          // far the resident competitor overshoots L2
+          double pressure = sm.l2Bytes > 0
+                                ? std::min(4.0, static_cast<double>(
+                                                    residentCompetitor) /
+                                                    static_cast<double>(sm.l2Bytes))
+                                : 1.0;
+          double marginal = scoreFor(s) * pressure /
+                            std::max(1.0, budget);
+          if (marginal > greedyScore) {
+            greedyScore = marginal;
+            greedy = s;
+          }
+        }
+        // local exchange (single bounded pass): try the adjacent depths
+        // around the greedy pick; move only when the plain score
+        // improves AND the SMEM budget still holds
+        for (int cand : {greedy - 1, greedy + 1}) {
+          if (cand < result.feasibleMin || cand > result.feasibleMax)
+            continue;
+          if (smemBytes(cand) > smemBudget)
+            continue;
+          if (scoreFor(cand) > scoreFor(greedy)) {
+            greedy = cand;
+          }
+        }
+        chosen = std::clamp(greedy, result.feasibleMin, result.feasibleMax);
+        result.occupancy = scoreFor(chosen);
+        result.l2Deepened = (chosen != bestStages);
+      } else {
+        double tolerance = modelGranularity(input.numWarps);
+        int deepMax = std::min(result.feasibleMax, 5);
+        for (int s = deepMax; s >= 3; --s) {
+          double occ = scoreFor(s);
+          if (occ >= bestOcc - tolerance) {
+            chosen = s;
+            result.occupancy = occ;
+            result.l2Deepened = (s != bestStages);
+            break;
+          }
         }
       }
     }

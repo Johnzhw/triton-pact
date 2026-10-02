@@ -169,13 +169,17 @@ struct PACTAutoNumStagesPass
     // elementwise family) the global stage choice misfired -- the five
     // regressing cells (0.641/0.856/0.894/0.905/0.941) all return to
     // band with P6 off (suite/results/v20/tb_pair/bisect_nop6.log).
-    // Fire ONLY on the paged families P1 recognized; prefill/unknown
-    // keep the native default.
+    // The first gate cut (prefill/unknown) fixed 3/5; the two remaining
+    // inductor fusions classify prefill_paged FALSE-POSITIVELY (a divsi
+    // + tile signal that is not real paging), so the firing domain is
+    // narrowed to the families with MEASURED P6 upside: decode_paged
+    // (V9 >=1.3x long-S micro evidence) and paged_rt_or_gather
+    // (W6'c/W7' target ops).  prefill_paged keeps the native default
+    // until it earns its own pairing evidence.
     if (auto ktype = mod->getAttrOfType<StringAttr>("pact.kernel_type")) {
       auto kv = ktype.getValue();
-      if (kv != "decode_paged" && kv != "prefill_paged" &&
-          kv != "paged_rt_or_gather") {
-        llvm::errs() << "[PACT P6] Non-paged kernel (" << kv
+      if (kv != "decode_paged" && kv != "paged_rt_or_gather") {
+        llvm::errs() << "[PACT P6] Out-of-domain kernel (" << kv
                      << ") detected, skipping (V20 W3' domain gate).\n";
         return;
       }

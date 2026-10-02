@@ -163,26 +163,25 @@ struct PACTAutoNumStagesPass
 
     ModuleOp mod = getOperation();
 
-    // Pure prefill (no paged access pattern) was skipped by P1; keep P6
-    // consistent with that skip decision.  V20 W3' bisect tightens the
-    // domain further: on NON-paged kernels (tritonbench inductor/
-    // elementwise family) the global stage choice misfired -- the five
-    // regressing cells (0.641/0.856/0.894/0.905/0.941) all return to
-    // band with P6 off (suite/results/v20/tb_pair/bisect_nop6.log).
-    // The first gate cut (prefill/unknown) fixed 3/5; the two remaining
-    // inductor fusions classify prefill_paged FALSE-POSITIVELY (a divsi
-    // + tile signal that is not real paging), so the firing domain is
-    // narrowed to the families with MEASURED P6 upside: decode_paged
-    // (V9 >=1.3x long-S micro evidence) and paged_rt_or_gather
-    // (W6'c/W7' target ops).  prefill_paged keeps the native default
-    // until it earns its own pairing evidence.
-    if (auto ktype = mod->getAttrOfType<StringAttr>("pact.kernel_type")) {
-      auto kv = ktype.getValue();
-      if (kv != "decode_paged" && kv != "paged_rt_or_gather") {
-        llvm::errs() << "[PACT P6] Out-of-domain kernel (" << kv
-                     << ") detected, skipping (V20 W3' domain gate).\n";
-        return;
-      }
+    // V20 W3' domain gate (v3, annotation-anchored): fire only when P1
+    // actually annotated paged/gather loads in this module.  Structural
+    // classify signals (divsi + arith users) false-positive on inductor
+    // fusions -- they carry a decode_paged label with no real paging and
+    // paid up to -36% under the global stage choice (bisect:
+    // suite/results/v20/tb_pair/bisect_nop6.log); the annotation is the
+    // ground truth that Phase 1/2 completed on THIS kernel.  The type
+    // whitelist of gate v1/v2 was insufficient (the fusions classify
+    // decode_paged).
+    bool hasPactLoad = false;
+    mod.walk([&](Operation *op) {
+      if (op->hasAttr("pact.paged_load") ||
+          op->hasAttr("pact.gather_load"))
+        hasPactLoad = true;
+    });
+    if (!hasPactLoad) {
+      llvm::errs() << "[PACT P6] No pact.paged/gather_load annotations, "
+                      "skipping (V20 W3' domain gate v3).\n";
+      return;
     }
 
     // Architecture-aware default: 2-3 for Ampere, 5 for Hopper

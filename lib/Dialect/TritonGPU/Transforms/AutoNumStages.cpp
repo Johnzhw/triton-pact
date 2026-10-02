@@ -164,10 +164,19 @@ struct PACTAutoNumStagesPass
     ModuleOp mod = getOperation();
 
     // Pure prefill (no paged access pattern) was skipped by P1; keep P6
-    // consistent with that skip decision.
+    // consistent with that skip decision.  V20 W3' bisect tightens the
+    // domain further: on NON-paged kernels (tritonbench inductor/
+    // elementwise family) the global stage choice misfired -- the five
+    // regressing cells (0.641/0.856/0.894/0.905/0.941) all return to
+    // band with P6 off (suite/results/v20/tb_pair/bisect_nop6.log).
+    // Fire ONLY on the paged families P1 recognized; prefill/unknown
+    // keep the native default.
     if (auto ktype = mod->getAttrOfType<StringAttr>("pact.kernel_type")) {
-      if (ktype.getValue() == "prefill") {
-        llvm::errs() << "[PACT P6] Prefill kernel detected, skipping.\n";
+      auto kv = ktype.getValue();
+      if (kv != "decode_paged" && kv != "prefill_paged" &&
+          kv != "paged_rt_or_gather") {
+        llvm::errs() << "[PACT P6] Non-paged kernel (" << kv
+                     << ") detected, skipping (V20 W3' domain gate).\n";
         return;
       }
     }

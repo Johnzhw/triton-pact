@@ -74,6 +74,12 @@ inline const std::set<std::string> CACHE_INVALIDATING_ENV_VARS = {
     // V18 G-1/BR-15: flips P11 stagesPerBlock (2<->3) -> changes the
     // warp decision -> changes the binary; must invalidate the cache.
     "PACT_P11_LEGACY_ASSUMPTION",
+    // V20 W6'a family A/B (default OFF): generalized P1 recognition —
+    // runtime stride/page divisor (PACT_RUNTIME_PAGE) and gather-row
+    // stride (PACT_GATHER_CONTIG) both change IR annotations and hence
+    // the binary when set; both must invalidate the cache.
+    "PACT_RUNTIME_PAGE",
+    "PACT_GATHER_CONTIG",
     // clang-format on
 };
 

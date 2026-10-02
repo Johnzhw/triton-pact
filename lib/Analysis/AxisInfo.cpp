@@ -667,6 +667,30 @@ private:
             rhsDivisibility = std::max(rhsDivisibility, rhsBound);
             break;
           }
+          // V20 W6'a family B (PACT_GATHER_CONTIG, attrs written only
+          // under that env): a gather-row load whose addptr offset is
+          // idx*STRIDE with STRIDE a runtime arg of tt.divisibility d
+          // has idx*STRIDE*elemSize divisible by d*elemSize — for
+          // d>=16/elemSize>=2 the row group start is 16B-aligned, the
+          // alignment proof vanilla AxisInfo cannot make for runtime
+          // values.  Dims come from pact.head_dim_idx (last dim only).
+          if (loadOp->hasAttr("pact.gather_load")) {
+            int64_t hdIdx = -1;
+            if (auto hdi = loadOp->template getAttrOfType<IntegerAttr>(
+                    "pact.head_dim_idx"))
+              hdIdx = hdi.getInt();
+            if (dim == hdIdx) {
+              int64_t strideDiv = 16;
+              if (auto sd = loadOp->template getAttrOfType<IntegerAttr>(
+                      "pact.stride_div"))
+                strideDiv = sd.getInt();
+              lhsDivisibility = std::max(lhsDivisibility, int64_t(16));
+              rhsDivisibility = std::max(
+                  rhsDivisibility,
+                  std::min<int64_t>(16, strideDiv * elemSize));
+            }
+            break;
+          }
         }
       }
       // P0 (Pass B) fallback for divisibility: penetrate intermediate ops.

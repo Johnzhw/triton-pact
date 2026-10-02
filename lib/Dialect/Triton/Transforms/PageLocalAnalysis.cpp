@@ -85,7 +85,8 @@ static LinearLayout buildPagedMemoryLayout(int64_t headDim, int64_t pageSize,
 //                 → extsi → addi/muli → splat/broadcast/expand_dims → addptr
 // The old code only inspected the *direct* offset operand of addptr, so it
 // never found the remsi and always fell back to P1's page_boundary_safe.
-static bool traceToRemSIOp(Value val, int64_t pageSize, int maxDepth) {
+static bool traceToRemSIOp(Value val, int64_t pageSize, int maxDepth,
+                           Value divisorArg = Value()) {
   if (maxDepth <= 0)
     return false;
 
@@ -98,6 +99,22 @@ static bool traceToRemSIOp(Value val, int64_t pageSize, int maxDepth) {
     if (auto constOp =
             remOp.getRhs().template getDefiningOp<arith::ConstantIntOp>()) {
       if (constOp.value() == pageSize)
+        return true;
+    }
+    // V20 W6'a family A: remsi by the RUNTIME divisor argument (its
+    // identity was recorded by P1 as pact.page_divisor_arg)
+    if (divisorArg) {
+      Value rhs = remOp.getRhs();
+      for (int i = 0; i < 6 && rhs.getDefiningOp(); i++) {
+        auto *rdef = rhs.getDefiningOp();
+        auto rname = rdef->getName().getStringRef();
+        if (rname == "arith.extsi" || rname == "arith.extui" ||
+            rname == "arith.index_cast" || rname == "tt.splat")
+          rhs = rdef->getOperand(0);
+        else
+          break;
+      }
+      if (rhs == divisorArg)
         return true;
     }
   }
@@ -176,6 +193,20 @@ struct PageLocalAnalysisPass
       if (auto attr = loadOp->getAttrOfType<IntegerAttr>("pact.head_dim_size"))
         headSize = attr.getInt();
 
+      // V20 W6'a family A: runtime divisor identity (P1 recorded the
+      // argument index when the page size is a runtime scalar)
+      Value divisorArg;
+      bool runtimePage = false;
+      if (auto attr = loadOp->getAttrOfType<IntegerAttr>(
+              "pact.page_divisor_arg")) {
+        auto func = loadOp->getParentOfType<triton::FuncOp>();
+        if (func && attr.getInt() >= 0 &&
+            attr.getInt() < func.getNumArguments()) {
+          divisorArg = func.getArgument(attr.getInt());
+          runtimePage = true;
+        }
+      }
+
       // === Step 2: dataflow-aware static safety ===
       // v2 improvement: trace the pointer chain to find remsi(PAGE_SIZE)
       // and determine the actual block_offset within the page.
@@ -201,8 +232,24 @@ struct PageLocalAnalysisPass
                 directRem = true;
               }
             }
+            if (!directRem && divisorArg) {
+              Value rhs = remOp.getRhs();
+              for (int i = 0; i < 6 && rhs.getDefiningOp(); i++) {
+                auto *rdef = rhs.getDefiningOp();
+                auto rname = rdef->getName().getStringRef();
+                if (rname == "arith.extsi" || rname == "arith.extui" ||
+                    rname == "arith.index_cast" || rname == "tt.splat")
+                  rhs = rdef->getOperand(0);
+                else
+                  break;
+              }
+              if (rhs == divisorArg)
+                directRem = true;
+            }
           }
-          if (directRem || traceToRemSIOp(offset, pageSize, /*maxDepth=*/6)) {
+          if (directRem ||
+              traceToRemSIOp(offset, pageSize, /*maxDepth=*/6,
+                             divisorArg)) {
             // block_offset = token_start % PAGE_SIZE ∈ [0, pageSize)
             foundBlockOffset = true;
             break;
@@ -228,7 +275,9 @@ struct PageLocalAnalysisPass
         //   pageSize % tileTokens == 0  → block_offset ∈ {0, TILE, 2·TILE, …},
         //     tile ends exactly at the page boundary.
         //   tileTokens % pageSize == 0  → block_offset ≡ 0 (tile ≡ page).
-        staticallySafe =
+        // V20 W6'a family A: with a RUNTIME page size the numeric
+        // comparison is impossible — stay conservative (mask path).
+        staticallySafe = !runtimePage &&
             (pageSize % tileTokens == 0 || tileTokens % pageSize == 0);
       } else {
         // Fallback: use P1's page_boundary_safe attribute

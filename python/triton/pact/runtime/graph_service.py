@@ -46,6 +46,8 @@ import time
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
+from triton.pact.runtime import capture_guard as _cg
+
 _LOCK = threading.RLock()
 _SERVICE: Optional["GraphKernelService"] = None
 _REPLAY_HOOKED = False
@@ -143,6 +145,10 @@ class GraphKernelService:
         self._boundary: Optional[Callable[[], None]] = None
         self._target_jit: Optional[str] = None
         self._skip: set = set()          # id(graph) that failed to bind
+        # V20 W1-1: capture generation each binding was snapshotted at
+        # (None/missing == never bound; a mismatch means the graph id was
+        # re-captured after the snapshot -- stale node handles, B-2)
+        self._bind_gen: Dict[int, int] = {}
         # V17 S3-2 ②: consecutive-apply backoff + give-up blacklist
         self._fail_streak: Dict[Tuple[str, str], int] = {}
         self._blacklist: set = set()     # (jit, variant) abandoned
@@ -183,6 +189,8 @@ class GraphKernelService:
             "content_hash": {}, "hash_misses": 0,
             # V19 N2: indirect-ABI jit name once prepare_indirect ran
             "indirect": None,
+            # V20 W1-1: gid state drops caused by re-captures (B-2 fix)
+            "recapture_drops": 0,
         }
 
     def _fi(self, kind: str) -> bool:
@@ -683,6 +691,54 @@ class GraphKernelService:
             return False
 
     # -- graph binding ---------------------------------------------------
+    # -- V20 W1-1 (B-2 stale-bind fix) ------------------------------------
+    def _binding_stale(self, gid: int) -> bool:
+        """True when a capture completed after this binding's snapshot:
+        the graph object was re-captured (vLLM lazy re-capture keeps the
+        same id) or the id was recycled onto a newly captured graph.  The
+        snapshotted CUgraphNode handles are dead either way."""
+        rec = self._bind_gen.get(gid)
+        return rec is not None and rec != _cg.capture_generation()
+
+    def _drop_locked(self, gid: int) -> bool:
+        """Drop ALL per-gid service state (caller holds _LOCK).  The
+        per-jit retarget state (_active/_pending) is global and survives.
+        Returns True when anything was actually dropped."""
+        had = (gid in self._bindings or gid in self._keep
+               or gid in self._execs or gid in self._jits
+               or gid in self._graph_active or gid in self._skip
+               or gid in self._bind_gen)
+        if had:
+            self._bindings.pop(gid, None)
+            self._keep.pop(gid, None)
+            self._execs.pop(gid, None)
+            self._jits.pop(gid, None)
+            self._graph_active.pop(gid, None)
+            self._skip.discard(gid)
+            self._bind_gen.pop(gid, None)
+            self.state["recapture_drops"] = \
+                int(self.state.get("recapture_drops") or 0) + 1
+        return had
+
+    def drop_stale_bindings(self, gid: int) -> None:
+        """Called by capture_guard.note_recapture right after the graph
+        object survived a (re-)capture: every node handle snapshotted for
+        the previous capture generation of this id is stale.  Dropping
+        here means the next replay re-binds from scratch (the re-captured
+        nodes are born at __base again inside the new capture window)."""
+        with _LOCK:
+            self._drop_locked(gid)
+        self._publish()
+
+    def _clear_family_streak(self, jit_name: str) -> None:
+        """V20 W1-2: one healthy outcome for this jit (a successful apply
+        or rollback) resets the give-up counter for ALL its variants.
+        Streaks used to persist for variants that simply stopped being
+        submitted, then rode unrelated successes up to the 3-strike
+        blacklist."""
+        for k in [k for k in self._fail_streak if k[0] == jit_name]:
+            self._fail_streak.pop(k, None)
+
     def bind_graph(self, graph, jit_name: str) -> int:
         """Locate this jit's kernel nodes in a torch-captured graph
         (keep_graph=True required) and snapshot their original params."""
@@ -690,7 +746,12 @@ class GraphKernelService:
         gid = id(graph)
         with _LOCK:
             if gid in self._bindings:
-                return len(self._bindings[gid])
+                if not self._binding_stale(gid):
+                    return len(self._bindings[gid])
+                # V20 W1-1: a capture completed after this snapshot (a
+                # note_recapture path this binding somehow missed) --
+                # drop the stale state and re-bind below
+                self._drop_locked(gid)
         from cuda.bindings import runtime as rt
         graph_h = graph.raw_cuda_graph()
         err, _, num = rt.cudaGraphGetNodes(graph_h, numNodes=0)
@@ -767,6 +828,9 @@ class GraphKernelService:
             # captured nodes are BORN at __base (capture_launch); every
             # switch after that is intra-module
             self._graph_active.setdefault(gid, "__base")
+            # V20 W1-1: snapshot the capture generation this binding is
+            # valid for (re-capture invalidates it, see _binding_stale)
+            self._bind_gen[gid] = _cg.capture_generation()
             self.state["binds"] += 1
             self.state["nodes"] += len(found)
         self._publish()
@@ -962,7 +1026,9 @@ class GraphKernelService:
                 self._active[jit_name] = variant
                 self.state["last_recode_ms"] = round(
                     (time.monotonic() - t0) * 1000.0, 4)
-                self._fail_streak.pop((jit_name, variant), None)
+                # V20 W1-2: a successful apply of this jit clears the
+                # WHOLE family's streak, not just this variant's
+                self._clear_family_streak(jit_name)
             elif not items:
                 # idempotent re-submit: every bound graph already runs it
                 self._active[jit_name] = variant
@@ -1234,6 +1300,9 @@ class GraphKernelService:
                 self.state["rollbacks"] += 1
                 self.state["active"] = None
                 self._active.pop(jit_name, None)
+                # V20 W1-2 (rollback side): a successful rollback is a
+                # healthy apply of this jit -- clear the family streak
+                self._clear_family_streak(jit_name)
         self._publish()
         return applied > 0
 
@@ -1251,6 +1320,13 @@ class GraphKernelService:
         NEXT replay, which is exactly the async-frame contract."""
         try:
             gid = id(graph)
+            # V20 W1-1: a binding whose capture generation no longer
+            # matches (re-captured graph, missed note_recapture) is
+            # dropped BEFORE the skip/early gates so a re-captured graph
+            # re-binds instead of sailing past on stale state
+            if self._binding_stale(gid) and (gid in self._bindings
+                                             or gid in self._skip):
+                self.drop_stale_bindings(gid)
             if gid in self._skip:
                 return
             if gid not in self._bindings:

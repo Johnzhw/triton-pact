@@ -23,6 +23,7 @@ import time
 _busy = threading.Event()   # set == a capture is in progress
 _lock = threading.Lock()
 _n = 0                      # capture nesting depth
+_generation = 0             # completed-capture generation (V20 W1-1)
 
 
 def capture_begin() -> None:
@@ -38,6 +39,35 @@ def capture_end() -> None:
         _n = max(_n - 1, 0)
         if _n == 0:
             _busy.clear()
+
+
+def capture_generation() -> int:
+    with _lock:
+        return _generation
+
+
+def note_recapture(graph_id: int) -> None:
+    """V20 W1-1 (B-2 stale-bind fix): the harness wrap calls this right
+    after a CUDAGraph's capture_end -- the graph OBJECT survived a
+    (re-)capture (vLLM lazy re-capture reuses it, id() unchanged), so any
+    binding snapshotted from an EARLIER capture of this id holds dead
+    CUgraphNode handles.  Bump the generation counter and drop the
+    service state for exactly this gid (a blanket generation compare
+    would force needless rebinds of every other tier's still-valid
+    binding).  NOTE: _lock is NEVER held across the graph_service call
+    (lock-order discipline: graph_service._LOCK -> capture_guard._lock
+    only, never the reverse nesting).
+
+    Un-wrapped processes never call this -- behaviour bit-for-bit
+    unchanged there."""
+    global _generation
+    with _lock:
+        _generation += 1
+    try:
+        from triton.pact.runtime.graph_service import get_service
+        get_service().drop_stale_bindings(graph_id)
+    except Exception:
+        pass
 
 
 def is_capture_busy() -> bool:

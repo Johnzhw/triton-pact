@@ -75,7 +75,14 @@ class InferenceSession:
         self._fo_enabled = os.environ.get("PACT_FACTS_ONLY") == "1"
         self._fo_every = max(1, int(
             os.environ.get("PACT_FACTS_ONLY_EVERY") or 64))
+        # V21-C4 lesson: the ~700ms counter window must NOT ride every
+        # facts send — decouple the CUPTI cadence from the EMA cadence
+        # (the replica EMA is ms-level and wants to stay fresh; counters
+        # are windows and can be sampled sparsely).  0 = never.
+        self._fo_cupti_every = int(
+            os.environ.get("PACT_FACTS_ONLY_CUPTI_EVERY") or 16)
         self._fo_calls = 0
+        self._fo_sends = 0
         self._fo_inflight = False
         self._fo_lock = threading.Lock()
         # V21-C2 (F3): the in_flight check-then-set races between the
@@ -253,11 +260,15 @@ class InferenceSession:
             if self._fo_inflight or self._fo_calls % self._fo_every:
                 return
             self._fo_inflight = True
+            self._fo_sends += 1
+            sends = self._fo_sends
         self.drift_stats["facts_only_sent"] += 1
+        cupti_ok = via_bg and self._fo_cupti_every > 0 and \
+            sends % self._fo_cupti_every == 0
         msg = {"msg_id": f"req_{next(_MSG_IDS)}", "type": "facts_only",
                "bucket": repr(bucket),
                "workload": {"B": batch, "S": seq_len},
-               "want_cupti": bool(via_bg)}
+               "want_cupti": bool(cupti_ok)}
 
         def _cycle():
             try:

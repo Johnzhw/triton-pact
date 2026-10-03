@@ -10,8 +10,14 @@ entries); the prefix is now part of the documented grammar.
 V14-B: the vocabulary adds ``cold`` (S1 auto family: lifts the stage cap,
 P6's L2-residency gate itself keeps hot shapes at the theory decision).
 The aobo inline path can emit it today via its cold-aware reselection;
-table/learned entries for it land with a future re-fit that measures the
-cold variant directly.
+table/learned entries for it land with a future re-fit that measures
+the cold variant directly.
+
+V21-D (0a/0c mechanism C): the vocabulary adds the NAMED VARIANT arms
+``p1rt`` (family A runtime page) and ``p1g`` (family B gather contig) —
+a v3 table/learned model selects them per cell and the decider injects
+their env via the learned-policy variants dict (zero C++; per-cell
+default-on is expressed table-side, never as a global env flip).
 """
 from __future__ import annotations
 
@@ -22,7 +28,9 @@ from typing import Dict, Optional
 from triton.pact.runtime.workload_sniffer import bucket_bs
 
 KNOWN_FAMILIES = ("theory", "occupancy", "latency", "vanilla",
-                  "deep", "short", "w1", "cold")
+                  "deep", "short", "w1", "cold",
+                  # V21-D named variants (env-dict arms, see docstring)
+                  "p1rt", "p1g")
 
 
 def _occ_bucket(permille: Optional[int]) -> str:
@@ -65,6 +73,14 @@ class FamilyTable:
                    if not (isinstance(v, str) and v in KNOWN_FAMILIES)}
         self.entries = {k: v for k, v in entries.items() if k not in dropped}
         self.dropped = dropped
+        # V21-D (F13, BR-17 "counted, never silent"): a dropped entry is
+        # a vocabulary miss the decider can NEVER act on — one visible
+        # line at load, so a stale table fails loudly upstream instead
+        # of silently narrowing the action space.
+        if dropped:
+            print(f"[PACT FamilyTable] dropped {len(dropped)} entries "
+                  f"outside KNOWN_FAMILIES: "
+                  f"{sorted(dropped.values())[:6]}", flush=True)
         self.default = default if default in KNOWN_FAMILIES else "theory"
 
     @classmethod

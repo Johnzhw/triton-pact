@@ -31,7 +31,12 @@ from triton.pact.decider.family_table import FamilyTable
 _SWALLOWED: Dict[str, Any] = {"predict_errors": 0, "load_errors": 0,
                               "schema_refused": 0, "last_error": None}
 
-FEATURE_ORDER = ("logS", "logD", "logP", "B")
+# V21-D (F14): FEATURE_ORDER was a dead 4-wide constant left from the
+# pre-T6 era (features() returns 7 since V16-T6 and nothing read it);
+# removed.  The runtime-truth extension lives in features11 below.
+
+_RUNTIME_KEYS = ("stall_memory_permille", "l2_hit_permille",
+                 "active_warp_ratio_permille", "sm_efficiency_permille")
 
 
 def features(cfg: Dict[str, Any]) -> list:
@@ -55,6 +60,27 @@ def features(cfg: Dict[str, Any]) -> list:
             round(math.log2(max(gqa * d, 1)), 3)]
 
 
+def features11(cfg: Dict[str, Any], facts: Optional[Dict] = None) -> list:
+    """V21-D (0a dual-source, schema v8): the 7 static geometry dims
+    plus the four CUPTI runtime-truth permilles (stall/l2/warp/sm) —
+    the USER-DEFINED core innovation: the mapping must distinguish on
+    runtime truth, not geometry alone.
+
+    Runtime dims missing (no trigger-window facts) -> returns the plain
+    7-dim vector: the v8 kNN pads the missing columns with prototype
+    means (a neutral centre) and counts it — the transient safety net;
+    the acceptance evidence (observation non-empty rate) lives in
+    drift_stats, and a steady-state miss means the COLLECTION chain is
+    broken (fix the chain, never widen the fallback)."""
+    x = features(cfg)
+    if not isinstance(facts, dict):
+        return x
+    vals = [facts.get(k) for k in _RUNTIME_KEYS]
+    if not all(isinstance(v, (int, float)) for v in vals):
+        return x
+    return x + [float(v) for v in vals]
+
+
 class LearnedPolicy:
     # path -> ((mtime_ns, size), LearnedPolicy) -- see load()
     _cache: Dict[str, tuple] = {}
@@ -70,9 +96,11 @@ class LearnedPolicy:
         # V17 S1-3 ①: explicit feature-schema versioning replaces the
         # silent zip() truncation of _predict_knn.  4 = pre-T6 models,
         # 6 = V16-T6 (adds GQA + log2 KV working-set), 7 = V18 B3 v7
-        # (adds the GQA x D interaction log2(GQA*D)).  A missing field
-        # is INFERRED from the prototype width and counted; with
-        # PACT_STRICT_SCHEMA=1 a mismatch refuses to load instead.
+        # (adds the GQA x D interaction log2(GQA*D)), 8 = V21-D
+        # (adds the four CUPTI runtime permilles — dual-source).  A
+        # missing field is INFERRED from the prototype width and
+        # counted; with PACT_STRICT_SCHEMA=1 a mismatch refuses to
+        # load instead.
         self.feature_schema_version = data.get("feature_schema_version")
         if self.feature_schema_version is None and self.prototypes:
             w = len(self.prototypes[0].get("feat") or [])
@@ -100,7 +128,7 @@ class LearnedPolicy:
             # V17 S1-3 ①: strict mode refuses schema-mismatched models
             # outright instead of padding at predict time
             if os.environ.get("PACT_STRICT_SCHEMA") == "1" and \
-                    obj.feature_schema_version not in (None, 4, 6, 7):
+                    obj.feature_schema_version not in (None, 4, 6, 7, 8):
                 _SWALLOWED["schema_refused"] += 1
                 return None
             if key is not None:
@@ -129,8 +157,11 @@ class LearnedPolicy:
         # with fewer features than the runtime vector pads its prototype
         # columns with the per-column MEAN over prototypes (a neutral
         # centre for the L1 distance), and every padded prediction is
-        # counted; more features than runtime is a hard mismatch ->
-        # default pick (counted).  Silent dimension dropping is gone.
+        # counted; V21-D: a model with MORE features (schema v8) than
+        # the runtime vector (no trigger-window facts) pads the RUNTIME
+        # side the same way — the static-7 degradation keeps using the
+        # static columns instead of jumping to the default pick.  Silent
+        # dimension dropping is gone.
         want = len(x)
         feats = [p["feat"] for p in self.prototypes]
         width = len(feats[0]) if feats else want
@@ -140,8 +171,9 @@ class LearnedPolicy:
             feats = [list(f) + means[width:] for f in feats]
             self.schema_padded += 1
         elif width > want:
+            cols = list(zip(*feats))
+            x = list(x) + [sum(c) / len(c) for c in cols[want:]]
             self.schema_padded += 1
-            return self.default_pick, 1.0
         ds = []
         for p, f in zip(self.prototypes, feats):
             d = sum(abs(a - b) for a, b in zip(x, f))
@@ -184,8 +216,11 @@ class LearnedPolicy:
                 best, best_v = v, m
         return best, best_v
 
-    def predict(self, cfg: Dict[str, Any]) -> Tuple[str, float]:
-        x = features(cfg)
+    def predict(self, cfg: Dict[str, Any],
+                facts: Optional[Dict] = None) -> Tuple[str, float]:
+        # V21-D: the dual-source vector — facts (CUPTI permilles) extend
+        # the static geometry whenever the trigger window provided them
+        x = features11(cfg, facts)
         if self.kind == "tree":
             return self._predict_tree(x)
         if self.kind == "knn":
@@ -244,7 +279,7 @@ def decide(facts: Dict[str, Any], batch: int, seq_len: int,
                 bandit = _exp3_for(cfg, policy)
                 variant = bandit.select()
             if variant is None:
-                variant, _ = policy.predict(cfg)
+                variant, _ = policy.predict(cfg, facts)
             env = policy.env_for(variant)
             if env is not None:
                 if variant == "vanilla":
@@ -331,7 +366,13 @@ def _exp3_for(cfg: Dict[str, Any], policy) -> Optional[Exp3Bandit]:
     b = _EXP3.get(key)
     if b is None:
         arms = [a for a in (policy.variants or {}) if a != "vanilla"]
-        b = Exp3Bandit(arms, seed=hash(key) & 0xFFFF)
+        # V21-D (F4): deterministic seed — str hash() is salted by
+        # PYTHONHASHSEED, so cross-process selection sequences were not
+        # reproducible (against the bit-for-bit discipline).  sha256 of
+        # the bucket key is stable everywhere.
+        import hashlib
+        seed = int(hashlib.sha256(str(key).encode()).hexdigest()[:8], 16)
+        b = Exp3Bandit(arms, seed=seed & 0xFFFF)
         _EXP3[key] = b
     return b
 

@@ -63,6 +63,46 @@ class InferenceSession:
         # contract untouched (single-writer would have to own the
         # maybe_request dispatch itself).
         self._l1_lock = threading.Lock()
+        # V21-C1 (F1 fix, PLAN_V21_v3 §C): a throttled facts_only RPC is
+        # the observation source for STATIONARY done buckets — the F1
+        # starvation chain is that the done-bucket early return never
+        # sends an RPC, so EMA/streak freeze and the drift machines can
+        # never re-arm.  OFF unless PACT_FACTS_ONLY=1; one lightweight
+        # observation per PACT_FACTS_ONLY_EVERY boundary calls (no
+        # compile, no shm).  CUPTI counters are requested only when the
+        # cycle runs on the background worker — the ~700ms counter
+        # session must never sit on a caller thread.
+        self._fo_enabled = os.environ.get("PACT_FACTS_ONLY") == "1"
+        self._fo_every = max(1, int(
+            os.environ.get("PACT_FACTS_ONLY_EVERY") or 64))
+        self._fo_calls = 0
+        self._fo_inflight = False
+        self._fo_lock = threading.Lock()
+        # V21-C2 (F3): the in_flight check-then-set races between the
+        # inline decode thread and the async background worker (both
+        # call the entry points) — one lock makes the gate atomic.  The
+        # reset moves to try/finally: try_request only swallows
+        # network-class errors, any other exception used to strand
+        # in_flight=True forever.
+        self._if_lock = threading.Lock()
+        # V21-C3 (0e counter-drift): third trigger channel — same state
+        # machine shape as L1, fed by the SAME facts stream (normal RPC
+        # responses + the facts_only source).  OFF unless
+        # PACT_TRIGGER_L2C=1.  The cooldown clock is SHARED with L1
+        # (_l1_last_s): the N9 lesson is that overlapping re-arm windows
+        # double the swap rate (chunk_swaps 96 -> 204, -3.2% in-band).
+        self._l2c_enabled = os.environ.get("PACT_TRIGGER_L2C") == "1"
+        self._l2c_tau = float(
+            os.environ.get("PACT_TRIGGER_L2C_TAU") or 0.25)
+        self._l2c_k = int(os.environ.get("PACT_TRIGGER_L2C_K") or 3)
+        self._l2c_ema: Dict[str, Dict[str, float]] = {}
+        self._l2c_streak = 0
+        # V21 acceptance evidence (core constraint): observation
+        # non-empty rate + per-channel re-arm counts — read-only state
+        # for W-drift harnesses/probes, never a decision input.
+        self.drift_stats: Dict[str, Any] = {
+            "facts_only_sent": 0, "l1_rearms": 0, "l2c_rearms": 0,
+            "observe_nonempty": 0, "observe_empty": 0}
         # V12-P1 (PACT_ASYNC_PGO=1): async frame state — a single daemon
         # background worker owns the decide/compile/measure cycle; the swap
         # is consumed at a launch boundary.  All-zero until the env is set.
@@ -103,16 +143,22 @@ class InferenceSession:
         """Track the service-reported replica EMA: first settled value per
         bucket becomes the baseline; consecutive over-tau deviations build
         the streak that later re-arms the bucket.  V17 S0-1: the whole
-        read-modify-write runs under _l1_lock (two caller threads)."""
+        read-modify-write runs under _l1_lock (two caller threads).
+        V21-C1/F2: the baseline key is the SERVER-echoed bucket (the EMA
+        is per-bucket service-side since V21-C1); an old server without
+        the echo falls back to prev_bucket, exactly the old grammar."""
         if not self._l1_enabled or not isinstance(resp, dict):
             return
         facts = (resp.get("facts") or {}) if "facts" in resp else \
             ((resp.get("service") or {}).get("facts") or {})
         ema = facts.get("replica_median_us_ema")
         if not isinstance(ema, (int, float)) or ema <= 0:
+            if "facts" in resp or "service" in resp:
+                self.drift_stats["observe_empty"] += 1
             return
+        self.drift_stats["observe_nonempty"] += 1
         with self._l1_lock:
-            key = f"{self.prev_bucket}"
+            key = str(resp.get("bucket") or self.prev_bucket)
             base = self._ema_baseline.get(key)
             if base is None:
                 self._ema_baseline[key] = float(ema)
@@ -126,8 +172,10 @@ class InferenceSession:
                 self._ema_baseline[key] = 0.7 * base + 0.3 * float(ema)
 
     def _l1_ready(self) -> bool:
-        """Streak >= k AND cooldown elapsed since the last L1 re-arm
-        (check-and-consume under _l1_lock)."""
+        """Streak >= k AND cooldown elapsed since the last drift re-arm
+        (check-and-consume under _l1_lock).  V21-C3: _l1_last_s is the
+        SHARED drift cooldown clock — the L2C channel consumes the same
+        window so the two drift channels can never stack re-arms."""
         with self._l1_lock:
             if not self._l1_enabled or self._l1_streak < self._l1_k:
                 return False
@@ -136,103 +184,204 @@ class InferenceSession:
                 return False
             self._l1_last_s = now
             self._l1_streak = 0     # re-arm consumes the streak
+            self.drift_stats["l1_rearms"] += 1
             return True
+
+    def _l2c_observe(self, resp: Optional[Dict]) -> None:
+        """V21-C3 (0e): counter-drift observation — first settled
+        (stall, l2) pair per bucket is the baseline; consecutive
+        over-tau deviations on EITHER counter build a shared streak.
+        Fed by the same stream as L1 (normal RPC facts + facts_only).
+        Runtime counters absent from the stream leave the streak frozen
+        — never fabricated (the no-invention rule)."""
+        if not self._l2c_enabled or not isinstance(resp, dict):
+            return
+        facts = (resp.get("facts") or {}) if "facts" in resp else \
+            ((resp.get("service") or {}).get("facts") or {})
+        vals = {k: facts.get(k) for k in
+                ("stall_memory_permille", "l2_hit_permille")}
+        if not all(isinstance(v, (int, float)) and v >= 0
+                   for v in vals.values()):
+            return
+        key = str(resp.get("bucket") or self.prev_bucket)
+        with self._l1_lock:   # one lock, both drift machines, no new order
+            base = self._l2c_ema.get(key)
+            if base is None:
+                self._l2c_ema[key] = dict(vals)
+                self._l2c_streak = 0
+                return
+            dev = max(abs(vals[k] - base[k]) / max(base[k], 1.0)
+                      for k in vals)
+            if dev > self._l2c_tau:
+                self._l2c_streak += 1
+            else:
+                self._l2c_streak = 0
+                for k in vals:
+                    self._l2c_ema[key][k] = 0.7 * base[k] + 0.3 * vals[k]
+
+    def _l2c_ready(self) -> bool:
+        """V21-C3: streak >= k AND the SHARED drift cooldown window is
+        open (see _l1_ready — one clock gates L1 and L2C together)."""
+        if not self._l2c_enabled:
+            return False
+        with self._l1_lock:
+            if self._l2c_streak < self._l2c_k:
+                return False
+            now = time.monotonic()
+            if now - self._l1_last_s < self._l1_cooldown:
+                return False
+            self._l1_last_s = now
+            self._l2c_streak = 0
+            self.drift_stats["l2c_rearms"] += 1
+            return True
+
+    def _maybe_facts_only(self, bucket, batch: int, seq_len: int,
+                          via_bg: bool) -> None:
+        """V21-C1 (F1): keep the drift state machines OBSERVED on the
+        stationary done bucket, right before the early return that used
+        to starve them.  Throttled to one lightweight RPC per
+        PACT_FACTS_ONLY_EVERY boundary calls; runs inline ONLY at the
+        scheduler/workload boundaries maybe_request itself is contracted
+        to (never inside an attention forward), and always on the
+        background worker in the async frame.  want_cupti is set ONLY
+        on the background path — the counter session is a ~700ms window
+        and must never sit on a caller thread."""
+        if not self._fo_enabled:
+            return
+        with self._fo_lock:
+            self._fo_calls += 1
+            if self._fo_inflight or self._fo_calls % self._fo_every:
+                return
+            self._fo_inflight = True
+        self.drift_stats["facts_only_sent"] += 1
+        msg = {"msg_id": f"req_{next(_MSG_IDS)}", "type": "facts_only",
+               "bucket": repr(bucket),
+               "workload": {"B": batch, "S": seq_len},
+               "want_cupti": bool(via_bg)}
+
+        def _cycle():
+            try:
+                resp = self.client.try_request(msg, timeout=30.0)
+                self._l1_observe(resp)
+                self._l2c_observe(resp)
+            except Exception as e:  # BR-17: counted, never silent
+                _note_swallowed("facts_only", e)
+            finally:
+                with self._fo_lock:
+                    self._fo_inflight = False
+
+        if via_bg:
+            self._submit_bg(_cycle)
+        else:
+            _cycle()
 
     def maybe_request(self, batch: int, seq_len: int,
                       current_config: Optional[Dict] = None,
                       geometry: Optional[Dict] = None) -> Optional[Dict]:
         fire, bucket = should_trigger(self.prev_bucket, batch, seq_len)
-        l1 = False
+        rearm = False
         if bucket in self.done_buckets:
-            l1 = self._l1_ready()   # L1 re-arm of an L0-done bucket
-            if not l1:
+            # V21-C1 (F1 fix): observe the stationary bucket BEFORE the
+            # early return that used to starve the drift machines
+            self._maybe_facts_only(bucket, batch, seq_len, via_bg=False)
+            rearm = self._l1_ready() or self._l2c_ready()  # drift re-arm
+            if not rearm:
                 return None
-        if not (fire or l1) or self.in_flight:
-            return None
-        self.in_flight = True
-        n_regs = 0
-        cur = self.swapper.current
+        with self._if_lock:   # V21-C2 (F3): atomic check-then-set
+            if not (fire or rearm) or self.in_flight:
+                return None
+            self.in_flight = True
         try:
-            if getattr(cur, "n_regs", None) in (None, 0) and hasattr(cur, "_init_handles"):
-                cur._init_handles()
-            n_regs = int(getattr(cur, "n_regs", 0) or 0)
-        except Exception:  # BR-17: counted
-            _SWALLOWED["n_regs_init"] = _SWALLOWED.get("n_regs_init", 0) + 1
             n_regs = 0
-        cfg = dict(current_config or {"warps": 4, "stages": 3, "V": 0})
-        if n_regs > 0:
-            cfg["n_regs"] = n_regs
-        msg = {
-            "msg_id": f"req_{next(_MSG_IDS)}",
-            "type": "profile_and_compile",
-            "kernel_key": getattr(self.swapper.jit_fn, "__name__", "kernel"),
-            "workload": {"B": batch, "S": seq_len},
-            "geometry": geometry or {},
-            "current_config": cfg,
-        }
-        resp = self.client.try_request(msg, timeout=120.0)
-        self.in_flight = False
-        self._l1_observe(resp)
-        if resp is None or resp.get("type") != "kernel_ready":
-            return resp
-        self.prev_bucket = bucket
-        self.done_buckets.add(bucket)
-        # V11-6a R2 fast path: a variant prewarmed into the resident pool
-        # (idle-window compile, offline-validated mapping) switches by slot
-        # exchange — no compile, no G4 timing on the critical path.  The
-        # plan dict records the pool hit and the R4 segments.
-        fam = resp.get("family")
-        if fam and getattr(self.swapper, "pool_contains", None) and \
-                self.swapper.pool_contains(fam):
-            import time as _t
-            t0 = _t.monotonic()
-            hit = self.swapper.swap_from_pool(fam)
-            plan = {
-                "swapped": bool(hit), "rolled_back": False,
-                "gain_percent": None, "cache_hit": True, "pool_hit": fam,
-                "slot_swap_ms": (_t.monotonic() - t0) * 1000.0,
-                "local_compile_ms": 0.0, "measure_time_ms": 0.0,
-                "service": {k: resp[k] for k in
-                            ("family", "new_config", "profile_time_ms",
-                             "compile_time_ms", "shm_name") if k in resp},
+            cur = self.swapper.current
+            try:
+                if getattr(cur, "n_regs", None) in (None, 0) and hasattr(cur, "_init_handles"):
+                    cur._init_handles()
+                n_regs = int(getattr(cur, "n_regs", 0) or 0)
+            except Exception:  # BR-17: counted
+                _SWALLOWED["n_regs_init"] = _SWALLOWED.get("n_regs_init", 0) + 1
+                n_regs = 0
+            cfg = dict(current_config or {"warps": 4, "stages": 3, "V": 0})
+            if n_regs > 0:
+                cfg["n_regs"] = n_regs
+            msg = {
+                "msg_id": f"req_{next(_MSG_IDS)}",
+                "type": "profile_and_compile",
+                "bucket": repr(bucket),
+                "kernel_key": getattr(self.swapper.jit_fn, "__name__", "kernel"),
+                "workload": {"B": batch, "S": seq_len},
+                "geometry": geometry or {},
+                "current_config": cfg,
             }
-            plan["overhead_ms"] = (float(resp.get("profile_time_ms") or 0)
-                                   + plan["slot_swap_ms"])
+            resp = self.client.try_request(msg, timeout=120.0)
+            self._l1_observe(resp)
+            self._l2c_observe(resp)
+            if resp is None or resp.get("type") != "kernel_ready":
+                return resp
+            self.prev_bucket = bucket
+            self.done_buckets.add(bucket)
+            # V11-6a R2 fast path: a variant prewarmed into the resident pool
+            # (idle-window compile, offline-validated mapping) switches by slot
+            # exchange — no compile, no G4 timing on the critical path.  The
+            # plan dict records the pool hit and the R4 segments.
+            fam = resp.get("family")
+            if fam and getattr(self.swapper, "pool_contains", None) and \
+                    self.swapper.pool_contains(fam):
+                import time as _t
+                t0 = _t.monotonic()
+                hit = self.swapper.swap_from_pool(fam)
+                plan = {
+                    "swapped": bool(hit), "rolled_back": False,
+                    "gain_percent": None, "cache_hit": True, "pool_hit": fam,
+                    "slot_swap_ms": (_t.monotonic() - t0) * 1000.0,
+                    "local_compile_ms": 0.0, "measure_time_ms": 0.0,
+                    "service": {k: resp[k] for k in
+                                ("family", "new_config", "profile_time_ms",
+                                 "compile_time_ms", "shm_name") if k in resp},
+                }
+                plan["overhead_ms"] = (float(resp.get("profile_time_ms") or 0)
+                                       + plan["slot_swap_ms"])
+                if resp.get("shm_name"):
+                    self.client.try_request(
+                        {"msg_id": msg["msg_id"], "type": "release_shm",
+                         "shm_name": resp["shm_name"]}, timeout=2.0)
+                return plan
+            extra_env = resp.get("extra_env") or {"PACT_ENABLE": "1"}
+            options = resp.get("options_override") or None
+            t_compile = time.monotonic()
+            kernel = self.swapper.compile_candidate(extra_env, options)
+            compile_ms = (time.monotonic() - t_compile) * 1000.0
+            cache_hit = compile_ms < 50.0
+            plan = self.swapper.g4_install(kernel)
+            plan["cache_hit"] = cache_hit
+            plan["local_compile_ms"] = compile_ms
+            plan["service"] = {k: resp[k] for k in
+                               ("family", "new_config", "profile_time_ms",
+                                "compile_time_ms", "shm_name") if k in resp}
+            ov = (float(resp.get("profile_time_ms") or 0) +
+                  float(resp.get("compile_time_ms") or 0) +
+                  float(plan.get("measure_time_ms") or 0))
+            plan["overhead_ms"] = ov
+            if os.environ.get("PACT_GRAPH_SERVICE") == "1" and \
+                    plan.get("swapped"):
+                # V13 Phase0: under a captured graph the slot exchange above is
+                # invisible to replay — offer the merged module and queue the
+                # node retarget here (this sync path runs on the lazy-arm
+                # background thread, never inside a forward/replay).
+                self._gs_offer(kernel, resp.get("family"))
+                plan["graph_retarget"] = self._gs_submit(
+                    kernel, resp.get("family"))
             if resp.get("shm_name"):
                 self.client.try_request(
                     {"msg_id": msg["msg_id"], "type": "release_shm",
                      "shm_name": resp["shm_name"]}, timeout=2.0)
             return plan
-        extra_env = resp.get("extra_env") or {"PACT_ENABLE": "1"}
-        options = resp.get("options_override") or None
-        t_compile = time.monotonic()
-        kernel = self.swapper.compile_candidate(extra_env, options)
-        compile_ms = (time.monotonic() - t_compile) * 1000.0
-        cache_hit = compile_ms < 50.0
-        plan = self.swapper.g4_install(kernel)
-        plan["cache_hit"] = cache_hit
-        plan["local_compile_ms"] = compile_ms
-        plan["service"] = {k: resp[k] for k in
-                           ("family", "new_config", "profile_time_ms",
-                            "compile_time_ms", "shm_name") if k in resp}
-        ov = (float(resp.get("profile_time_ms") or 0) +
-              float(resp.get("compile_time_ms") or 0) +
-              float(plan.get("measure_time_ms") or 0))
-        plan["overhead_ms"] = ov
-        if os.environ.get("PACT_GRAPH_SERVICE") == "1" and \
-                plan.get("swapped"):
-            # V13 Phase0: under a captured graph the slot exchange above is
-            # invisible to replay — offer the merged module and queue the
-            # node retarget here (this sync path runs on the lazy-arm
-            # background thread, never inside a forward/replay).
-            self._gs_offer(kernel, resp.get("family"))
-            plan["graph_retarget"] = self._gs_submit(
-                kernel, resp.get("family"))
-        if resp.get("shm_name"):
-            self.client.try_request(
-                {"msg_id": msg["msg_id"], "type": "release_shm",
-                 "shm_name": resp["shm_name"]}, timeout=2.0)
-        return plan
+        finally:
+            # V21-C2 (F3): ALWAYS release — try_request only swallows
+            # network-class errors; any other exception used to strand
+            # in_flight=True forever
+            with self._if_lock:
+                self.in_flight = False
 
     # ---- V12-P1: async frame, PACT_ASYNC_PGO=1 ----------------------------
     # Protocol ported from the aobo tree's AsyncKernelSwitch: every forward
@@ -341,14 +490,19 @@ class InferenceSession:
         While a submitted cycle is unconsumed, further triggers are skipped
         (bucket dedup still applies once the cycle lands)."""
         fire, bucket = should_trigger(self.prev_bucket, batch, seq_len)
-        l1 = False
+        rearm = False
         if bucket in self.done_buckets:
-            l1 = self._l1_ready()   # V16-T6 L1 re-arm
-            if not l1:
+            # V21-C1 (F1 fix): observe the stationary bucket; the async
+            # frame submits the facts cycle to the background worker
+            # (zero caller-thread blocking, CUPTI allowed there)
+            self._maybe_facts_only(bucket, batch, seq_len, via_bg=True)
+            rearm = self._l1_ready() or self._l2c_ready()  # drift re-arm
+            if not rearm:
                 return None
-        if not (fire or l1) or self.in_flight:
-            return None
-        self.in_flight = True
+        with self._if_lock:   # V21-C2 (F3): atomic check-then-set
+            if not (fire or rearm) or self.in_flight:
+                return None
+            self.in_flight = True
         fut = self._submit_bg(
             lambda: self._bg_cycle(batch, seq_len, current_config,
                                    geometry, bucket))
@@ -382,6 +536,7 @@ class InferenceSession:
             msg = {
                 "msg_id": f"req_{next(_MSG_IDS)}",
                 "type": "profile_and_compile",
+                "bucket": repr(bucket),
                 "kernel_key": getattr(self.swapper.jit_fn, "__name__",
                                       "kernel"),
                 "workload": {"B": batch, "S": seq_len},
@@ -390,6 +545,7 @@ class InferenceSession:
             }
             resp = self.client.try_request(msg, timeout=120.0)
             self._l1_observe(resp)
+            self._l2c_observe(resp)
             if resp is None or resp.get("type") != "kernel_ready":
                 return {"kind": "no_kernel",
                         "resp_type": (resp or {}).get("type", "none")}
@@ -477,7 +633,8 @@ class InferenceSession:
             return {"kind": "error", "error": repr(e),
                     "msg": msg, "resp": resp}
         finally:
-            self.in_flight = False
+            with self._if_lock:   # V21-C2 (F3): locked, always runs
+                self.in_flight = False
 
     def _subproc_compile(self, extra_env, options) -> Optional[Dict]:
         """V13 Phase1 (PACT_COMPILE_SUBPROC=1): ship the compile+measure

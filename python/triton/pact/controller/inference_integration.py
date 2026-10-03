@@ -85,6 +85,13 @@ class InferenceSession:
         self._fo_sends = 0
         self._fo_inflight = False
         self._fo_lock = threading.Lock()
+        # V21-C4 crash bisect outcome: single-factor arms are clean
+        # (channels-only, CUPTI-only 6/6) — the stochastic crash (2/10)
+        # needs the COMBINATION (counter-fed re-arms -> many in-engine
+        # compile/module-loads CONCURRENT with service-side CUPTI replay
+        # windows).  Guard: never request a counter window while a
+        # decide cycle is pending or just submitted (quiet frames only).
+        self._fo_last_submit_s = 0.0
         # V21-C2 (F3): the in_flight check-then-set races between the
         # inline decode thread and the async background worker (both
         # call the entry points) — one lock makes the gate atomic.  The
@@ -263,7 +270,9 @@ class InferenceSession:
             self._fo_sends += 1
             sends = self._fo_sends
         self.drift_stats["facts_only_sent"] += 1
-        cupti_ok = via_bg and self._fo_cupti_every > 0 and \
+        quiet = time.monotonic() - self._fo_last_submit_s > 2.0 and (
+            self._async_pending is None or self._async_pending.done())
+        cupti_ok = via_bg and self._fo_cupti_every > 0 and quiet and \
             sends % self._fo_cupti_every == 0
         msg = {"msg_id": f"req_{next(_MSG_IDS)}", "type": "facts_only",
                "bucket": repr(bucket),
@@ -514,6 +523,7 @@ class InferenceSession:
             if not (fire or rearm) or self.in_flight:
                 return None
             self.in_flight = True
+        self._fo_last_submit_s = time.monotonic()   # quiet-frame guard
         fut = self._submit_bg(
             lambda: self._bg_cycle(batch, seq_len, current_config,
                                    geometry, bucket))

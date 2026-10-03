@@ -907,14 +907,19 @@ def counter_session(launch_fn: Callable,
     # current context); passing the explicit primary ctx made UserRange
     # BeginSession return INVALID_PARAMETER on this stack
     _ctx_arg = None
-    # CUpti_ProfilerReplayMode: ApplicationReplay=1, KernelReplay=2,
-    # UserReplay=3 (NOT 1/2 -- misreading this made every earlier combo
-    # an illegal pairing: UserRange+KernelReplay -> begin rc=1)
+    # CUpti_ProfilerReplayMode (cupti_profiler_target.h):
+    # KernelReplay=1, ApplicationReplay=2, UserReplay=3.  The struct-field
+    # comment at :327 was right all along; the OLD comment here had
+    # KernelReplay=2 -- sending ApplicationReplay on the AutoRange path
+    # (in-process single-shot needs KernelReplay) made every BeginPass
+    # return CUPTI_ERROR_INVALID_OPERATION(7): passes never ran, the
+    # counter-data image stayed empty, and HostEvaluateToGpuValues failed
+    # -- the whole "WSL2 counters unavailable" diagnosis downstream of it.
     bsp = _BeginSessionParams(
         ctypes.sizeof(_BeginSessionParams), None,
         _ctx_arg, cp.counterDataImageSize,
         cdi_ptr, szp.counterDataScratchBufferSize, scratch_ptr,
-        0, None, 2 if use_user else 1, 3 if use_user else 2, 1, 1)
+        0, None, 2 if use_user else 1, 3 if use_user else 1, 1, 1)
     trail["begin_session_rc"] = cupti.cuptiProfilerBeginSession(ctypes.byref(bsp))
     if trail["begin_session_rc"] != 0:
         return fail("begin session")

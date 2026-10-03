@@ -142,13 +142,12 @@ class LearnedPolicy:
     def _predict_tree(self, x):
         node = self.tree[0] if self.tree else None
         # rules: nested via lo/hi indices into the list
-        i = 0
         while node is not None and "pick" not in node:
             go_lo = x[node["feat"]] <= node["thr"]
             nxt = node.get("lo" if go_lo else "hi")
             if nxt is None:
                 return "vanilla", 1.0
-            i, node = nxt, self.tree[nxt] if isinstance(nxt, int) else None
+            node = self.tree[nxt] if isinstance(nxt, int) else None
         return (node or {}).get("pick", "vanilla"), 1.0
 
     def _predict_knn(self, x):

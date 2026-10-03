@@ -30,7 +30,14 @@ from triton.pact.runtime.workload_sniffer import bucket_bs
 KNOWN_FAMILIES = ("theory", "occupancy", "latency", "vanilla",
                   "deep", "short", "w1", "cold",
                   # V21-D named variants (env-dict arms, see docstring)
-                  "p1rt", "p1g")
+                  "p1rt", "p1g",
+                  # V21 model-vs-table experiment finding: the campaign
+                  # TRAINING arms (stage/warp presets) were missing, so a
+                  # distilled v3 table had those entries silently dropped
+                  # by from_dict (lookup fell to default, agreement ~0.03
+                  # vs its own source model) — the vocab must cover every
+                  # deployable arm name the trainer can emit.
+                  "s2", "s5", "w2")
 
 
 def _occ_bucket(permille: Optional[int]) -> str:

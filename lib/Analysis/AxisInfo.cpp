@@ -692,6 +692,39 @@ private:
             break;
           }
         }
+        // V21-0c E-2 (0c-3): the family-B STORE side — the same
+        // alignment proof as the load branch above.  Stores carry NO
+        // head_dim annotation (the store pointer has no shape
+        // information — the reason the load-side annotation was never
+        // mirrored), so the dim defaults to the LAST dim (V21 execution
+        // revision 2).  Without this branch the W6'a gather_store
+        // annotations stayed metadata-only: the divisibility gcd capped
+        // vectorized stores at elemSize bytes (the V8-1 load-side
+        // shape, store edition).
+        if (auto storeOp = dyn_cast<triton::StoreOp>(user)) {
+          if (storeOp->hasAttr("pact.gather_store")) {
+            int64_t numDims = 0;
+            if (auto vt = dyn_cast<RankedTensorType>(
+                    storeOp.getValue().getType()))
+              numDims = vt.getRank();
+            int64_t hdIdx = numDims > 0 ? numDims - 1 : -1;
+            if (auto hdi = storeOp->template getAttrOfType<IntegerAttr>(
+                    "pact.head_dim_idx"))
+              hdIdx = hdi.getInt();
+            if (dim == hdIdx) {
+              int64_t strideDiv = 16;
+              if (auto sd =
+                      storeOp->template getAttrOfType<IntegerAttr>(
+                          "pact.stride_div"))
+                strideDiv = sd.getInt();
+              lhsDivisibility = std::max(lhsDivisibility, int64_t(16));
+              rhsDivisibility = std::max(
+                  rhsDivisibility,
+                  std::min<int64_t>(16, strideDiv * elemSize));
+            }
+            break;
+          }
+        }
       }
       // P0 (Pass B) fallback for divisibility: penetrate intermediate ops.
       if (isPactPassBEnabled() && isPactAxisInfoOverrideEnabled()) {

@@ -45,7 +45,13 @@ KNOWN_FAMILIES = ("theory", "occupancy", "latency", "vanilla",
                   # num_stages OPTIONS channel is taken over by P6 under
                   # PACT_ENABLE=1, so constants pin via env — 20261004
                   # channel verification).
-                  "blo16_swi8", "bloNone_evict", "s3")
+                  "blo16_swi8", "bloNone_evict", "s3",
+                  # V22 R1 winner arms (3-1 free search: large-batch D128
+                  # cells are won by DISABLING auto-stages or pinning V;
+                  # w8 = the warps half of the D64/GQA4 winners — the
+                  # swizzle/evict half is naive-kernel-only, production
+                  # kernel has no kwargs face)
+                  "w8", "p6off", "v8")
 
 
 def _occ_bucket(permille: Optional[int]) -> str:

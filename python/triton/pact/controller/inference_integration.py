@@ -114,9 +114,12 @@ class InferenceSession:
         # V21 acceptance evidence (core constraint): observation
         # non-empty rate + per-channel re-arm counts — read-only state
         # for W-drift harnesses/probes, never a decision input.
+        # V22 1-2: cupti_sessions/cupti_busy_deny mirror the SERVER-side
+        # K1 mutex counters (monotonic snapshot of the service process).
         self.drift_stats: Dict[str, Any] = {
             "facts_only_sent": 0, "l1_rearms": 0, "l2c_rearms": 0,
-            "observe_nonempty": 0, "observe_empty": 0}
+            "observe_nonempty": 0, "observe_empty": 0,
+            "cupti_sessions": 0, "cupti_busy_deny": 0}
         # V12-P1 (PACT_ASYNC_PGO=1): async frame state — a single daemon
         # background worker owns the decide/compile/measure cycle; the swap
         # is consumed at a launch boundary.  All-zero until the env is set.
@@ -284,6 +287,17 @@ class InferenceSession:
                 resp = self.client.try_request(msg, timeout=30.0)
                 self._l1_observe(resp)
                 self._l2c_observe(resp)
+                # V22 1-2 (K1): mirror the server-side CUPTI mutex
+                # counters (monotonic snapshot; observation-only).
+                cs = resp.get("cupti_stats") if isinstance(resp, dict) \
+                    else None
+                if isinstance(cs, dict):
+                    for k in ("cupti_sessions", "cupti_busy_deny"):
+                        v = cs.get("sessions" if k == "cupti_sessions"
+                                   else "busy_deny")
+                        if isinstance(v, int):
+                            self.drift_stats[k] = max(
+                                self.drift_stats.get(k, 0), v)
             except Exception as e:  # BR-17: counted, never silent
                 _note_swallowed("facts_only", e)
             finally:

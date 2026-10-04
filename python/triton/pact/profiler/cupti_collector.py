@@ -32,11 +32,12 @@ from typing import Callable, Dict, Optional
 # concurrency is removed.
 _CUPTI_SESSION_LOCK = threading.Lock()
 _CUPTI_STATS: Dict[str, int] = {"sessions": 0, "lock_waits": 0,
-                                "busy_deny": 0}
+                                "busy_deny": 0, "windows": 0}
 
 
 def cupti_stats() -> Dict[str, int]:
-    """Read-only snapshot of the mutex/acceptance counters (BR-17)."""
+    """Read-only snapshot of the mutex/acceptance counters (BR-17; V23
+    3-2 adds 'windows' — counter sessions that ran to ok=True)."""
     return dict(_CUPTI_STATS)
 
 
@@ -1157,6 +1158,11 @@ def collect_or_unavailable(launch_fn: Optional[Callable] = None,
                 "source": "unavailable",
                 "reason": f"counter session failed: {sess.get('reason')}",
                 "trail": sess.get("trail")}
+    # V23 3-2: window registration — a COMPLETED counter session (the
+    # ~700ms CUPTI replay window ran to ok=True) is counted apart from
+    # sessions (entries) so the K1b merge verdict can distinguish
+    # attempted vs completed windows.
+    _CUPTI_STATS["windows"] = _CUPTI_STATS.get("windows", 0) + 1
     name2chan = {v: k for k, v in COUNTER_METRICS.items()}
     m = sess["metrics"]
 

@@ -4,6 +4,7 @@ from __future__ import annotations
 import itertools
 import os
 import queue
+import subprocess
 import threading
 import time
 from concurrent.futures import Future
@@ -252,6 +253,52 @@ class InferenceSession:
             self.drift_stats["l2c_rearms"] += 1
             return True
 
+    def _idle_stream_drained(self) -> bool:
+        """V23 3-2: OUR engine's queue depth probe — the current CUDA
+        stream has drained (no pending work of this process).  Split out
+        so the unit gate can stub it (GPU-free checks)."""
+        try:
+            import torch
+            if not torch.cuda.is_available():
+                return False
+            return torch.cuda.current_stream().query()
+        except Exception as e:  # BR-17: counted, never silent
+            _note_swallowed("engine_idle_stream", e)
+            return False
+
+    def _engine_idle_probe(self, util_max: int = 5) -> bool:
+        """V23 3-2 (K1b/B-1 merge): the CUPTI window opens only when the
+        ENGINE is actually idle — our own stream drained AND the device
+        reports no other compute load (one nvidia-smi utilization
+        sample; K1b's crash was CROSS-PROCESS replay perturbation,
+        invisible to the in-process quiet-frame guard).  Mitigation
+        face, not a cure: the frozen verdict bar is 'crash frequency
+        drops significantly' (<=1 of 3 EVERY=1 retests), and the probe
+        FAILS CLOSED — no window without positive evidence of idle.
+        Counters are observation-only and never gate anything."""
+        self.drift_stats["engine_idle_probes"] = \
+            self.drift_stats.get("engine_idle_probes", 0) + 1
+        if not self._idle_stream_drained():
+            self.drift_stats["engine_idle_denied"] = \
+                self.drift_stats.get("engine_idle_denied", 0) + 1
+            return False
+        try:
+            r = subprocess.run(
+                ("nvidia-smi", "--query-gpu=utilization.gpu",
+                 "--format=csv,noheader,nounits"),
+                capture_output=True, text=True, timeout=2.0)
+            util = int(r.stdout.strip().splitlines()[0])
+        except Exception as e:  # BR-17: counted; fail closed
+            _note_swallowed("engine_idle_util", e)
+            self.drift_stats["engine_idle_denied"] = \
+                self.drift_stats.get("engine_idle_denied", 0) + 1
+            return False
+        if util > util_max:
+            self.drift_stats["engine_idle_denied"] = \
+                self.drift_stats.get("engine_idle_denied", 0) + 1
+            return False
+        return True
+
     def _maybe_facts_only(self, bucket, batch: int, seq_len: int,
                           via_bg: bool) -> None:
         """V21-C1 (F1): keep the drift state machines OBSERVED on the
@@ -262,7 +309,11 @@ class InferenceSession:
         to (never inside an attention forward), and always on the
         background worker in the async frame.  want_cupti is set ONLY
         on the background path — the counter session is a ~700ms window
-        and must never sit on a caller thread."""
+        and must never sit on a caller thread.
+
+        V23 3-2: the quiet-frame heuristic alone is now joined by the
+        ENGINE-IDLE probe (stream drained + device-wide utilization
+        sample) before any CUPTI window is requested."""
         if not self._fo_enabled:
             return
         with self._fo_lock:
@@ -275,8 +326,13 @@ class InferenceSession:
         self.drift_stats["facts_only_sent"] += 1
         quiet = time.monotonic() - self._fo_last_submit_s > 2.0 and (
             self._async_pending is None or self._async_pending.done())
+        # V23 3-2: engine-idle probe joins the quiet-frame guard before
+        # any CUPTI window (K1b mitigation face, fail closed).  The
+        # probe (one nvidia-smi sample) runs only when every other
+        # condition already holds — never on the sync path.
         cupti_ok = via_bg and self._fo_cupti_every > 0 and quiet and \
-            sends % self._fo_cupti_every == 0
+            sends % self._fo_cupti_every == 0 and \
+            self._engine_idle_probe()
         msg = {"msg_id": f"req_{next(_MSG_IDS)}", "type": "facts_only",
                "bucket": repr(bucket),
                "workload": {"B": batch, "S": seq_len},
@@ -292,9 +348,10 @@ class InferenceSession:
                 cs = resp.get("cupti_stats") if isinstance(resp, dict) \
                     else None
                 if isinstance(cs, dict):
-                    for k in ("cupti_sessions", "cupti_busy_deny"):
-                        v = cs.get("sessions" if k == "cupti_sessions"
-                                   else "busy_deny")
+                    for k, src in (("cupti_sessions", "sessions"),
+                                   ("cupti_busy_deny", "busy_deny"),
+                                   ("cupti_windows", "windows")):
+                        v = cs.get(src)
                         if isinstance(v, int):
                             self.drift_stats[k] = max(
                                 self.drift_stats.get(k, 0), v)

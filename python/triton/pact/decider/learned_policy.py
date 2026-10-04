@@ -5,8 +5,12 @@ Deployment contract (V9-B3):
   ``suite/offline/learned/learn_policy.py --export`` with one of:
     {"kind": "tree",  "rules": [...]}   — list of {feat, thr, lo, hi, pick}
     {"kind": "knn",   "prototypes": [...]} — list of {feat, gains}
-  plus {"variants": {name: env-dict}} mapping model names to PACT env
-  presets (theory/occ/lat/deep...).  Inference is pure Python.
+  plus {"variants": {name: value}} mapping model names to deployment
+  arms.  A value is either the legacy plain env-dict (theory/occ/lat/
+  deep...) or, since V22 1-1, the dual-channel
+  {"env": {...}, "options_override": {...}} — kernel kwargs / compile
+  options (blo16_swi8, st3...) ride options_override into
+  compile_explicit's fifth parameter.  Inference is pure Python.
 * ``decide()`` consults the learned model first (when the env var is set
   and the file parses); on any error or miss it falls back to the
   FamilyTable.  ``vanilla`` remains a first-class prediction and compiles
@@ -227,7 +231,29 @@ class LearnedPolicy:
         return "vanilla", 1.0
 
     def env_for(self, variant: str) -> Optional[Dict[str, str]]:
-        return self.variants.get(variant)
+        # V22 1-1: a variants value may be the legacy plain env-dict or
+        # the dual-channel {"env", "options_override"}; the discriminator
+        # is the reserved keys themselves (a real env name is always
+        # PACT_*-prefixed, so no plain env-dict can collide).  A
+        # dual-channel value with no "env" key is a pure-kwargs arm and
+        # resolves to {} (a legal empty injection, distinct from the
+        # unknown-variant None).
+        v = self.variants.get(variant)
+        if not isinstance(v, dict):
+            return v
+        if "env" in v or "options_override" in v:
+            return dict(v.get("env") or {})
+        return v
+
+    def options_for(self, variant: str) -> Dict[str, Any]:
+        """V22 1-1: the kwargs channel of a dual-channel variant value.
+        Legacy plain-env variants resolve to {} — the deployed path is
+        bit-for-bit unchanged for them."""
+        v = self.variants.get(variant)
+        if not isinstance(v, dict) or \
+                not ("env" in v or "options_override" in v):
+            return {}
+        return dict(v.get("options_override") or {})
 
 
 def decide(facts: Dict[str, Any], batch: int, seq_len: int,
@@ -290,6 +316,15 @@ def decide(facts: Dict[str, Any], batch: int, seq_len: int,
                                    gqa=gqa, kv_heads=kv_heads)
                 out["family"] = variant
                 out["extra_env"] = dict(env)
+                # V22 1-1: dual-channel variants carry kernel kwargs /
+                # compile options in options_override; they layer OVER
+                # the table's options (the variant value is the arm's
+                # full intent).  Legacy env-only variants add nothing —
+                # the table's options_override passes through unchanged.
+                opt = policy.options_for(variant)
+                if opt:
+                    out["options_override"] = {
+                        **out.get("options_override", {}), **opt}
                 return out
         except Exception as e:  # noqa: BLE001 - counted, never silent
             _SWALLOWED["predict_errors"] += 1

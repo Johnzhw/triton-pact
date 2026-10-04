@@ -37,7 +37,15 @@ KNOWN_FAMILIES = ("theory", "occupancy", "latency", "vanilla",
                   # by from_dict (lookup fell to default, agreement ~0.03
                   # vs its own source model) — the vocab must cover every
                   # deployable arm name the trainer can emit.
-                  "s2", "s5", "w2")
+                  "s2", "s5", "w2",
+                  # V22 1-1 kwargs/options dual-channel arms (PLAN_V22
+                  # 阶段一；same vocab rule: every arm name the trainer
+                  # or a deployed v3 model can emit must be known here).
+                  # s3 = PACT_OVERRIDE_STAGES=3 constant arm (the
+                  # num_stages OPTIONS channel is taken over by P6 under
+                  # PACT_ENABLE=1, so constants pin via env — 20261004
+                  # channel verification).
+                  "blo16_swi8", "bloNone_evict", "s3")
 
 
 def _occ_bucket(permille: Optional[int]) -> str:

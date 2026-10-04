@@ -160,6 +160,23 @@ class CUDAOptions:
         return "iisan" in self.instrumentation_mode
 
 
+def _pact_knobs_in_domain(opt) -> bool:
+    """V22 1-3 (V21-5 knobs-domain gate): False when the caller EXPLICITLY
+    pinned num_stages to a non-default value (torch inductor manages its
+    own schedule and passes options.num_stages; PACT's auto-knob pass
+    insertion there is interference-only — softmax_fused 0.645 /
+    residual_rmsnorm 0.859).  Semantic signal, not a __module__ heuristic.
+    Default-valued (jit default) compiles — the production kernel path —
+    stay in domain bit-for-bit."""
+    try:
+        ns = getattr(opt, "num_stages", None)
+        if ns is not None and int(ns) != CUDAOptions.num_stages:
+            return False
+    except (TypeError, ValueError):
+        pass
+    return True
+
+
 class CUDABackend(BaseBackend):
     instrumentation = None
 
@@ -245,6 +262,19 @@ class CUDABackend(BaseBackend):
         # PACT Phase 0: propagate SM version to C++ passes
         if knobs.pact.enable:
             os.environ.setdefault("PACT_SM_VERSION", str(capability))
+        # V22 1-3 (V21-5 knobs-domain gate): a compile whose caller
+        # EXPLICITLY pinned num_stages (value != the CUDAOptions default)
+        # is OUT of PACT's auto-knob domain — torch inductor manages its
+        # own schedule and passes options.num_stages; PACT's pass
+        # insertion there is interference-only (softmax_fused 0.645 /
+        # residual_rmsnorm 0.859, the two domain-external inductor
+        # cells).  Semantic signal, not a __module__ name heuristic
+        # (generated module names are unstable).  An explicit value that
+        # EQUALS the default is indistinguishable here and stays in
+        # domain (bounded leak, covered by the retest pair).  The
+        # production kernel (triton_unified_attention) compiles with the
+        # jit default, so the deployed chain is untouched.
+        pact_knobs_domain = knobs.pact.enable and _pact_knobs_in_domain(opt)
         hints_path = os.environ.get("PACT_HW_HINTS_JSON")
         if knobs.pact.enable and hints_path:
             try:
@@ -272,11 +302,11 @@ class CUDABackend(BaseBackend):
         passes.ttir.add_combine(pm)
         passes.ttir.add_reorder_broadcast(pm)
         # PACT: Page-aware compilation passes (TTIR level)
-        if knobs.pact.enable and knobs.pact.enable_page_transform:
+        if pact_knobs_domain and knobs.pact.enable_page_transform:
             passes.ttir.add_page_transform(pm)
-        if knobs.pact.enable and knobs.pact.enable_page_local_analysis:
+        if pact_knobs_domain and knobs.pact.enable_page_local_analysis:
             passes.ttir.add_pact_page_local_analysis(pm)
-        if knobs.pact.enable and knobs.pact.enable_auto_num_warps:
+        if pact_knobs_domain and knobs.pact.enable_auto_num_warps:
             passes.ttir.add_pact_auto_num_warps(pm)
         passes.common.add_cse(pm)
         passes.common.add_symbol_dce(pm)
@@ -325,7 +355,8 @@ class CUDABackend(BaseBackend):
         passes.ttgpuir.add_optimize_thread_locality(pm)
         passes.ttgpuir.add_accelerate_matmul(pm)
         passes.ttgpuir.add_remove_layout_conversions(pm)
-        if knobs.pact.enable and knobs.pact.enable_auto_num_stages:
+        if knobs.pact.enable and _pact_knobs_in_domain(opt) \
+                and knobs.pact.enable_auto_num_stages:
             passes.ttgpuir.add_pact_auto_num_stages(pm)
         passes.ttgpuir.add_optimize_dot_operands(pm, capability >= 80)
         nvidia.passes.ttnvgpuir.add_optimize_descriptor_encoding(pm)

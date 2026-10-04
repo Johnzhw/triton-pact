@@ -13,7 +13,8 @@ from triton.pact.decider.family_table import FamilyTable
 from triton.pact.decider.learned_policy import decide
 from triton.pact.ipc.shm_manager import ShmManager
 from triton.pact.ipc.socket_server import PactSocketServer
-from triton.pact.profiler.cupti_collector import collect_or_unavailable
+from triton.pact.profiler.cupti_collector import (collect_or_unavailable,
+                                                   cupti_stats)
 from triton.pact.profiler.replica_probe import replica_median_us
 
 
@@ -107,7 +108,6 @@ class CompilerService:
             # V22 1-2 (K1): surface the CUPTI mutex counters on the
             # observation path (ADD-ONLY; the profile_and_compile
             # response field set is V20-frozen bit-for-bit).
-            from triton.pact.profiler.cupti_collector import cupti_stats
             return {"msg_id": req.get("msg_id"), "type": "facts",
                     "bucket": self._bucket_key(req),
                     "facts": {k: v for k, v in facts.items() if k != "lib"},

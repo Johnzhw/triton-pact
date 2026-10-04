@@ -104,9 +104,14 @@ class CompilerService:
             self._facts_only_served += 1
             facts = self._collect_facts(
                 req, want_cupti=bool(req.get("want_cupti")))
+            # V22 1-2 (K1): surface the CUPTI mutex counters on the
+            # observation path (ADD-ONLY; the profile_and_compile
+            # response field set is V20-frozen bit-for-bit).
+            from triton.pact.profiler.cupti_collector import cupti_stats
             return {"msg_id": req.get("msg_id"), "type": "facts",
                     "bucket": self._bucket_key(req),
                     "facts": {k: v for k, v in facts.items() if k != "lib"},
+                    "cupti_stats": cupti_stats(),
                     "profile_time_ms": (time.monotonic() - t0) * 1000.0}
         if req.get("type") != "profile_and_compile":
             return {"msg_id": req.get("msg_id"), "type": "error",

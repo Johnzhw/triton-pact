@@ -18,7 +18,26 @@ from __future__ import annotations
 import ctypes
 import glob
 import os
+import threading
 from typing import Callable, Dict, Optional
+
+# V22 1-2 (K1 root-cause fix): the CompilerService socket server spawns
+# ONE DAEMON THREAD PER CONNECTION, so an inline-thread facts_only RPC
+# and a background-worker facts_only RPC can enter counter_session
+# CONCURRENTLY on the service side — the fully-armed e2e profile's
+# 2/10 illegal-access crashes (tau25k4 family; the client quiet-frame
+# guard is a heuristic, this lock is the process-wide mutex).  A busy
+# lock is COUNTED (BR-17: cupti_busy_deny, never silently dropped) and
+# the waiter still queues — the truth value is preserved, only the
+# concurrency is removed.
+_CUPTI_SESSION_LOCK = threading.Lock()
+_CUPTI_STATS: Dict[str, int] = {"sessions": 0, "lock_waits": 0,
+                                "busy_deny": 0}
+
+
+def cupti_stats() -> Dict[str, int]:
+    """Read-only snapshot of the mutex/acceptance counters (BR-17)."""
+    return dict(_CUPTI_STATS)
 
 
 class _InitParams(ctypes.Structure):
@@ -1107,17 +1126,28 @@ def collect_or_unavailable(launch_fn: Optional[Callable] = None,
     # the userrange_profiling-sample shape (KernelReplay re-reads the
     # captured launch params after the fact and corrupts the context
     # with triton's staging buffers).
-    try:
-        sess = counter_session(launch_fn, lib_path=lib_path,
-                               range_name="pact_measure")
-    except Exception as e:
-        return {**probe,
-                "active_warp_ratio_permille": None,
-                "stall_memory_permille": None,
-                "sm_efficiency_permille": None,
-                "l2_hit_permille": None,
-                "source": "unavailable",
-                "reason": f"session raised: {e}"}
+    # V22 1-2: one counter session at a time per PROCESS (K1).  A
+    # second arrival while the lock is held counts busy_deny and waits
+    # — sessions serialize, values stay real.  sessions+lock_waits is
+    # the total session count.
+    _waited = _CUPTI_SESSION_LOCK.locked()
+    if _waited:
+        _CUPTI_STATS["busy_deny"] += 1
+        _CUPTI_STATS["lock_waits"] += 1
+    else:
+        _CUPTI_STATS["sessions"] += 1
+    with _CUPTI_SESSION_LOCK:
+        try:
+            sess = counter_session(launch_fn, lib_path=lib_path,
+                                   range_name="pact_measure")
+        except Exception as e:
+            return {**probe,
+                    "active_warp_ratio_permille": None,
+                    "stall_memory_permille": None,
+                    "sm_efficiency_permille": None,
+                    "l2_hit_permille": None,
+                    "source": "unavailable",
+                    "reason": f"session raised: {e}"}
     if not sess.get("ok"):
         return {**probe,
                 "active_warp_ratio_permille": None,

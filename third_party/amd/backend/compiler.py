@@ -113,6 +113,21 @@ class HIPOptions:
         return hashlib.sha256(key.encode("utf-8")).hexdigest()
 
 
+def _pact_knobs_in_domain(opt) -> bool:
+    """V22 1-3 (V21-5 knobs-domain gate, AMD mirror of the nvidia
+    helper): False when the caller EXPLICITLY pinned num_stages to a
+    non-default value (AMDOptions default 2) — that compile manages its
+    own schedule (torch inductor shape); PACT pass insertion there is
+    interference-only.  Default-valued compiles stay in domain."""
+    try:
+        ns = getattr(opt, "num_stages", None)
+        if ns is not None and int(ns) != HIPOptions.num_stages:
+            return False
+    except (TypeError, ValueError):
+        pass
+    return True
+
+
 class HIPBackend(BaseBackend):
     instrumentation = None
     supports_native_tensor_specialization = False
@@ -248,12 +263,15 @@ class HIPBackend(BaseBackend):
         passes.common.add_canonicalizer(pm)
         passes.ttir.add_combine(pm)
         passes.ttir.add_reorder_broadcast(pm)
-        # PACT: Page-aware compilation passes (TTIR level).
-        if knobs.pact.enable and knobs.pact.enable_page_transform:
+        # PACT: Page-aware compilation passes (TTIR level).  V22 1-3:
+        # the knobs-domain gate skips all three for explicit-num_stages
+        # (inductor-shaped) compiles — mirror of the nvidia side.
+        _pact_domain = knobs.pact.enable and _pact_knobs_in_domain(options)
+        if _pact_domain and knobs.pact.enable_page_transform:
             passes.ttir.add_page_transform(pm)
-        if knobs.pact.enable and knobs.pact.enable_page_local_analysis:
+        if _pact_domain and knobs.pact.enable_page_local_analysis:
             passes.ttir.add_pact_page_local_analysis(pm)
-        if knobs.pact.enable and knobs.pact.enable_auto_num_warps:
+        if _pact_domain and knobs.pact.enable_auto_num_warps:
             passes.ttir.add_pact_auto_num_warps(pm)
         passes.common.add_cse(pm)
         passes.ttir.add_triton_licm(pm)
@@ -295,7 +313,8 @@ class HIPBackend(BaseBackend):
         pm.enable_debug()
         emuTF32 = False
         passes.ttgpuir.add_coalesce(pm)
-        if knobs.pact.enable and knobs.pact.enable_auto_num_stages:
+        if knobs.pact.enable and _pact_knobs_in_domain(options) \
+                and knobs.pact.enable_auto_num_stages:
             passes.ttgpuir.add_pact_auto_num_stages(pm)
         passes.ttgpuir.add_f32_dot_tc(pm, emuTF32)
         passes.ttgpuir.add_remove_layout_conversions(pm)

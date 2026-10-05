@@ -267,15 +267,15 @@ class InferenceSession:
             return False
 
     def _engine_idle_probe(self, util_max: int = 5) -> bool:
-        """V23 3-2 (K1b/B-1 merge): the CUPTI window opens only when the
-        ENGINE is actually idle — our own stream drained AND the device
-        reports no other compute load (one nvidia-smi utilization
-        sample; K1b's crash was CROSS-PROCESS replay perturbation,
-        invisible to the in-process quiet-frame guard).  Mitigation
-        face, not a cure: the frozen verdict bar is 'crash frequency
-        drops significantly' (<=1 of 3 EVERY=1 retests), and the probe
-        FAILS CLOSED — no window without positive evidence of idle.
-        Counters are observation-only and never gate anything."""
+        """V23 3-2 (K1b/B-1 merge), scoped by the truth-iron-law
+        revision: consulted ONLY for the pathological EVERY=1 injection
+        form — our own stream drained AND the device reports no other
+        compute load (one nvidia-smi utilization sample; K1b's crash
+        was CROSS-PROCESS replay perturbation, invisible to the
+        in-process quiet-frame guard).  Mitigation face, not a cure;
+        fails closed.  The NORMAL cadence never consults it (the K1a
+        mutex serializes those windows; starving their counter truth
+        under load is a forbidden silent fallback)."""
         self.drift_stats["engine_idle_probes"] = \
             self.drift_stats.get("engine_idle_probes", 0) + 1
         if not self._idle_stream_drained():
@@ -311,9 +311,10 @@ class InferenceSession:
         on the background path — the counter session is a ~700ms window
         and must never sit on a caller thread.
 
-        V23 3-2: the quiet-frame heuristic alone is now joined by the
-        ENGINE-IDLE probe (stream drained + device-wide utilization
-        sample) before any CUPTI window is requested."""
+        V23 3-2: the quiet-frame heuristic is joined by the ENGINE-IDLE
+        probe (stream drained + device-wide utilization sample) — but
+        ONLY for the pathological EVERY=1 injection form; the normal
+        cadence is probe-free (truth iron law, user directive)."""
         if not self._fo_enabled:
             return
         with self._fo_lock:
@@ -326,13 +327,19 @@ class InferenceSession:
         self.drift_stats["facts_only_sent"] += 1
         quiet = time.monotonic() - self._fo_last_submit_s > 2.0 and (
             self._async_pending is None or self._async_pending.done())
-        # V23 3-2: engine-idle probe joins the quiet-frame guard before
-        # any CUPTI window (K1b mitigation face, fail closed).  The
-        # probe (one nvidia-smi sample) runs only when every other
-        # condition already holds — never on the sync path.
+        # V23 3-2, revised per the user's truth-iron-law directive
+        # (2026-10-05): the probe gates ONLY the pathological EVERY=1
+        # injection form (K1b, domain-external).  The NORMAL cadence
+        # keeps the V22 behaviour — windows open per cadence under the
+        # K1a service mutex (V22 15-arm matrix: 0/10 crashes there) —
+        # because starving the facts-path counter truth under load is a
+        # silent fallback (1193 sends / 0 counter windows measured on
+        # the first attempt), which the iron law forbids.  The decide
+        # path's own CUPTI session was never gated.
+        pathological_every1 = self._fo_cupti_every <= 1
         cupti_ok = via_bg and self._fo_cupti_every > 0 and quiet and \
             sends % self._fo_cupti_every == 0 and \
-            self._engine_idle_probe()
+            (self._engine_idle_probe() if pathological_every1 else True)
         msg = {"msg_id": f"req_{next(_MSG_IDS)}", "type": "facts_only",
                "bucket": repr(bucket),
                "workload": {"B": batch, "S": seq_len},
